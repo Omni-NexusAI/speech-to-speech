@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from openai.types.realtime import (
     RealtimeErrorEvent,
     SessionCreatedEvent,
+    SessionUpdatedEvent,
     SessionUpdateEvent,
 )
 from openai.types.realtime.realtime_transcription_session_create_request import (
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 class SessionHandler(RealtimeBaseHandler):
     """Owns session lifecycle: config updates and session.created events."""
 
-    def handle_session_update(self, conn_id: str, event: SessionUpdateEvent) -> Optional[RealtimeErrorEvent]:
+    def handle_session_update(self, conn_id: str, event: SessionUpdateEvent) -> RealtimeErrorEvent | SessionUpdatedEvent | None:
         """Apply session config changes.
 
         Only ``RealtimeSessionCreateRequest`` sessions are accepted;
@@ -49,7 +49,11 @@ class SessionHandler(RealtimeBaseHandler):
         else:
             cfg.apply_session_update(s)
         logger.info("Session configuration updated")
-        return None
+        return SessionUpdatedEvent(
+            type="session.updated",
+            event_id=self._next_event_id(),
+            session=cfg.session,
+        )
 
     def build_session_created(self, conn_id: str) -> SessionCreatedEvent:
         """Build a SessionCreatedEvent populated with the current config."""

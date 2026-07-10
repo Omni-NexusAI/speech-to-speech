@@ -13,7 +13,7 @@ import torch
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.baseHandler import BaseHandler
-from speech_to_speech.pipeline.events import SpeechStartedEvent, SpeechStoppedEvent
+from speech_to_speech.pipeline.events import PipelineMetricEvent, SpeechStartedEvent, SpeechStoppedEvent
 from speech_to_speech.pipeline.handler_types import VADIn, VADOut
 from speech_to_speech.pipeline.messages import VADAudio
 from speech_to_speech.pipeline.queue_types import TextEventItem
@@ -541,6 +541,17 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                             reopened=reopened,
                         )
                     )
+                self._emit_metric(
+                    "vad",
+                    "speech_started",
+                    turn_id=turn_id,
+                    turn_revision=turn_revision,
+                    detail={
+                        "active_ms": round(effective_active_speech_duration_ms, 1),
+                        "threshold_ms": round(active_speech_min_ms, 1),
+                        "device": "cpu",
+                    },
+                )
         elif not is_triggered_now and vad_output is None:
             self._discard_expired_pending_short_segment()
 
@@ -561,12 +572,16 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         if self._uses_realtime_turn_handling():
             # Realtime mode keeps turns reopenable; live transcription additionally
             # emits progressive audio chunks while speaking.
-            yield from self._process_realtime(vad_output)
+            yield from self._process_realtime(vad_output, runtime_config)
         else:
             # Original mode: yield only when speech ends
-            yield from self._process_normal(vad_output)
+            yield from self._process_normal(vad_output, runtime_config)
 
-    def _process_realtime(self, vad_output: list[torch.Tensor] | None) -> Iterator[VADOut]:
+    def _emit_metric(self, stage: str, status: str, *, turn_id: str | None = None, turn_revision: int | None = None, elapsed_ms: float | None = None, detail: dict[str, Any] | None = None) -> None:
+        if self.text_output_queue:
+            self.text_output_queue.put(PipelineMetricEvent(stage=stage, status=status, at_s=time.time(), elapsed_ms=elapsed_ms, turn_id=turn_id, turn_revision=turn_revision, detail=detail or {}))
+
+    def _process_realtime(self, vad_output: list[torch.Tensor] | None, runtime_config: RuntimeConfig | None = None) -> Iterator[VADOut]:
         """Process with real-time progressive audio release."""
         # Check if we're currently in a speech segment.
         if self.enable_realtime_transcription and hasattr(self.iterator, "buffer") and len(self.iterator.buffer) > 0:
@@ -595,6 +610,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                         mode="progressive",
                         turn_id=turn_id,
                         turn_revision=turn_revision,
+                        runtime_config=runtime_config,
                     )
                     self.last_process_time = current_time
 
@@ -670,7 +686,8 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                         duration_ms,
                         active_speech_duration_ms,
                     )
-                if not self._speech_started_emitted:
+                synthetic_start = not self._speech_started_emitted
+                if synthetic_start:
                     turn_id, turn_revision, reopened = self._ensure_turn_for_speech_start(start_ms)
                     if self.text_output_queue:
                         self.text_output_queue.put(
@@ -705,6 +722,15 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                             turn_revision=turn_revision,
                         )
                     )
+                if synthetic_start:
+                    self._emit_metric(
+                        "vad",
+                        "speech_started",
+                        turn_id=turn_id,
+                        turn_revision=turn_revision,
+                        detail={"active_ms": round(active_speech_duration_ms, 1), "device": "cpu"},
+                    )
+                self._emit_metric("vad", "speech_final", turn_id=turn_id, turn_revision=turn_revision, detail={"duration_ms": round(duration_ms, 1), "active_ms": round(active_speech_duration_ms, 1), "device": "cpu"})
                 self._speculative_audio_prefix = output_array
                 self._last_final_wall_time = time.time()
                 self._last_final_audio_ms = end_ms
@@ -719,7 +745,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                     )
                 else:
                     self.should_listen.clear()
-                yield VADAudio(audio=output_array, mode="final", turn_id=turn_id, turn_revision=turn_revision)
+                yield VADAudio(audio=output_array, mode="final", turn_id=turn_id, turn_revision=turn_revision, runtime_config=runtime_config)
                 self.last_process_time = 0.0
                 self._speech_started_emitted = False
 
@@ -736,7 +762,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
             multiplier = 6.0
         return min(base_pause * multiplier, 2.0)
 
-    def _process_normal(self, vad_output: list[torch.Tensor] | None) -> Iterator[VADOut]:
+    def _process_normal(self, vad_output: list[torch.Tensor] | None, runtime_config: RuntimeConfig | None = None) -> Iterator[VADOut]:
         """Original processing: yield only when speech ends."""
         if vad_output is not None:
             if len(vad_output) == 0:
@@ -804,7 +830,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                     self.text_output_queue.put(SpeechStoppedEvent(duration_s=duration_ms / 1000.0, audio_end_ms=end_ms))
                 if self.audio_enhancement:
                     array = self._apply_audio_enhancement(array)
-                yield VADAudio(audio=array)
+                yield VADAudio(audio=array, runtime_config=runtime_config)
                 self._speech_started_emitted = False
 
     def _apply_audio_enhancement(self, array: np.ndarray) -> np.ndarray:

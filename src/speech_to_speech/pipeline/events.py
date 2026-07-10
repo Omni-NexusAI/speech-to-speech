@@ -8,7 +8,7 @@ literals that were previously put on the queue.
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from pydantic import BaseModel, Field
@@ -61,6 +61,11 @@ class TranscriptionCompletedEvent(PipelineEvent):
     turn_id: str | None = None
     turn_revision: int | None = None
     speech_stopped_at_s: float | None = Field(default=None, exclude=True)
+    context_committed: bool = Field(default=False, exclude=True)
+    # Direct-audio Gemma already generated the assistant response for this turn.
+    # The realtime service must close the transcription item without starting the
+    # regular text-only response path a second time.
+    direct_audio_completed: bool = Field(default=False, exclude=True)
 
 
 # ── LLM output events (LMOutputProcessor) ────────────────────────────
@@ -97,3 +102,16 @@ class ResponseFailedEvent(PipelineEvent):
     message: str = ""
     turn_id: str | None = None
     turn_revision: int | None = None
+
+
+class PipelineMetricEvent(PipelineEvent):
+    """Low-overhead timing/status event for the realtime diagnostics panel."""
+
+    type: Literal["pipeline_metric"] = "pipeline_metric"
+    stage: str
+    status: str
+    at_s: float
+    elapsed_ms: float | None = None
+    turn_id: str | None = None
+    turn_revision: int | None = None
+    detail: dict[str, Any] = Field(default_factory=dict)

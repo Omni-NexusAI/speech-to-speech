@@ -4,6 +4,7 @@ from dataclasses import fields
 from speech_to_speech.arguments_classes.chat_tts_arguments import ChatTTSHandlerArguments
 from speech_to_speech.arguments_classes.facebookmms_tts_arguments import FacebookMMSTTSHandlerArguments
 from speech_to_speech.arguments_classes.faster_whisper_stt_arguments import FasterWhisperSTTHandlerArguments
+from speech_to_speech.arguments_classes.gemma_audio_stt_arguments import GemmaAudioSTTHandlerArguments
 from speech_to_speech.arguments_classes.kokoro_tts_arguments import KokoroTTSHandlerArguments
 from speech_to_speech.arguments_classes.language_model_arguments import LanguageModelHandlerArguments
 from speech_to_speech.arguments_classes.mlx_audio_whisper_arguments import MLXAudioWhisperSTTHandlerArguments
@@ -52,6 +53,9 @@ def test_release_defaults_match_responses_api_parakeet_qwen3_realtime_profile():
     assert qwen3_args.qwen3_tts_non_streaming_mode is True
     assert qwen3_args.qwen3_tts_ref_audio is None
     assert qwen3_args.qwen3_tts_mlx_quantization == "6bit"
+    assert qwen3_args.qwen3_tts_api_base_url == "http://127.0.0.1:8881/v1"
+    assert qwen3_args.qwen3_tts_api_voice == "clone:16d9bb336799"
+    assert qwen3_args.qwen3_tts_api_backend_model == "1.7B-Base"
 
 
 # -- ParsedArguments dataclass tests ------------------------------------------
@@ -67,6 +71,7 @@ EXPECTED_FIELD_TYPES = {
     "faster_whisper_stt_handler_kwargs": FasterWhisperSTTHandlerArguments,
     "mlx_audio_whisper_stt_handler_kwargs": MLXAudioWhisperSTTHandlerArguments,
     "parakeet_tdt_stt_handler_kwargs": ParakeetTDTSTTHandlerArguments,
+    "gemma_audio_stt_handler_kwargs": GemmaAudioSTTHandlerArguments,
     "language_model_handler_kwargs": LanguageModelHandlerArguments,
     "responses_api_language_model_handler_kwargs": ResponsesApiLanguageModelHandlerArguments,
     "chat_tts_handler_kwargs": ChatTTSHandlerArguments,
@@ -114,6 +119,18 @@ def test_parse_arguments_accepts_qwen3_tts_backend_override():
         sys.argv = original_argv
 
     assert args.qwen3_tts_handler_kwargs.qwen3_tts_backend == "torch"
+
+
+def test_parse_arguments_accepts_local_gemma_audio_and_remote_tts():
+    original_argv = sys.argv[:]
+    try:
+        sys.argv = ["speech-to-speech", "--stt", "gemma-audio", "--qwen3_tts_backend", "openai-api"]
+        args = parse_arguments()
+    finally:
+        sys.argv = original_argv
+
+    assert args.module_kwargs.stt == "gemma-audio"
+    assert args.qwen3_tts_handler_kwargs.qwen3_tts_backend == "openai-api"
 
 
 def test_parse_arguments_transformers_backend():

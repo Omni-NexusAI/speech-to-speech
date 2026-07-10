@@ -10,7 +10,13 @@ from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.LLM.chat import make_user_message
 from speech_to_speech.pipeline.events import PartialTranscriptionEvent, TranscriptionCompletedEvent
 from speech_to_speech.pipeline.handler_types import LLMIn, STTOut
-from speech_to_speech.pipeline.messages import GenerateResponseRequest, PartialTranscription, Transcription
+from speech_to_speech.pipeline.messages import (
+    DirectAssistantRequest,
+    DirectAssistantResponse,
+    GenerateResponseRequest,
+    PartialTranscription,
+    Transcription,
+)
 from speech_to_speech.pipeline.queue_types import TextEventItem
 
 logger = logging.getLogger(__name__)
@@ -40,6 +46,51 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
         self.should_listen = should_listen
 
     def process(self, transcription: STTOut) -> Iterator[Union[STTOut, LLMIn]]:
+        if isinstance(transcription, DirectAssistantResponse):
+            text = transcription.text.strip()
+            transcript = (transcription.transcript or "").strip()
+            runtime_config = transcription.runtime_config or self.runtime_config
+            if transcript and self.text_output_queue is not None:
+                if transcription.is_final:
+                    self.text_output_queue.put(
+                        TranscriptionCompletedEvent(
+                            transcript=transcript,
+                            language_code=transcription.language_code,
+                            turn_id=transcription.turn_id,
+                            turn_revision=transcription.turn_revision,
+                            speech_stopped_at_s=transcription.speech_stopped_at_s,
+                            context_committed=transcription.context_committed,
+                            direct_audio_completed=True,
+                        )
+                    )
+                else:
+                    self.text_output_queue.put(
+                        PartialTranscriptionEvent(
+                            delta=transcript,
+                            turn_id=transcription.turn_id,
+                            turn_revision=transcription.turn_revision,
+                        )
+                    )
+            if self.runtime_config is not None and transcript:
+                self.runtime_config.chat.add_item(make_user_message(transcript))
+            if not text and not transcription.tools and not transcription.is_final:
+                return
+            if text:
+                logger.info("Direct audio assistant response chunk: %s", text)
+            yield DirectAssistantRequest(
+                text=text,
+                transcript=transcript or None,
+                is_final=transcription.is_final,
+                tools=transcription.tools,
+                language_code=transcription.language_code,
+                turn_id=transcription.turn_id,
+                turn_revision=transcription.turn_revision,
+                speech_stopped_at_s=transcription.speech_stopped_at_s,
+                runtime_config=runtime_config,
+                response=transcription.response,
+                context_committed=transcription.context_committed,
+            )
+            return
         if isinstance(transcription, PartialTranscription):
             if self.text_output_queue and transcription.text:
                 self.text_output_queue.put(

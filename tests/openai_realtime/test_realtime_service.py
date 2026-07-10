@@ -1249,6 +1249,55 @@ class TestDispatchPipelineEvent:
         assert evt.usage.type == "duration"
         assert service._state(conn_id).response_pending is True
 
+    def test_direct_audio_completion_emits_final_transcript_without_second_generation(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+    ):
+        service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(
+                transcript="hello world",
+                turn_id="turn_1",
+                turn_revision=0,
+                context_committed=True,
+                direct_audio_completed=True,
+            ),
+        )
+
+        assert len(events) == 1
+        assert isinstance(events[0], ConversationItemInputAudioTranscriptionCompletedEvent)
+        assert events[0].transcript == "hello world"
+        assert text_prompt_queue.empty()
+        assert service._state(conn_id).response_pending is False
+
+    def test_explicit_response_create_remains_available_after_direct_audio_completion(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+    ):
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(
+                transcript="use a tool",
+                turn_id="turn_tool",
+                turn_revision=0,
+                context_committed=True,
+                direct_audio_completed=True,
+            ),
+        )
+
+        result = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+
+        assert isinstance(result, ResponseCreatedEvent)
+        request = text_prompt_queue.get_nowait()
+        assert isinstance(request, GenerateResponseRequest)
+        assert request.turn_id == "turn_tool"
+        assert text_prompt_queue.empty()
+
     def test_empty_transcription_completed_emits_event_without_response(
         self,
         service,

@@ -1,5 +1,38 @@
 # Repository Instructions
 
+## DOX Framework
+
+- DOX is installed here as a shallow AGENTS.md hierarchy.
+- AGENTS.md files are binding work contracts for their subtrees.
+- Before editing, read this root AGENTS.md and every child AGENTS.md on the path to the files you will touch.
+- After meaningful edits, update the nearest AGENTS.md and any affected parent/child indexes when structure, contracts, workflows, or durable preferences changed.
+- Keep docs concise and operational; document stable contracts rather than change history.
+
+## Local Voice-Agent Testing Contract
+
+- Local realtime defaults retain 30 complete turns with compaction disabled; context is session-scoped and resets with the WebSocket/backend.
+- `scripts/local_realtime.ps1` is the managed background entry point; foreground launchers remain available for raw-console debugging.
+
+- This fork is used for local speech-to-speech testing with the OpenAI Realtime-compatible server preserved.
+- Keep upstream pipeline behavior intact unless a change is required for the local direct-audio Gemma path.
+- The local fast-test path intentionally skips Parakeet/transcription with `--stt gemma-audio` and sends completed audio turns directly to the local Gemma audio model.
+- Speech output for this machine should use the existing Dockerized FasterQwen3TTS-compatible OpenAI API with `--qwen3_tts_backend openai-api`; do not modify the TTS container/image from this repo.
+- Local inference only for the custom test path: no cloud fallback should be introduced.
+- For Gemma 4 12B tests, use the settings from `C:\llama.cpp\launch_gemma-4-12B-it-qat-MTP.ps1` with context reduced to 16k; this repo provides `scripts\launch_gemma_4_12b_16k.ps1` for that.
+- The target TTS container for this framework is `qwen3-tts-faster` (`281c411e5cfe02d0b0d903f67cd3fb712ab38bc705eb3edbedd8a2041c78702b`) on `http://127.0.0.1:8881/v1`.
+- Qwen3 clone output must use the `1.7B-Base` backend model by default; the `qwen3-tts-faster` container hardcodes this model and does not expose the candidate container's `/v1/backend/models` switch API.
+- The realtime UI should expose saved Voice Studio `Base` clone profiles only, with `clone:16d9bb336799` (`J.A.R.V.I.S`) as the default.
+- Do not test Gemma/llama.cpp while the local Gemma server is being rebuilt.
+
+## Child DOX Index
+
+- `src/AGENTS.md` covers package code and runtime pipeline contracts.
+- `scripts/AGENTS.md` covers local launch/test helper scripts.
+- `tests/AGENTS.md` covers test expectations.
+- `web/AGENTS.md` covers the vendored HF Realtime Voice browser UI.
+
+## Release Rules
+
 - Never include `codex` in branch names or pull request titles.
 - Keep release pull requests focused on version metadata and release documentation.
 - Do not commit local build artifacts such as `dist/`, `build/`, or generated wheel/sdist files.

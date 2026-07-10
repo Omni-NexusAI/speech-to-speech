@@ -26,6 +26,7 @@ from openai.types.realtime import (
     ResponseTextDeltaEvent,
     ResponseTextDoneEvent,
     SessionCreatedEvent,
+    SessionUpdatedEvent,
     SessionUpdateEvent,
 )
 from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
@@ -43,6 +44,7 @@ from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
     PartialTranscriptionEvent,
     PipelineEvent,
+    PipelineMetricEvent,
     ResponseFailedEvent,
     SpeechStartedEvent,
     SpeechStoppedEvent,
@@ -82,6 +84,7 @@ ClientEvent = Union[
 
 ServerEvent = Union[
     SessionCreatedEvent,
+    SessionUpdatedEvent,
     RealtimeErrorEvent,
     InputAudioBufferSpeechStartedEvent,
     InputAudioBufferSpeechStoppedEvent,
@@ -96,6 +99,8 @@ ServerEvent = Union[
     ResponseFunctionCallArgumentsDoneEvent,
     ResponseTextDeltaEvent,
     ResponseTextDoneEvent,
+    "PipelineMetricServerEvent",
+    "PipelineRuntimeServerEvent",
 ]
 
 RealtimeEvent = Union[ClientEvent, ServerEvent]
@@ -144,6 +149,24 @@ class GlobalUsageMetrics(UsageMetrics):
     @property
     def total_errors(self) -> int:
         return sum(self.errors_by_type.values())
+
+
+class PipelineMetricServerEvent(BaseModel):
+    type: Literal["pipeline.metric"] = "pipeline.metric"
+    event_id: str
+    stage: str
+    status: str
+    at_s: float
+    elapsed_ms: float | None = None
+    turn_id: str | None = None
+    turn_revision: int | None = None
+    detail: dict[str, Any] = Field(default_factory=dict)
+
+
+class PipelineRuntimeServerEvent(BaseModel):
+    type: Literal["pipeline.runtime"] = "pipeline.runtime"
+    event_id: str
+    runtime: dict[str, Any] = Field(default_factory=dict)
 
 
 class ConnState(BaseModel):
@@ -216,6 +239,7 @@ class RealtimeService:
             PartialTranscriptionEvent: self.conversation.on_partial_transcription,
             TranscriptionCompletedEvent: self._on_transcription_completed,
             ResponseFailedEvent: self._on_response_failed,
+            PipelineMetricEvent: self._on_pipeline_metric,
         }
 
     # ── Connection lifecycle ─────────────────────
@@ -279,7 +303,7 @@ class RealtimeService:
     def build_session_created(self, conn_id: str) -> SessionCreatedEvent:
         return self.session.build_session_created(conn_id)
 
-    def handle_session_update(self, conn_id: str, event: SessionUpdateEvent) -> Optional[RealtimeErrorEvent]:
+    def handle_session_update(self, conn_id: str, event: SessionUpdateEvent) -> RealtimeErrorEvent | SessionUpdatedEvent | None:
         return self.session.handle_session_update(conn_id, event)
 
     def handle_audio_append(self, conn_id: str, event: InputAudioBufferAppendEvent) -> list[bytes]:
@@ -407,7 +431,7 @@ class RealtimeService:
 
         cfg = st.runtime_config
         transcript = event.transcript
-        if transcript:
+        if transcript and not event.context_committed:
             if same_speculative_turn and st.speculative_user_item_id:
                 replaced = cfg.chat.replace_user_message_text(st.speculative_user_item_id, transcript)
                 if not replaced:
@@ -416,10 +440,10 @@ class RealtimeService:
             else:
                 item = cfg.chat.add_item(make_user_message(transcript))
                 st.speculative_user_item_id = item.id
-        elif same_speculative_turn and st.speculative_user_item_id:
+        elif not event.context_committed and same_speculative_turn and st.speculative_user_item_id:
             cfg.chat.remove_user_message(st.speculative_user_item_id)
             st.speculative_user_item_id = None
-        elif event.turn_id is not None and event.turn_id != st.speculative_user_turn_id:
+        elif not event.context_committed and event.turn_id is not None and event.turn_id != st.speculative_user_turn_id:
             st.speculative_user_item_id = None
 
         if event.turn_id is not None:
@@ -428,7 +452,16 @@ class RealtimeService:
             st.speculative_user_speech_stopped_at_s = event.speech_stopped_at_s
 
         queue = self.text_prompt_queue
-        if queue and transcript:
+        if event.direct_audio_completed:
+            # Gemma direct-audio already owns this answer and its phrase chunks
+            # are flowing through the TTS path. Starting GenerateResponseRequest
+            # here would make a second Gemma call and a duplicate playback.
+            logger.info(
+                "Direct-audio completion turn=%s rev=%s: normal generation suppressed",
+                event.turn_id,
+                event.turn_revision,
+            )
+        elif queue and transcript:
             st.response_pending = True
             queue.put(
                 GenerateResponseRequest(
@@ -480,6 +513,20 @@ class RealtimeService:
         events: list[ServerEvent] = [self.make_error(event.message, "response_failed")]
         events.extend(self.response.finish_response(conn_id, status="failed"))
         return events
+
+    def _on_pipeline_metric(self, conn_id: str, event: PipelineMetricEvent) -> list[ServerEvent]:
+        return [
+            PipelineMetricServerEvent(
+                event_id=self._next_event_id(),
+                stage=event.stage,
+                status=event.status,
+                at_s=event.at_s,
+                elapsed_ms=event.elapsed_ms,
+                turn_id=event.turn_id,
+                turn_revision=event.turn_revision,
+                detail=event.detail,
+            )
+        ]
 
     def get_usage(self) -> dict[str, Any]:
         """Return cumulative usage metrics across all completed responses."""

@@ -138,6 +138,34 @@ class TestConnection:
                 assert msg["event_id"].startswith("event_")
                 assert "session" in msg
 
+    def test_runtime_identity_is_sent_when_configured(self, setup):
+        _, service, input_queue, output_queue, text_output_queue, should_listen, stop_event, response_playing, cancel_scope = setup
+        unit = PipelineUnit(
+            index=0,
+            service=service,
+            cancel_scope=cancel_scope,
+            should_listen=should_listen,
+            response_playing=response_playing,
+            input_queue=input_queue,
+            output_queue=output_queue,
+            text_output_queue=text_output_queue,
+            text_prompt_queue=service.text_prompt_queue,
+            handlers=[],
+        )
+        app = create_app(
+            pool=[unit],
+            stop_event=stop_event,
+            runtime_info={"mode": "local-direct-audio", "live_transcription": True},
+        )
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                assert ws.receive_json()["type"] == "session.created"
+                runtime = ws.receive_json()
+                assert runtime["type"] == "pipeline.runtime"
+                assert runtime["runtime"]["api_version"] == router_module.BACKEND_RUNTIME_API_VERSION
+                assert runtime["runtime"]["mode"] == "local-direct-audio"
+                assert runtime["runtime"]["live_transcription"] is True
+
     def test_second_connection_rejected(self, setup):
         app, *_ = setup
         with TestClient(app) as client:
@@ -749,6 +777,17 @@ class TestPool:
             assert data["size"] == 2
             assert data["in_use"] == 0
             assert [u["session_id"] for u in data["units"]] == [None, None]
+            assert data["runtime"]["api_version"] == router_module.BACKEND_RUNTIME_API_VERSION
+            assert data["runtime"]["diagnostic_stages"] == [
+                "mic",
+                "vad",
+                "gemma_preview",
+                "gemma",
+                "context",
+                "tool",
+                "tts",
+                "playback",
+            ]
 
     def test_two_clients_claim_two_slots_third_rejected(self):
         pool = [_make_unit(0), _make_unit(1)]

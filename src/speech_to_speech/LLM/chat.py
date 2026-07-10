@@ -101,6 +101,7 @@ class Chat:
         self.buffer: list[SupportedItem] = []
         self._pending_tool_calls: dict[str, RealtimeConversationItemFunctionCall] = {}
         self._user_turn_count: int = 0
+        self._trim_count: int = 0
 
         # All state mutations and serializations go through _lock. Public methods
         # acquire it once; internal callers that already hold it use the
@@ -122,6 +123,7 @@ class Chat:
             self._user_turn_count -= 1
         while self.buffer and not isinstance(self.buffer[0], RealtimeConversationItemUserMessage):
             self.buffer.pop(0)
+        self._trim_count += 1
 
     def _has_call_id_in_buffer(self, call_id: str) -> bool:
         for entry in self.buffer:
@@ -435,7 +437,19 @@ class Chat:
             clone.buffer = list(self.buffer)
             clone._pending_tool_calls = dict(self._pending_tool_calls)
             clone._user_turn_count = self._user_turn_count
+            clone._trim_count = self._trim_count
             return clone
+
+    def stats(self) -> dict[str, int]:
+        """Return content-free counters for local diagnostics."""
+        with self._lock:
+            return {
+                "turns": self._user_turn_count,
+                "items": len(self.buffer),
+                "pending_tool_calls": len(self._pending_tool_calls),
+                "limit": self.size,
+                "trim_count": self._trim_count,
+            }
 
     def reset(self) -> None:
         """Clear all conversation state. Cancels any in-flight compaction splice."""
@@ -446,6 +460,7 @@ class Chat:
             self.init_chat_message = None
             self._pending_tool_calls = {}
             self._user_turn_count = 0
+            self._trim_count = 0
 
     def close(self) -> None:
         """Permanently shut down the chat. In-flight compaction splice is suppressed.

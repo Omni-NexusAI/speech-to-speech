@@ -1,0 +1,18 @@
+# Tests
+
+## Purpose
+
+- Contains pytest coverage for pipeline handlers, Realtime protocol behavior, and backend adapters.
+
+## Local Contracts
+
+- Realtime tests should cover instruction acknowledgement, direct-audio history serialization, final-only context commits, content-free trim counters, backend runtime identity, and PowerShell 5.1 lifecycle ordering.
+- Direct-audio regression coverage must prove that a final transcript does not enqueue a second normal response and that an explicit post-tool `response.create` still starts one follow-up.
+
+- Prefer mocked HTTP and monkeypatched model setup for backend-adapter tests.
+- Tests for the local Gemma/FasterQwen3TTS path must not require running local models or Docker containers.
+- Keep live smoke testing documented separately from automated tests.
+
+## Child DOX Index
+
+- No child AGENTS.md files currently.

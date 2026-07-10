@@ -34,6 +34,7 @@ from speech_to_speech.LLM.voice_prompt import build_voice_system_prompt
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.handler_types import LLMIn, LLMOut
 from speech_to_speech.pipeline.messages import (
+    DirectAssistantRequest,
     EndOfResponse,
     LLMResponseChunk,
     TokenUsage,
@@ -44,7 +45,7 @@ from speech_to_speech.utils.utils import is_out_of_band, response_wants_audio
 logger = logging.getLogger(__name__)
 
 
-# ── Normalised provider events ────────────────────────────────────────────────
+# â”€â”€ Normalised provider events â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Each backend's stream/response is mapped to this small vocabulary so the shared
 # speech-pipeline logic (sentence batching, cancellation, history, token usage)
 # lives in one place. Subclasses differ only in how they produce these events.
@@ -110,15 +111,15 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
     """Shared lifecycle for OpenAI-compatible LLM backends (Responses & Chat
     Completions).
 
-    Subclasses implement four hooks — :meth:`warmup`,
+    Subclasses implement four hooks â€” :meth:`warmup`,
     :meth:`_build_compaction_generate_fn`, :meth:`_serialize`, :meth:`_request`,
-    :meth:`_iter_events` and :meth:`_build_optional_kwargs` — and inherit the
+    :meth:`_iter_events` and :meth:`_build_optional_kwargs` â€” and inherit the
     request/response orchestration: speculative-turn gating, cancellation,
     sentence batching, text-only vs audio handling, history write-back, token
     usage, out-of-band handling and error termination.
     """
 
-    # ── setup ─────────────────────────────────────────────────────────────────
+    # â”€â”€ setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def setup(
         self,
@@ -194,7 +195,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             return {"chat_template_kwargs": {"enable_thinking": False}}
         return None
 
-    # ── subclass hooks ──────────────────────────────────────────────────────--
+    # â”€â”€ subclass hooks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€--
 
     @abstractmethod
     def warmup(self) -> None:
@@ -240,7 +241,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         """Build the per-request tools/tool_choice kwargs in the backend's shape."""
         ...
 
-    # ── speculative-turn / cancellation gating ─────────────────────────────────
+    # â”€â”€ speculative-turn / cancellation gating â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _turn_is_latest(self, turn_id: str | None, turn_revision: int | None) -> bool:
         return self.speculative_turns is None or self.speculative_turns.is_latest(turn_id, turn_revision)
@@ -264,7 +265,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             full_instructions = builder(instructions)
             chat.add_item(make_system_message(full_instructions))
 
-    # ── output helpers ──────────────────────────────────────────────────────--
+    # â”€â”€ output helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€--
 
     def _chunk(
         self,
@@ -313,7 +314,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             return
         if not is_out_of_band(turn.response):
             # Flush assistant text accumulated before this call first (so history
-            # order matches what the client received), then persist the call —
+            # order matches what the client received), then persist the call â€”
             # all before the chunk leaves for the client.
             chat = turn.runtime_config.chat
             for pending_item in state.pending:
@@ -322,7 +323,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             chat.add_item(fc_item)
         yield self._chunk(turn, tools=[item])
 
-    # ── consumption ─────────────────────────────────────────────────────────--
+    # â”€â”€ consumption â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€--
 
     def _consume_streaming(self, events: Iterator[ProviderEvent], state: _GenState, turn: _Turn) -> Iterator[LLMOut]:
         cancelled = False
@@ -434,7 +435,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         logger.debug(f"Clean text: {state.clean_text}")
         logger.info(f"Tools: {state.tools}")
 
-    # ── orchestration ─────────────────────────────────────────────────────────
+    # â”€â”€ orchestration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _generate(
         self,
@@ -524,6 +525,21 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
     def process(self, request: LLMIn) -> Iterator[LLMOut]:
         """Process a language model request and yield LLMResponseChunks."""
+        if isinstance(request, DirectAssistantRequest):
+            if request.text or request.tools:
+                yield LLMResponseChunk(
+                    text=request.text,
+                    language_code=request.language_code,
+                    runtime_config=request.runtime_config,
+                    response=request.response,
+                    turn_id=request.turn_id,
+                    turn_revision=request.turn_revision,
+                    speech_stopped_at_s=request.speech_stopped_at_s,
+                    tools=request.tools,
+                )
+            if request.is_final:
+                yield EndOfResponse(turn_id=request.turn_id, turn_revision=request.turn_revision)
+            return
         runtime_config = request.runtime_config
         response = request.response
         turn_id = request.turn_id

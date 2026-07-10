@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -20,12 +21,13 @@ from openai.types.realtime import (
 from starlette.websockets import WebSocketState
 
 from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit, SessionState
-from speech_to_speech.api.openai_realtime.service import ServerEvent, build_error_event
+from speech_to_speech.api.openai_realtime.service import PipelineRuntimeServerEvent, ServerEvent, build_error_event
 from speech_to_speech.pipeline.control import SESSION_END, PipelineControlMessage, is_control_message
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
     PartialTranscriptionEvent,
     PipelineEvent,
+    PipelineMetricEvent,
     SpeechStartedEvent,
     SpeechStoppedEvent,
     TokenUsageEvent,
@@ -41,6 +43,7 @@ MAX_AUDIO_BATCH_BYTES = 6400
 # monkeypatch this to a small value since their fixtures usually skip the
 # real handler chain.
 SESSION_END_DRAIN_TIMEOUT_S = 10.0
+BACKEND_RUNTIME_API_VERSION = 1
 QItem = TypeVar("QItem")
 
 
@@ -79,7 +82,7 @@ def _keep_audio_sentinel(item: Any) -> bool:
 def _keep_user_text_event(item: Any) -> bool:
     return isinstance(
         item,
-        (SpeechStoppedEvent, PartialTranscriptionEvent, TranscriptionCompletedEvent, TokenUsageEvent),
+        (SpeechStoppedEvent, PartialTranscriptionEvent, TranscriptionCompletedEvent, TokenUsageEvent, PipelineMetricEvent),
     )
 
 
@@ -255,7 +258,30 @@ async def _release_unit_after_drain(unit: PipelineUnit, session: Any, session_id
     logger.info(f"Pipeline {unit.index} released (session {session_id} ended)")
 
 
-def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
+def create_app(
+    pool: list[PipelineUnit],
+    stop_event: ThreadingEvent,
+    runtime_info: dict[str, Any] | None = None,
+) -> FastAPI:
+    emit_runtime_event = runtime_info is not None
+    started_at_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    runtime = {
+        "api_version": BACKEND_RUNTIME_API_VERSION,
+        "started_at_utc": started_at_utc,
+        "pid": os.getpid(),
+        "mode": "realtime",
+        "diagnostic_stages": [
+            "mic",
+            "vad",
+            "gemma_preview",
+            "gemma",
+            "context",
+            "tool",
+            "tts",
+            "playback",
+        ],
+        **(runtime_info or {}),
+    }
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # One send loop per pipeline unit; each polls its own queues and forwards
@@ -322,11 +348,26 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
 
         try:
             await _send_event(ws, unit.service.build_session_created(session_id))
+            if emit_runtime_event:
+                await _send_event(
+                    ws,
+                    PipelineRuntimeServerEvent(
+                        event_id=f"event_runtime_{session_id}",
+                        runtime=runtime,
+                    ),
+                )
 
             while not stop_event.is_set():
                 try:
                     raw = await asyncio.wait_for(ws.receive_json(), timeout=0.1)
                 except asyncio.TimeoutError:
+                    continue
+
+                if raw.get("type") == "local.pipeline.update":
+                    config = raw.get("config") if isinstance(raw.get("config"), dict) else {}
+                    allowed = {"full_buffer_tts"}
+                    rt_cfg = unit.service._state(session_id).runtime_config
+                    rt_cfg.local_pipeline.update({k: v for k, v in config.items() if k in allowed})
                     continue
 
                 event = unit.service.parse_client_event(raw)
@@ -351,9 +392,9 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
                         await _send_event(ws, err)
 
                 elif isinstance(event, SessionUpdateEvent):
-                    err = unit.service.handle_session_update(session_id, event)
-                    if err:
-                        await _send_event(ws, err)
+                    result = unit.service.handle_session_update(session_id, event)
+                    if result:
+                        await _send_event(ws, result)
 
                 elif isinstance(event, ConversationItemCreateEvent):
                     events = unit.service.handle_conversation_item_create(session_id, event)
@@ -443,6 +484,7 @@ def create_app(pool: list[PipelineUnit], stop_event: ThreadingEvent) -> FastAPI:
             "size": len(pool),
             "in_use": sum(1 for u in pool if u.session is not None),
             "units": [_state(u) for u in pool],
+            "runtime": runtime,
         }
 
     async def _send_loop_for(unit: PipelineUnit) -> None:

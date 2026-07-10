@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 
-# ── Base class ────────────────────────────────────────────────────────
+# â”€â”€ Base class â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 class PipelineMessage(BaseModel):
@@ -33,7 +33,7 @@ class PipelineMessage(BaseModel):
     tag: str
 
 
-# ── VAD → STT ─────────────────────────────────────────────────────────
+# â”€â”€ VAD â†’ STT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 class VADAudio(PipelineMessage):
@@ -45,9 +45,10 @@ class VADAudio(PipelineMessage):
     turn_id: str | None = None
     turn_revision: int | None = None
     created_at_s: float = Field(default_factory=perf_counter)
+    runtime_config: RuntimeConfig | None = None
 
 
-# ── STT → TranscriptionNotifier → LLM ────────────────────────────────
+# â”€â”€ STT â†’ TranscriptionNotifier â†’ LLM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 class PartialTranscription(PipelineMessage):
@@ -64,13 +65,39 @@ class Transcription(PipelineMessage):
 
     tag: Literal["transcription"] = "transcription"
     text: str
+    transcript: str | None = None
+    is_final: bool = True
+    tools: list[ResponseFunctionToolCall] = Field(default_factory=list)
     language_code: Optional[str] = None
     turn_id: str | None = None
     turn_revision: int | None = None
     speech_stopped_at_s: float | None = None
 
 
-# ── LLM → LMOutputProcessor ──────────────────────────────────────────
+
+class DirectAssistantResponse(PipelineMessage):
+    """Assistant text produced directly from user audio before the LLM stage."""
+
+    tag: Literal["direct_assistant_response"] = "direct_assistant_response"
+    text: str
+    transcript: str | None = None
+    is_final: bool = True
+    tools: list[ResponseFunctionToolCall] = Field(default_factory=list)
+    language_code: Optional[str] = None
+    turn_id: str | None = None
+    turn_revision: int | None = None
+    speech_stopped_at_s: float | None = None
+    runtime_config: RuntimeConfig | None = None
+    response: RealtimeResponseCreateParams | None = None
+    context_committed: bool = False
+
+
+class DirectAssistantRequest(DirectAssistantResponse):
+    """Pass-through LLM request for already-generated assistant text."""
+
+    tag: Literal["direct_assistant_request"] = "direct_assistant_request"
+
+# â”€â”€ LLM â†’ LMOutputProcessor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 class LLMResponseChunk(PipelineMessage):
@@ -114,7 +141,7 @@ class EndOfResponse(PipelineMessage):
     error: str | None = None
 
 
-# ── LMOutputProcessor → TTS ──────────────────────────────────────────
+# â”€â”€ LMOutputProcessor â†’ TTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 class TTSInput(PipelineMessage):
@@ -139,7 +166,7 @@ class AudioOutput(PipelineMessage):
     cancel_generation: int | None = None
 
 
-# ── Realtime service → LLM ────────────────────────────────────────────
+# â”€â”€ Realtime service â†’ LLM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 class GenerateResponseRequest(PipelineMessage):
@@ -162,7 +189,7 @@ class GenerateResponseRequest(PipelineMessage):
     speech_stopped_at_s: float | None = None
 
 
-# ── Binary sentinels (audio/output queue) ─────────────────────────────
+# â”€â”€ Binary sentinels (audio/output queue) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 AUDIO_RESPONSE_DONE: Final[bytes] = b"__RESPONSE_DONE__"
 PIPELINE_END: Final[bytes] = b"END"

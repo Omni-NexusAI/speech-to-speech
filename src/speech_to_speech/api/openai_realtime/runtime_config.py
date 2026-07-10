@@ -1,3 +1,5 @@
+from typing import Any
+
 from openai.types.realtime import RealtimeSessionCreateRequest
 from openai.types.realtime.realtime_audio_config import RealtimeAudioConfig
 from openai.types.realtime.realtime_audio_config_input import RealtimeAudioConfigInput
@@ -42,6 +44,7 @@ class RuntimeConfig(BaseModel):
         default_factory=lambda: RealtimeSessionCreateRequest(type="realtime"),
         validate_default=True,
     )
+    local_pipeline: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("session", mode="after")
     @classmethod
