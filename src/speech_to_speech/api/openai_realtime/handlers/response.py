@@ -287,7 +287,19 @@ class ResponseHandler(RealtimeBaseHandler):
                 return []
         st = self._state(conn_id)
         events: list[ServerEvent] = []
+        # Audio-producing turns are announced by AudioHandler. A tool-only
+        # direct-audio turn has no audio, so it must announce its own response
+        # lifecycle for the browser to wait for response.done before follow-up.
+        response_was_missing = st.current_response_id is None and bool(event.tools) and not bool(event.text)
         resp_id, item_id = self._ensure_response(conn_id)
+        if response_was_missing:
+            events.append(
+                ResponseCreatedEvent(
+                    type="response.created",
+                    event_id=self._next_event_id(),
+                    response=self._build_response(conn_id, "in_progress"),
+                )
+            )
         st.last_item_id = item_id
         output_idx = 0
         if event.text:

@@ -16,7 +16,8 @@
 - Settings, About, and Diagnostics should show the real local runtime state, not hosted-demo model labels.
 - Keep the upstream `Built by` credit intact. The top identity row must source local Gemma and FasterQwen3TTS provider status from `/api/local-pipeline`, and place the Omni-NexusAI fork credit in a separate `Modified by` row.
 - When the backend emits `pipeline.metric`, keep the UI rendering lightweight and diagnostic-only; do not infer pipeline state by duplicating backend logic in the browser.
-- Local runtime toggles such as full response buffering should use `local.pipeline.update`, leaving OpenAI-compatible `session.update` for standard voice/instructions/tool fields.
+- Local runtime toggles such as full response buffering and live transcript previews should use `local.pipeline.update`, leaving OpenAI-compatible `session.update` for standard voice/instructions/tool fields.
+- Tool output must wait for its `conversation.item.created` acknowledgement before requesting the one post-tool response. Never replay a rejected `response.create` on a later user turn.
 - Camera preview and Diagnostics should not occupy the same desktop corner; keep the camera self-view clear when diagnostics are open.
 
 ## Child DOX Index

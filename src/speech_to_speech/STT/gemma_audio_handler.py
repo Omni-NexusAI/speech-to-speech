@@ -69,6 +69,8 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
 
     def process(self, vad_audio: STTIn) -> Iterator[STTOut]:
         if vad_audio.mode == "progressive":
+            if not self._live_preview_enabled(getattr(vad_audio, "runtime_config", None)):
+                return
             yield from self._iter_progressive_transcriptions(vad_audio)
             return
         start_s = perf_counter()
@@ -130,10 +132,10 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             "Transcribe the user's audio accurately. When no tool is needed, respond in this exact plain-text "
             "shape:\nUSER_TRANSCRIPT: <short transcript of what the user said>\n"
             "ASSISTANT_RESPONSE: <your spoken answer>\n"
-            "When a provided tool is needed, use the OpenAI function-calling interface immediately instead of "
-            "describing the tool or fabricating its result. You may place USER_TRANSCRIPT in the tool-call message "
-            "content, but do not emit ASSISTANT_RESPONSE until the tool result is available. Do not wrap plain-text "
-            "responses in JSON or Markdown."
+            "When a provided tool is needed, call it in the same response and never fabricate its result. A short "
+            "spoken acknowledgement is allowed before the function call. You may place USER_TRANSCRIPT in the "
+            "tool-call message content, but do not emit a result-dependent ASSISTANT_RESPONSE until the tool result "
+            "is available. Do not wrap plain-text responses in JSON or Markdown."
         )
         user_content: list[dict[str, Any]] = [{"type": "text", "text": self.prompt}]
         for image_url in self._conversation_image_urls(runtime_config):
@@ -273,6 +275,12 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         return bool(local_pipeline.get("full_buffer_tts"))
 
     @staticmethod
+    def _live_preview_enabled(runtime_config: Any | None) -> bool:
+        """Preview requests are opt-in because generative audio models are not ASR."""
+        local_pipeline = getattr(runtime_config, "local_pipeline", None) or {}
+        return bool(local_pipeline.get("live_transcription", False))
+
+    @staticmethod
     def _conversation_image_urls(runtime_config: Any | None) -> list[str]:
         chat = getattr(runtime_config, "chat", None)
         buffer = getattr(chat, "buffer", None) or []
@@ -397,10 +405,14 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
     ) -> bool:
         runtime_config = getattr(vad_audio, "runtime_config", None)
         chat = getattr(runtime_config, "chat", None)
-        if chat is None or not transcript:
+        if chat is None:
             return False
         before = chat.stats()
-        chat.add_item(make_user_message(transcript))
+        # A tool result must always have its persisted function-call partner.
+        # Keep a bounded placeholder when a generative audio model could not
+        # supply a transcript; dropping the entire turn orphaned browser tool
+        # output and made subsequent context appear to reset.
+        chat.add_item(make_user_message(transcript or "[Audio turn; transcript unavailable.]"))
         if assistant_text:
             chat.add_item(make_assistant_message(assistant_text))
         for tool in tools:

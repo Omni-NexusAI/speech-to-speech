@@ -3,7 +3,7 @@
   "ws_host": "127.0.0.1",
   "ws_port": 8765,
   "stt": "gemma-audio",
-  "enable_live_transcription": true,
+  "enable_live_transcription": false,
   "live_transcription_update_interval": 0.75,
   "llm_backend": "chat-completions",
   "model_name": "gemma-4-12b-it-qat",

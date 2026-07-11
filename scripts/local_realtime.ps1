@@ -168,13 +168,16 @@ function Start-One([string]$Name, $State) {
     Set-Content -Path $stdout -Value ""
     Set-Content -Path $stderr -Value ""
     $oldUnbuffered = $env:PYTHONUNBUFFERED
+    $oldRuntimeLog = $env:S2S_RUNTIME_LOG_FILE
     $env:PYTHONUNBUFFERED = "1"
+    if ($Name -eq "backend") { $env:S2S_RUNTIME_LOG_FILE = $stdout }
     if ($Name -eq "backend" -and -not $env:OPENAI_API_KEY) { $env:OPENAI_API_KEY = "local-llama-cpp" }
     try {
         $launcher = Start-Process -FilePath $Python -ArgumentList $spec.Args -WorkingDirectory $spec.WorkDir -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
     }
     finally {
         $env:PYTHONUNBUFFERED = $oldUnbuffered
+        $env:S2S_RUNTIME_LOG_FILE = $oldRuntimeLog
     }
 
     for ($i = 0; $i -lt 90; $i++) {

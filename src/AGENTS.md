@@ -7,7 +7,7 @@
 ## Local Contracts
 
 - Direct-audio Gemma requests include session instructions and a snapshot of bounded chat history with thinking disabled.
-- Progressive Gemma transcript previews are ephemeral; only final user, assistant, and tool items are committed to shared chat.
+- Progressive Gemma transcript previews are opt-in and ephemeral; only final user, assistant, and tool items are committed to shared chat. A missing final transcript must still commit a bounded audio-turn placeholder when a function call needs a persisted partner.
 - Local history retains 30 complete turns without automatic summarization and emits content-free context metrics when committed or trimmed.
 - The realtime backend publishes runtime identity through `/v1/pool` and `pipeline.runtime`; local UI diagnostics use it to detect stale backend code.
 

@@ -316,6 +316,14 @@
               <small>Waits for Gemma to finish before sending text to Qwen3TTS.</small>
             </div>
 
+            <div class="field local-mode-field">
+              <label class="inline-check">
+                <input id="live-transcript" type="checkbox" />
+                <span>Live transcript previews</span>
+              </label>
+              <small>Uses an extra local audio-to-text request while you speak. Off keeps turns final-only.</small>
+            </div>
+
             <label class="field">
               <span>Instructions</span>
               <textarea id="instructions" rows="5" placeholder="You are a friendly voice assistant..."></textarea>

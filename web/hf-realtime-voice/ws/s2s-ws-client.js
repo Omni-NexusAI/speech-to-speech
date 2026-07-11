@@ -195,6 +195,8 @@ export class S2sWsRealtimeClient extends EventTarget {
      * queued requestResponse(). A payload may carry an image to send just
      * before its create (so the frame travels with the create, not eagerly). */
     this._createQueue = [];
+    /** @type {Map<string, { resolve: () => void, reject: (reason?: unknown) => void, timer: number }>} */
+    this._toolOutputAcks = new Map();
     /** @type {Promise<void> | null} */
     this._readyPromise = null;
     this._sessionConfigured = false;
@@ -748,6 +750,17 @@ export class S2sWsRealtimeClient extends EventTarget {
         break;
       }
 
+      case "conversation.item.created": {
+        const item = event.item || {};
+        const pending = item.type === "function_call_output" ? this._toolOutputAcks.get(item.call_id) : null;
+        if (pending) {
+          clearTimeout(pending.timer);
+          this._toolOutputAcks.delete(item.call_id);
+          pending.resolve();
+        }
+        break;
+      }
+
       case "response.function_call_arguments.done": {
         const name = typeof event.name === "string" ? event.name : "";
         const args = typeof event.arguments === "string" ? event.arguments : "{}";
@@ -858,12 +871,9 @@ export class S2sWsRealtimeClient extends EventTarget {
         // again).
         if (err?.type === "conversation_already_has_active_response" ||
             err?.code === "conversation_already_has_active_response") {
-          if (this._createInFlight) {
-            this._createInFlight = false;
-            // Re-queue a BARE create: any image on the original payload was
-            // already sent before this (rejected) create, so don't resend it.
-            this._createQueue.push({});
-          }
+          this._createInFlight = false;
+          this._createQueue = [];
+          this.dispatchEvent(new CustomEvent("server-error", { detail: { error: new Error(err?.message ?? "Response already active") } }));
           break;
         }
         // Every other server error is non-fatal: surface it for logging but
@@ -972,11 +982,21 @@ export class S2sWsRealtimeClient extends EventTarget {
    * @param {string} output Plain text / JSON string the model will read.
    */
   sendToolOutput(callId, output) {
-    if (!callId) return; // Can't target a result without the call id.
+    if (!callId) return Promise.reject(new Error("Missing function call id"));
+    if (this._toolOutputAcks.has(callId)) return Promise.reject(new Error(`Tool output already pending (${callId})`));
+    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return Promise.reject(new Error("WebSocket is not connected"));
+    const ack = new Promise((resolve, reject) => {
+      const timer = window.setTimeout(() => {
+        this._toolOutputAcks.delete(callId);
+        reject(new Error(`Timed out waiting for tool output acknowledgement (${callId})`));
+      }, 15000);
+      this._toolOutputAcks.set(callId, { resolve, reject, timer });
+    });
     this._send({
       type: "conversation.item.create",
       item: { type: "function_call_output", call_id: callId, output },
     });
+    return ack;
   }
 
   /**
@@ -1066,6 +1086,11 @@ export class S2sWsRealtimeClient extends EventTarget {
     // Abort a queue wait in progress: flag it and wake the poll sleep so
     // `_pollQueue` throws "aborted" and connect() unwinds cleanly.
     this._closed = true;
+    for (const pending of this._toolOutputAcks.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("WebSocket closed before tool output was acknowledged"));
+    }
+    this._toolOutputAcks.clear();
     if (this._queueWake) {
       clearTimeout(this._queueTimer);
       const wake = this._queueWake;

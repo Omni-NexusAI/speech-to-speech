@@ -965,9 +965,10 @@ class TestDispatchPipelineEvent:
                 tools=[{"type": "function_call", "call_id": "c1", "name": "f1", "arguments": "{}"}],
             ),
         )
-        assert len(events) == 1
-        assert isinstance(events[0], ResponseFunctionCallArgumentsDoneEvent)
-        assert events[0].output_index == 0
+        assert len(events) == 2
+        assert events[0].type == "response.created"
+        assert isinstance(events[1], ResponseFunctionCallArgumentsDoneEvent)
+        assert events[1].output_index == 0
 
     def test_assistant_text_text_only_emits_text_events(self, service, conn_id):
         from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams

@@ -165,6 +165,25 @@ def test_direct_tool_call_is_committed_before_browser_output():
     assert chat.buffer[-1].call_id == "call_camera"
     assert chat.stats()["pending_tool_calls"] == 0
 
+
+def test_direct_tool_call_without_transcript_keeps_a_function_call_partner():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    chat = Chat(30)
+    vad_audio = SimpleNamespace(runtime_config=SimpleNamespace(chat=chat), turn_id="turn_1", turn_revision=0)
+    tool = ResponseFunctionToolCall(
+        type="function_call",
+        name="web_search",
+        arguments='{"query":"local test"}',
+        call_id="call_search",
+        id="fc_search",
+        status="completed",
+    )
+
+    assert handler._commit_context(vad_audio, None, "", [tool]) is True
+    assert chat.stats()["pending_tool_calls"] == 1
+    assert chat.buffer[0].content[0].text == "[Audio turn; transcript unavailable.]"
+
 def test_direct_assistant_response_passes_through_transcription_notifier_and_llm():
     notifier = object.__new__(TranscriptionNotifier)
     notifier.setup(text_output_queue=None, runtime_config=None, should_listen=Event())

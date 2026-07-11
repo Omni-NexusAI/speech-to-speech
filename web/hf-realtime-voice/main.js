@@ -47,6 +47,7 @@ const STORAGE_KEYS = {
   diagnostics: "s2s.ws.diagnostics",
   diagnosticsGeometry: "s2s.ws.diagnosticsGeometry",
   fullBufferTts: "s2s.ws.fullBufferTts",
+  liveTranscript: "s2s.ws.liveTranscript",
 };
 
 // ── Noise gate ──────────────────────────────────────────────────────────────
@@ -106,6 +107,7 @@ function loadSettings() {
     instructions: localStorage.getItem(STORAGE_KEYS.instructions) || DEFAULT_INSTRUCTIONS,
     noiseGate: loadGateThreshold(),
     fullBufferTts: localStorage.getItem(STORAGE_KEYS.fullBufferTts) === "1",
+    liveTranscript: localStorage.getItem(STORAGE_KEYS.liveTranscript) === "1",
   };
 }
 
@@ -129,6 +131,7 @@ function saveSettings(s) {
   localStorage.setItem(STORAGE_KEYS.instructions, s.instructions);
   localStorage.setItem(STORAGE_KEYS.noiseGate, String(s.noiseGate));
   localStorage.setItem(STORAGE_KEYS.fullBufferTts, s.fullBufferTts ? "1" : "0");
+  localStorage.setItem(STORAGE_KEYS.liveTranscript, s.liveTranscript ? "1" : "0");
 }
 
 /** @returns {{ web_search: boolean, camera_snapshot: boolean }} */
@@ -262,6 +265,8 @@ const inputInstructions = $("#instructions");
 const inputNoiseGate = $("#noise-gate");
 /** @type {HTMLInputElement} */
 const inputFullBufferTts = $("#full-buffer-tts");
+/** @type {HTMLInputElement} */
+const inputLiveTranscript = $("#live-transcript");
 /** @type {HTMLElement} */
 const gateValue = $("#gate-value");
 /** @type {HTMLElement} */
@@ -435,6 +440,8 @@ function openSettings() {
   renderVoiceOptions();
   inputVoice.value = settings.voice;
   inputInstructions.value = settings.instructions;
+  inputFullBufferTts.checked = settings.fullBufferTts;
+  inputLiveTranscript.checked = settings.liveTranscript;
   syncGateUi();
   updateRestartAvailability();
   settingsModal.showModal();
@@ -842,7 +849,7 @@ async function runTool(name, argsJson, callId) {
       result.output = await execWebSearch(query);
       // Return the result and let the bare response.create (below) trigger the
       // spoken answer.
-      client.sendToolOutput(callId, result.output);
+      await client.sendToolOutput(callId, result.output);
     } else if (name === "camera_snapshot") {
       const dataUrl = captureSnapshot();
       if (dataUrl) {
@@ -851,21 +858,21 @@ async function runTool(name, argsJson, callId) {
         // Return the tool output; the frame itself rides along with the
         // response.create below (sent right before it), so the model sees the
         // snapshot in the very response it's about to speak.
-        client.sendToolOutput(callId, result.output);
+        await client.sendToolOutput(callId, result.output);
         flashPreview();
       } else {
         console.warn("[tool] camera_snapshot: no frame — camera off or not ready");
         result.output = "The camera is not available right now.";
-        client.sendToolOutput(callId, result.output);
+        await client.sendToolOutput(callId, result.output);
       }
     } else {
       result.output = `Unknown tool: ${name}`;
-      client.sendToolOutput(callId, result.output);
+      await client.sendToolOutput(callId, result.output);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     result.output = `Tool failed: ${msg}`;
-    client.sendToolOutput(callId, result.output);
+    await client.sendToolOutput(callId, result.output);
   }
   if (DEBUG) console.debug(`[tool] requesting model response after ${name}`);
   // Camera: the captured frame rides with the response.create (sent just before
@@ -1158,6 +1165,7 @@ function readSettingsFromForm() {
     instructions: inputInstructions.value.trim() || DEFAULT_INSTRUCTIONS,
     noiseGate: readGateThreshold(),
     fullBufferTts: inputFullBufferTts.checked,
+    liveTranscript: inputLiveTranscript.checked,
   };
 }
 
@@ -1211,7 +1219,7 @@ settingsForm.addEventListener("submit", (event) => {
   // changed connection URL only takes effect on the next restart.
   if (client && LIVE_STATES.has(currentState)) {
     client.updateSession({ voice: settings.voice, instructions: effectiveInstructions() });
-    client.updateLocalPipeline({ full_buffer_tts: settings.fullBufferTts });
+    client.updateLocalPipeline({ full_buffer_tts: settings.fullBufferTts, live_transcription: settings.liveTranscript });
   }
 });
 
@@ -1532,7 +1540,7 @@ async function doStart(audioContext = null) {
 
   try {
     await c.connect();
-    c.updateLocalPipeline({ full_buffer_tts: settings.fullBufferTts });
+    c.updateLocalPipeline({ full_buffer_tts: settings.fullBufferTts, live_transcription: settings.liveTranscript });
   } catch (err) {
     // The grant can be refused (402 → limit) or the dial can fail. In LB mode
     // the AudioContext hasn't been adopted by the client yet (the session POST

@@ -215,6 +215,14 @@ def setup_logger(log_level: str) -> None:
         level=log_level.upper(),
         format="%(asctime)s - %(pipeline_prefix)s%(name)s - %(levelname)s - %(message)s",
     )
+    runtime_log_path = os.getenv("S2S_RUNTIME_LOG_FILE")
+    if runtime_log_path:
+        root_logger = logging.getLogger()
+        target = os.path.abspath(runtime_log_path)
+        if not any(getattr(handler, "baseFilename", None) == target for handler in root_logger.handlers):
+            file_handler = logging.FileHandler(target, encoding="utf-8")
+            file_handler.setFormatter(logging.Formatter("%(asctime)s - %(pipeline_prefix)s%(name)s - %(levelname)s - %(message)s"))
+            root_logger.addHandler(file_handler)
     # Attach the filter to every existing handler so each LogRecord gets a
     # `pipeline_prefix` attribute (matching the format string above).
     pipeline_filter = PipelineLogFilter()
@@ -539,7 +547,7 @@ def _build_realtime_pipeline_unit(
         speculative_turns=speculative_turns,
     )
 
-    if module_kwargs.enable_live_transcription:
+    if module_kwargs.enable_live_transcription or module_kwargs.stt == "gemma-audio":
         vad_kw.enable_realtime_transcription = True
         vad_kw.realtime_processing_pause = module_kwargs.live_transcription_update_interval
 
@@ -728,7 +736,7 @@ def build_pipeline(
         ]
 
     # Set VAD realtime transcription parameters from module_kwargs
-    if module_kwargs.enable_live_transcription:
+    if module_kwargs.enable_live_transcription or module_kwargs.stt == "gemma-audio":
         vad_handler_kwargs.enable_realtime_transcription = True
         vad_handler_kwargs.realtime_processing_pause = module_kwargs.live_transcription_update_interval
 

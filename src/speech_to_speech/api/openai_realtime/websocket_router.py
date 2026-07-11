@@ -365,9 +365,11 @@ def create_app(
 
                 if raw.get("type") == "local.pipeline.update":
                     config = raw.get("config") if isinstance(raw.get("config"), dict) else {}
-                    allowed = {"full_buffer_tts"}
+                    allowed = {"full_buffer_tts", "live_transcription"}
                     rt_cfg = unit.service._state(session_id).runtime_config
-                    rt_cfg.local_pipeline.update({k: v for k, v in config.items() if k in allowed})
+                    rt_cfg.local_pipeline.update(
+                        {k: bool(v) for k, v in config.items() if k in allowed and isinstance(v, bool)}
+                    )
                     continue
 
                 event = unit.service.parse_client_event(raw)

@@ -478,8 +478,10 @@ class TestSDKToolCalling:
                 )
             )
 
+            created = await _recv(conn)
             e1 = await _recv(conn)
             e2 = await _recv(conn)
+            assert created.type == "response.created"
             assert e1.type == FUNCTION_CALL_DONE
             assert e2.type == FUNCTION_CALL_DONE
             assert e1.output_index == 0
