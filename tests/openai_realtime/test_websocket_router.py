@@ -11,6 +11,7 @@ import base64
 import time
 from queue import Empty, Queue
 from threading import Event as ThreadingEvent
+from threading import Timer
 
 import pytest
 from starlette.testclient import TestClient
@@ -568,6 +569,36 @@ class TestSendLoop:
                 assert service.total_usage.output_tokens == 5
                 assert service._state(conn_id).response_usage.input_tokens == 0
                 assert service._state(conn_id).response_usage.output_tokens == 0
+
+    def test_tool_only_event_arriving_after_audio_done_still_closes_response(self, setup):
+        app, service, _, output_queue, text_output_queue, *_ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()  # session.created
+                conn_id = list(service._conns.keys())[0]
+                delayed_tool = Timer(
+                    0.01,
+                    lambda: text_output_queue.put(
+                        AssistantTextEvent(
+                            text="",
+                            tools=[{"type": "function_call", "call_id": "c1", "name": "f1", "arguments": "{}"}],
+                        )
+                    ),
+                )
+                delayed_tool.start()
+                output_queue.put(AUDIO_RESPONSE_DONE)
+
+                types = [ws.receive_json()["type"] for _ in range(4)]
+                delayed_tool.join(timeout=1.0)
+
+                assert types == [
+                    "response.created",
+                    "response.function_call_arguments.done",
+                    "response.output_audio.done",
+                    "response.done",
+                ]
+                assert service._state(conn_id).in_response is False
+                assert service._state(conn_id).pending_tool_call_ids == {"c1"}
 
     def test_response_completion_drain_sends_pending_tool_before_done(self, setup):
         _, service, input_queue, output_queue, text_output_queue, should_listen, _, response_playing, cancel_scope = (

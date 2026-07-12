@@ -20,8 +20,8 @@
 - Speech output for this machine should use the existing Dockerized FasterQwen3TTS-compatible OpenAI API with `--qwen3_tts_backend openai-api`; do not modify the TTS container/image from this repo.
 - Local inference only for the custom test path: no cloud fallback should be introduced.
 - For Gemma 4 12B tests, use the settings from `C:\llama.cpp\launch_gemma-4-12B-it-qat-MTP.ps1` with context reduced to 16k; this repo provides `scripts\launch_gemma_4_12b_16k.ps1` for that.
-- The target TTS container for this framework is `qwen3-tts-faster` (`281c411e5cfe02d0b0d903f67cd3fb712ab38bc705eb3edbedd8a2041c78702b`) on `http://127.0.0.1:8881/v1`.
-- Qwen3 clone output must use the `1.7B-Base` backend model by default; the `qwen3-tts-faster` container hardcodes this model and does not expose the candidate container's `/v1/backend/models` switch API.
+- The target TTS service is the stable Docker container name `qwen3-tts-faster` on `http://127.0.0.1:8881/v1`; container IDs are transient after authorized rebuilds and must not be used by lifecycle scripts.
+- Qwen3 clone output must use the `1.7B-Base` backend model by default; the `qwen3-tts-faster` API exposes native incremental PCM16 clone streaming while preserving buffered formats for non-streaming requests.
 - The realtime UI should expose saved Voice Studio `Base` clone profiles only, with `clone:16d9bb336799` (`J.A.R.V.I.S`) as the default.
 - Do not test Gemma/llama.cpp while the local Gemma server is being rebuilt.
 

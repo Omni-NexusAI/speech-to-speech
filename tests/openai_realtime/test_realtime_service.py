@@ -339,6 +339,44 @@ class TestHandleConversationItemCreate:
             for e in service._state(conn_id).runtime_config.chat.buffer
         )
 
+    def test_matching_tool_output_unlocks_exactly_one_followup(self, service, conn_id, text_prompt_queue):
+        from openai.types.realtime.realtime_conversation_item_function_call import (
+            RealtimeConversationItemFunctionCall,
+        )
+
+        st = service._state(conn_id)
+        st.runtime_config.chat.add_item(
+            RealtimeConversationItemFunctionCall(
+                type="function_call", call_id="call_1", name="web_search", arguments="{}"
+            )
+        )
+        st.pending_tool_call_ids.add("call_1")
+        output = ConversationItemCreateEvent(
+            type="conversation.item.create",
+            item={"type": "function_call_output", "output": "result", "call_id": "call_1"},
+        )
+
+        service.handle_conversation_item_create(conn_id, output)
+        assert st.pending_tool_call_ids == set()
+        assert st.tool_followup_ready is True
+
+        created = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert isinstance(created, ResponseCreatedEvent)
+        assert st.tool_followup_started is True
+
+        duplicate = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert isinstance(duplicate, RealtimeErrorEvent)
+        assert duplicate.error.type == "duplicate_tool_followup"
+
+    def test_response_create_waits_for_matching_tool_output(self, service, conn_id):
+        st = service._state(conn_id)
+        st.pending_tool_call_ids.add("call_1")
+
+        result = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+
+        assert isinstance(result, RealtimeErrorEvent)
+        assert result.error.type == "tool_output_pending"
+
     def test_input_image_forwarded(self, service, conn_id, text_prompt_queue):
         evt = ConversationItemCreateEvent(
             type="conversation.item.create",
@@ -969,6 +1007,8 @@ class TestDispatchPipelineEvent:
         assert events[0].type == "response.created"
         assert isinstance(events[1], ResponseFunctionCallArgumentsDoneEvent)
         assert events[1].output_index == 0
+        assert service._state(conn_id).in_response is True
+        assert service._state(conn_id).pending_tool_call_ids == {"c1"}
 
     def test_assistant_text_text_only_emits_text_events(self, service, conn_id):
         from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams

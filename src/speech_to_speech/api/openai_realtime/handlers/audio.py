@@ -98,6 +98,11 @@ class AudioHandler(RealtimeBaseHandler):
         response = self._service.response
         events: list[ServerEvent] = []
         st = self._state(conn_id)
+        if st.pending_tool_call_ids or st.tool_followup_ready:
+            logger.info("Superseding unresolved tool transaction for a newer user turn")
+            st.pending_tool_call_ids.clear()
+            st.tool_followup_ready = False
+            st.tool_followup_started = False
         if st.in_response and event.interrupt_response and st.runtime_config.interrupt_response_enabled:
             events.extend(response.finish_response(conn_id, status="cancelled", reason="turn_detected"))
         is_reopen = bool(event.reopened and event.turn_id is not None and event.turn_id == st.speculative_turn_id)

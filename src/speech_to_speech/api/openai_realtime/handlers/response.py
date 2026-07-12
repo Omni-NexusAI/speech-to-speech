@@ -141,6 +141,16 @@ class ResponseHandler(RealtimeBaseHandler):
         on failure, or ``None`` if there is no text_prompt_queue.
         """
         st = self._state(conn_id)
+        if st.pending_tool_call_ids:
+            return self.make_error(
+                message="Cannot create a response until all pending tool outputs are received.",
+                _type="tool_output_pending",
+            )
+        if st.tool_followup_started:
+            return self.make_error(
+                message="A response has already been created for the current tool transaction.",
+                _type="duplicate_tool_followup",
+            )
         if event.response:
             if event.response.tool_choice and not isinstance(event.response.tool_choice, str):
                 return self.make_error(
@@ -171,6 +181,10 @@ class ResponseHandler(RealtimeBaseHandler):
         st.current_response_params = event.response
         st.current_response_id = _generate_id("resp")
         self._start_item(conn_id)
+        st.current_response_is_tool_followup = st.tool_followup_ready
+        if st.current_response_is_tool_followup:
+            st.tool_followup_ready = False
+            st.tool_followup_started = True
 
         cfg = st.runtime_config
         queue = self._queue(conn_id)
@@ -252,6 +266,9 @@ class ResponseHandler(RealtimeBaseHandler):
                 )
             )
             self._end_response(conn_id, status)
+            if st.current_response_is_tool_followup:
+                st.current_response_is_tool_followup = False
+                st.tool_followup_started = False
         # Apply any client items that arrived mid-generation now that in_response
         # is cleared and the generation's own write-back has landed. Done outside
         # the in_response guard so a stray terminal call still drains the buffer.
@@ -335,6 +352,9 @@ class ResponseHandler(RealtimeBaseHandler):
         if event.tools:
             st.response_usage.tool_calls += len(event.tools)
             for tool in event.tools:
+                st.pending_tool_call_ids.add(tool.call_id)
+                st.tool_followup_ready = False
+                st.tool_followup_started = False
                 events.append(
                     ResponseFunctionCallArgumentsDoneEvent(
                         type="response.function_call_arguments.done",

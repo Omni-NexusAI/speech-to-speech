@@ -215,6 +215,59 @@ def test_ensure_openai_api_backend_model_accepts_fixed_faster_container(monkeypa
     assert handler.api_response_format == "wav"
 
 
+def test_ensure_openai_api_backend_model_uses_fixed_faster_pcm_streaming_when_advertised(monkeypatch):
+    class FakeResponse:
+        def __init__(self, payload, status_code=200):
+            self._payload = payload
+            self.status_code = status_code
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, timeout=None):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, url, headers=None):
+            if url.endswith("/backend/models"):
+                return FakeResponse({}, status_code=404)
+            return FakeResponse(
+                {
+                    "backend": "faster-qwen3-tts",
+                    "capabilities": {
+                        "native_pcm_streaming": True,
+                        "stream_response_format": "pcm",
+                        "sample_rate": 24000,
+                    },
+                }
+            )
+
+    monkeypatch.setattr(qwen3_tts_module.httpx, "Client", FakeClient)
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.api_base_url = "http://127.0.0.1:8881/v1"
+    handler.api_backend_model = "1.7B-Base"
+    handler.api_timeout = None
+    handler.api_key = None
+    handler.api_response_format = "wav"
+    handler.api_sample_rate = 16000
+    handler.api_streaming_supported = False
+
+    handler._ensure_openai_api_backend_model()
+
+    assert handler.api_response_format == "pcm"
+    assert handler.api_sample_rate == 24000
+    assert handler.api_streaming_supported is True
+
+
 def test_api_voice_for_backend_maps_clone_id_to_profile_name(tmp_path):
     profile_dir = tmp_path / "profiles" / "16d9bb336799"
     profile_dir.mkdir(parents=True)

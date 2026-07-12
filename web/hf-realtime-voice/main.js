@@ -847,9 +847,6 @@ async function runTool(name, argsJson, callId) {
     if (name === "web_search") {
       const query = typeof args.query === "string" ? args.query : "";
       result.output = await execWebSearch(query);
-      // Return the result and let the bare response.create (below) trigger the
-      // spoken answer.
-      await client.sendToolOutput(callId, result.output);
     } else if (name === "camera_snapshot") {
       const dataUrl = captureSnapshot();
       if (dataUrl) {
@@ -858,21 +855,25 @@ async function runTool(name, argsJson, callId) {
         // Return the tool output; the frame itself rides along with the
         // response.create below (sent right before it), so the model sees the
         // snapshot in the very response it's about to speak.
-        await client.sendToolOutput(callId, result.output);
         flashPreview();
       } else {
         console.warn("[tool] camera_snapshot: no frame — camera off or not ready");
         result.output = "The camera is not available right now.";
-        await client.sendToolOutput(callId, result.output);
       }
     } else {
       result.output = `Unknown tool: ${name}`;
-      await client.sendToolOutput(callId, result.output);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     result.output = `Tool failed: ${msg}`;
+  }
+  try {
     await client.sendToolOutput(callId, result.output);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    result.output = `Tool output was not accepted: ${msg}`;
+    addPipelineMetric({ stage: "tool", status: "failed", elapsed_ms: performance.now() - toolStartedAt, detail: { name } });
+    return result;
   }
   if (DEBUG) console.debug(`[tool] requesting model response after ${name}`);
   // Camera: the captured frame rides with the response.create (sent just before
@@ -1470,11 +1471,11 @@ async function doStart(audioContext = null) {
 
   c.addEventListener("toolcall", (e) => {
     const { name, arguments: args, callId } = /** @type {CustomEvent<{ name: string; arguments: string; callId: string }>} */ (e).detail;
-    chat.onToolCall(name);
+    chat.onToolCall(name, args, callId);
     // Execute the tool, then push it to the conversation once the result is in,
     // so the toggle shows both the call input and its output together.
     void runTool(name, args, callId).then(({ output, image }) => {
-      chat.onToolResult(name, args, output, image);
+      chat.onToolResult(name, args, output, image, callId);
     });
   });
   c.addEventListener("error", (e) => {
@@ -1532,6 +1533,7 @@ async function doStart(audioContext = null) {
   c.addEventListener("turn-state", (e) => {
     const status = /** @type {CustomEvent<any>} */ (e).detail.status;
     if (status !== "speech_stopped") return;
+    chat.onUserTurnPending();
     clearTimeout(backendMetricTimer);
     backendMetricTimer = window.setTimeout(() => {
       setDiagnosticWarning("backend-metrics", "No backend metrics arrived for this turn. The backend may be stale or disconnected.");

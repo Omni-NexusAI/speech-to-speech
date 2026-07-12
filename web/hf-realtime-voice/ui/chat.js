@@ -49,6 +49,8 @@ export class ChatView {
     /** @type {HTMLElement | null} */
     this._activeUserBubble = null;
     this._activeUserItemId = "";
+    /** @type {HTMLElement | null} */
+    this._pendingUserHist = null;
     // Monotonic counter for synthesizing unique keys when the server omits an
     // item_id / response_id, so id-less messages never collapse onto each other.
     this._anonSeq = 0;
@@ -56,6 +58,8 @@ export class ChatView {
     // ── Assistant transcript state (keyed by response_id) ──────────────────
     /** @type {Map<string, { bubble: HTMLElement, hist: HTMLElement }>} */
     this._asstByResp = new Map();
+    /** @type {Map<string, HTMLElement>} */
+    this._toolHistByCall = new Map();
 
     // ── Ephemeral bubble auto-dismiss ──────────────────────────────────────
     // Per-element expiry (epoch ms). A bubble fades once its expiry passes —
@@ -275,6 +279,7 @@ export class ChatView {
     });
     this._chatHistory.appendChild(el);
     this._scrollToBottom();
+    return el;
   }
 
   /** Tag an assistant history row as interrupted (user barged in mid-reply).
@@ -315,7 +320,9 @@ export class ChatView {
     this._userHistByItem.clear();
     this._activeUserBubble = null;
     this._activeUserItemId = "";
+    this._pendingUserHist = null;
     this._asstByResp.clear();
+    this._toolHistByCall.clear();
   }
 
   // ── Client event handlers ─────────────────────────────────────────────────
@@ -337,7 +344,8 @@ export class ChatView {
 
       let hist = this._userHistByItem.get(id);
       if (!hist) {
-        hist = this._appendHistMsg("user", text, d.partial);
+        hist = this._pendingUserHist || this._appendHistMsg("user", text, d.partial);
+        this._pendingUserHist = null;
         this._userHistByItem.set(id, hist);
       } else {
         this._updateHistMsg(hist, text, d.partial);
@@ -374,6 +382,13 @@ export class ChatView {
     }
   }
 
+  /** Reserve chronology at speech stop before a direct-audio result arrives. */
+  onUserTurnPending() {
+    if (this._pendingUserHist) return;
+    this._pendingUserHist = this._appendHistMsg("user", "Transcribing audio…", true);
+    this._markUnread();
+  }
+
   /**
    * A response closed (completed or cancelled).
    * @param {{ responseId: string; status: string; audible?: boolean; transcript?: string }} detail
@@ -384,6 +399,13 @@ export class ChatView {
     // Without an id we can't target a specific response; the bubble will
     // auto-dismiss on its own timer regardless.
     if (!responseId) return;
+    if (this._pendingUserHist && status !== "cancelled") {
+      // A missing validated transcript is absence of data, not user text.
+      // Remove the chronology reservation instead of displaying a fabricated
+      // placeholder in conversation history.
+      this._pendingUserHist.remove();
+      this._pendingUserHist = null;
+    }
     const entry = this._asstByResp.get(responseId);
 
     if (status === "cancelled") {
@@ -408,17 +430,27 @@ export class ChatView {
     this._asstByResp.delete(responseId);
   }
 
-  /** The model called a tool — show an ephemeral "running" bubble.
-   *  @param {string} name */
-  onToolCall(name) {
+  /** The model called a tool — reserve its durable history position immediately.
+   *  @param {string} name @param {string} argsJson @param {string} callId */
+  onToolCall(name, argsJson, callId) {
     this._bumpDismiss(this._spawnBubble("tool", name));
+    if (callId && !this._toolHistByCall.has(callId)) {
+      this._toolHistByCall.set(callId, this._appendHistTool(name, argsJson, "Running…"));
+    }
     this._markUnread();
   }
 
-  /** The tool finished — append its call+result row (and any captured image).
-   *  @param {string} name @param {string} argsJson @param {string} output @param {string} [image] */
-  onToolResult(name, argsJson, output, image) {
-    this._appendHistTool(name, argsJson, output);
+  /** The tool finished — update its durable card (and any captured image).
+   *  @param {string} name @param {string} argsJson @param {string} output @param {string} [image] @param {string} [callId] */
+  onToolResult(name, argsJson, output, image, callId = "") {
+    const existing = callId ? this._toolHistByCall.get(callId) : null;
+    const outputEl = existing?.querySelector(".hist-tool-output");
+    if (outputEl) {
+      outputEl.textContent = output || "(no output)";
+      this._toolHistByCall.delete(callId);
+    } else {
+      this._appendHistTool(name, argsJson, output);
+    }
     if (image) this._appendHistImage(image); // show the captured frame below the call
     this._markUnread();
   }

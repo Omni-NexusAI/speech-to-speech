@@ -12,7 +12,9 @@ $LogRoot = Join-Path $RuntimeRoot "logs"
 $StatePath = Join-Path $RuntimeRoot "state.json"
 $Python = Join-Path $RepoRoot ".venv\Scripts\python.exe"
 $ConfigPath = Join-Path $RepoRoot "examples\local_gemma_fasterqwen3tts.json"
-$TtsContainer = "281c411e5cfe02d0b0d903f67cd3fb712ab38bc705eb3edbedd8a2041c78702b"
+# Docker recreates a container whenever the FasterQwen3TTS image changes; its
+# stable service name is the safe lifecycle identity, not a transient hash.
+$TtsContainer = "qwen3-tts-faster"
 $ExpectedTtsModel = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 $StateVersion = 2
 $Specs = @{

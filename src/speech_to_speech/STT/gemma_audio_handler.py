@@ -344,6 +344,11 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 before, after = raw_text.split(_RESPONSE_MARKER, 1)
                 transcript = self._extract_transcript(before)
                 transcript_value = transcript
+                if transcript:
+                    # Establish the user transcript before assistant chunks are
+                    # forwarded, so the Realtime UI and conversation chronology
+                    # cannot render the assistant first.
+                    yield self._direct(vad_audio, "", transcript=transcript, is_final=False)
                 assistant_started = True
                 pending_response = after
             elif assistant_started:
@@ -354,11 +359,9 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                     yield self._direct(vad_audio, chunk, is_final=False)
         tools = self._tool_calls_from_accum(tool_accum)
         final_text = pending_response.strip() if assistant_started else self._fallback_response_text(raw_text)
-        transcript = transcript_value or self._extract_transcript(raw_text) or self._preview_transcripts.get(
-            (vad_audio.turn_id, vad_audio.turn_revision)
-        )
-        if not transcript:
-            transcript = self._transcribe_once(vad_audio)
+        # Final-only mode must not make a second generative request just to
+        # populate a user bubble: that can hallucinate speech and pollute chat.
+        transcript = transcript_value or self._extract_transcript(raw_text)
         full_response = self._fallback_response_text(raw_text)
         committed = self._commit_context(vad_audio, transcript, full_response, tools)
         self._preview_transcripts.pop((vad_audio.turn_id, vad_audio.turn_revision), None)
@@ -375,9 +378,6 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
 
     def _responses_from_text(self, text: str, vad_audio: STTIn, *, tools: list[ResponseFunctionToolCall] | None = None) -> Iterator[DirectAssistantResponse]:
         transcript = self._extract_transcript(text)
-        transcript = transcript or self._preview_transcripts.get((vad_audio.turn_id, vad_audio.turn_revision))
-        if not transcript:
-            transcript = self._transcribe_once(vad_audio)
         response_text = self._fallback_response_text(text)
         if response_text:
             console.print(f"[yellow]GEMMA AUDIO: {response_text}")
@@ -408,11 +408,11 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         if chat is None:
             return False
         before = chat.stats()
-        # A tool result must always have its persisted function-call partner.
-        # Keep a bounded placeholder when a generative audio model could not
-        # supply a transcript; dropping the entire turn orphaned browser tool
-        # output and made subsequent context appear to reset.
-        chat.add_item(make_user_message(transcript or "[Audio turn; transcript unavailable.]"))
+        # Fail closed when the audio model omits its transcript metadata. A
+        # fabricated placeholder is not user speech and must not enter context.
+        # Function calls remain valid partners for their later tool outputs.
+        if transcript:
+            chat.add_item(make_user_message(transcript))
         if assistant_text:
             chat.add_item(make_assistant_message(assistant_text))
         for tool in tools:

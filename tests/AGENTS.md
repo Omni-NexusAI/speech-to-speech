@@ -7,7 +7,7 @@
 ## Local Contracts
 
 - Realtime tests should cover instruction acknowledgement, direct-audio history serialization, final-only context commits, content-free trim counters, backend runtime identity, and PowerShell 5.1 lifecycle ordering.
-- Direct-audio regression coverage must prove that a final transcript does not enqueue a second normal response and that an explicit post-tool `response.create` still starts one follow-up. Tool-only direct responses must emit a lifecycle event, and missing transcripts must retain their function-call/output pair in context.
+- Direct-audio regression coverage must prove that a final transcript does not enqueue a second normal response and that an explicit post-tool `response.create` still starts one follow-up. Tool-only direct responses must drain their call event before completion, and missing transcripts must retain their function-call/output pair without inserting placeholder user text.
 
 - Prefer mocked HTTP and monkeypatched model setup for backend-adapter tests.
 - Tests for the local Gemma/FasterQwen3TTS path must not require running local models or Docker containers.

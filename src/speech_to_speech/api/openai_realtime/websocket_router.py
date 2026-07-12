@@ -38,6 +38,10 @@ from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, PIPELINE_END
 
 logger = logging.getLogger(__name__)
 MAX_AUDIO_BATCH_BYTES = 6400
+# The TTS completion sentinel and assistant/tool events travel on separate
+# queues. A tool-only turn can put the sentinel a few milliseconds first, so
+# allow the side channel one scheduler slice to catch up before closing.
+PENDING_RESPONSE_EVENT_GRACE_S = 0.05
 # How long the release path waits for SESSION_END to propagate through the
 # handler chain back to output_queue before clearing unit.session. Tests
 # monkeypatch this to a small value since their fixtures usually skip the
@@ -123,6 +127,12 @@ async def _drain_pending_response_events(
 ) -> None:
     if session_id is None:
         return
+
+    st = unit.service._state(session_id)
+    if st.current_response_id is None and unit.text_output_queue.empty():
+        deadline = asyncio.get_running_loop().time() + PENDING_RESPONSE_EVENT_GRACE_S
+        while unit.text_output_queue.empty() and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.005)
 
     preserved: list[Any] = []
     drained_assistant = 0

@@ -203,6 +203,12 @@ class ConnState(BaseModel):
     # write-back (cross-thread), so they are buffered here and flushed in order
     # once the response completes. See ConversationHandler.flush_deferred_items.
     deferred_items: list[ConversationItem] = Field(default_factory=list)
+    # Tool continuations are a call-ID-bound transaction. The browser may only
+    # create one post-tool response after every matching output reaches Chat.
+    pending_tool_call_ids: set[str] = Field(default_factory=set)
+    tool_followup_ready: bool = False
+    tool_followup_started: bool = False
+    current_response_is_tool_followup: bool = False
 
 
 class RealtimeService:

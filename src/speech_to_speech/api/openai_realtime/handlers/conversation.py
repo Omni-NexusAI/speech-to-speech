@@ -62,6 +62,13 @@ class ConversationHandler(RealtimeBaseHandler):
         if not item:
             return []
         st = self._state(conn_id)
+        if getattr(item, "type", None) == "function_call_output":
+            call_id = getattr(item, "call_id", None)
+            if call_id in st.pending_tool_call_ids:
+                st.pending_tool_call_ids.remove(call_id)
+                if not st.pending_tool_call_ids:
+                    st.tool_followup_ready = True
+                    logger.info("Tool transaction ready for one follow-up response")
         event = ConversationItemCreatedEvent(
             type="conversation.item.created",
             event_id=self._next_event_id(),

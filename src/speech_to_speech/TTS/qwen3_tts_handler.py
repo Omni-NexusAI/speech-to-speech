@@ -165,6 +165,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.api_backend_model = api_backend_model
         self.api_voice_library_dir = self._resolve_api_voice_library_dir(api_voice_library_dir)
         self.api_response_format = "pcm"
+        self.api_streaming_supported = False
         self.api_sample_rate = int(api_sample_rate)
         self.api_timeout = httpx.Timeout(float(api_timeout_s), connect=10.0)
 
@@ -749,10 +750,19 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                 health_response.raise_for_status()
                 health = health_response.json()
                 if health.get("backend") == "faster-qwen3-tts":
-                    self.api_response_format = "wav"
+                    capabilities = health.get("capabilities") or {}
+                    streaming_pcm = bool(capabilities.get("native_pcm_streaming")) and (
+                        capabilities.get("stream_response_format") == "pcm"
+                    )
+                    self.api_streaming_supported = streaming_pcm
+                    self.api_response_format = "pcm" if streaming_pcm else "wav"
+                    sample_rate = capabilities.get("sample_rate")
+                    if streaming_pcm and isinstance(sample_rate, int) and sample_rate > 0:
+                        self.api_sample_rate = sample_rate
                     logger.info(
-                        "Qwen3-TTS API does not expose model switching; assuming fixed %s backend from faster container",
+                        "FasterQwen3TTS fixed %s backend detected; native PCM streaming=%s",
                         self.api_backend_model,
+                        streaming_pcm,
                     )
                     return
             status_response.raise_for_status()

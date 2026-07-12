@@ -18,6 +18,7 @@
 - When the backend emits `pipeline.metric`, keep the UI rendering lightweight and diagnostic-only; do not infer pipeline state by duplicating backend logic in the browser.
 - Local runtime toggles such as full response buffering and live transcript previews should use `local.pipeline.update`, leaving OpenAI-compatible `session.update` for standard voice/instructions/tool fields.
 - Tool output must wait for its `conversation.item.created` acknowledgement before requesting the one post-tool response. Never replay a rejected `response.create` on a later user turn.
+- Speech stop may reserve user chronology, but a turn without a validated final transcript must remove that reservation instead of displaying synthetic transcript text.
 - Camera preview and Diagnostics should not occupy the same desktop corner; keep the camera self-view clear when diagnostics are open.
 
 ## Child DOX Index
