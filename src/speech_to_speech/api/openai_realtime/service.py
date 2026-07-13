@@ -48,6 +48,7 @@ from speech_to_speech.pipeline.events import (
     PipelineEvent,
     PipelineMetricEvent,
     ResponseFailedEvent,
+    ResponseOutputCompleteEvent,
     SpeechStartedEvent,
     SpeechStoppedEvent,
     TokenUsageEvent,
@@ -211,6 +212,8 @@ class ConnState(BaseModel):
     tool_followup_ready: bool = False
     tool_followup_started: bool = False
     current_response_is_tool_followup: bool = False
+    text_output_complete: bool = False
+    await_text_output_complete: bool = False
 
 
 class RealtimeService:
@@ -250,6 +253,7 @@ class RealtimeService:
             PartialTranscriptionEvent: self.conversation.on_partial_transcription,
             TranscriptionCompletedEvent: self._on_transcription_completed,
             ResponseFailedEvent: self._on_response_failed,
+            ResponseOutputCompleteEvent: self._on_response_output_complete,
             PipelineMetricEvent: self._on_pipeline_metric,
         }
 
@@ -452,12 +456,18 @@ class RealtimeService:
             return False
         if not isinstance(
             event,
-            (PartialTranscriptionEvent, TranscriptionCompletedEvent, AssistantTextEvent, TokenUsageEvent),
+            (
+                PartialTranscriptionEvent,
+                TranscriptionCompletedEvent,
+                AssistantTextEvent,
+                TokenUsageEvent,
+                ResponseOutputCompleteEvent,
+            ),
         ):
             return False
         turn_id = getattr(event, "turn_id", None)
         turn_revision = getattr(event, "turn_revision", None)
-        if isinstance(event, (AssistantTextEvent, TokenUsageEvent)):
+        if isinstance(event, (AssistantTextEvent, TokenUsageEvent, ResponseOutputCompleteEvent)):
             is_latest: bool | None
             if wait_for_pending_reopen:
                 is_latest = self.speculative_turns.is_latest_after_reopen_grace(turn_id, turn_revision)
@@ -512,6 +522,12 @@ class RealtimeService:
             st.speculative_user_turn_id = event.turn_id
             st.speculative_user_turn_revision = event.turn_revision
             st.speculative_user_speech_stopped_at_s = event.speech_stopped_at_s
+
+        # Direct Gemma commits complete user/assistant/tool history itself.
+        # Publish the authoritative tokenized value from the service rather
+        # than a partial stats-only metric from a pipeline handler.
+        if self.context_tokenizer_base_url:
+            events.append(self.context_metric(conn_id, "committed" if event.context_committed else "updated"))
 
         queue = self.text_prompt_queue
         if event.direct_audio_completed:
@@ -575,6 +591,14 @@ class RealtimeService:
         events: list[ServerEvent] = [self.make_error(event.message, "response_failed")]
         events.extend(self.response.finish_response(conn_id, status="failed"))
         return events
+
+    def _on_response_output_complete(
+        self, conn_id: str, event: ResponseOutputCompleteEvent
+    ) -> list[ServerEvent]:
+        self._state(conn_id).text_output_complete = True
+        if self.context_tokenizer_base_url:
+            return [self.context_metric(conn_id, "committed")]
+        return []
 
     def _on_pipeline_metric(self, conn_id: str, event: PipelineMetricEvent) -> list[ServerEvent]:
         return [

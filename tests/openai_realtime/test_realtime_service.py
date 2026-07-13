@@ -502,7 +502,7 @@ class TestDeferConversationItemsDuringResponse:
         created = [e for e in events if isinstance(e, ConversationItemCreatedEvent)]
         assert len(created) == 2
 
-    def test_function_call_output_deferred_then_pairs_after_response(self, service, conn_id):
+    def test_function_call_output_is_acknowledged_and_pairs_during_response(self, service, conn_id):
         from openai.types.realtime.realtime_conversation_item_function_call import (
             RealtimeConversationItemFunctionCall,
         )
@@ -521,13 +521,12 @@ class TestDeferConversationItemsDuringResponse:
             item={"type": "function_call_output", "output": "ok", "call_id": "call_1"},
         )
         # Output arrives mid-response: deferred (applying now could race), no error.
-        assert service.handle_conversation_item_create(conn_id, evt) == []
-        assert len(st.deferred_items) == 1
-
-        finish_events = service.finish_response(conn_id)
+        created = service.handle_conversation_item_create(conn_id, evt)
+        assert len(created) == 1
+        assert isinstance(created[0], ConversationItemCreatedEvent)
+        assert st.deferred_items == []
 
         # Flushed after completion → pairs cleanly, no invalid_conversation_item error.
-        assert not any(isinstance(e, RealtimeErrorEvent) for e in finish_events)
         assert chat._has_call_id_in_buffer("call_1")
         assert chat.buffer[-1].type == "function_call_output"
 

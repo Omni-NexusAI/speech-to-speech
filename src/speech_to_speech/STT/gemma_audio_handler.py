@@ -40,6 +40,17 @@ _ASSISTANT_RESPONSE_RE = re.compile(
     r"(?ims)^\s*(?:ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:\s*(.+)\Z"
 )
 _SENTENCE_RE = re.compile(r"(.+?[.!?](?:\s+|$))", re.DOTALL)
+_TRANSCRIPT_CONTROL_TEXT = (
+    "listen to the attached user audio",
+    "respond directly as a concise voice assistant",
+    "do not include a transcript",
+    "audio content appears to be non-verbal",
+    "audio content appears to be unintelligible",
+    "user_transcript:",
+    "assistant_response:",
+)
+FAILED_TRANSCRIPT_TEXT = "Speech could not be transcribed."
+FAILED_TRANSCRIPT_REPLY = "I didn't catch that. Please repeat your request."
 
 
 class GemmaAudioSTTHandler(BaseSTTHandler):
@@ -53,7 +64,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         stream: bool = True,
         timeout_s: float = 120.0,
         format: str = "wav",
-        prompt: str = "Listen to the attached user audio and respond directly as a concise voice assistant.",
+        prompt: str = "",
         system_prompt: str = "You are a local low-latency voice assistant. Answer naturally for speech synthesis.",
         gen_kwargs: dict[str, Any] | None = None,
         text_output_queue: Any | None = None,
@@ -65,6 +76,8 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         self.stream = stream
         self.timeout = httpx.Timeout(float(timeout_s), connect=10.0)
         self.audio_format = format
+        # Compatibility option for older configs. It must never be included in
+        # user multimodal content, where Gemma can mistake it for user speech.
         self.prompt = prompt
         self.system_prompt = system_prompt
         self.gen_kwargs = gen_kwargs or {}
@@ -72,6 +85,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         self.text_output_queue: Any | None = text_output_queue
         self.cancel_scope = cancel_scope
         self._preview_transcripts: dict[tuple[str | None, int | None], str] = {}
+        self._committed_user_turns: set[tuple[str | None, int | None]] = set()
         logger.info("Gemma audio direct mode configured for %s at %s", self.model_name, self.base_url)
 
     def process(self, vad_audio: STTIn) -> Iterator[STTOut]:
@@ -146,7 +160,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             "tool-call message content, but do not emit a result-dependent ASSISTANT_RESPONSE until the tool result "
             "is available. Do not wrap plain-text responses in JSON or Markdown."
         )
-        user_content: list[dict[str, Any]] = [{"type": "text", "text": self.prompt}]
+        user_content: list[dict[str, Any]] = []
         for image_url in self._conversation_image_urls(runtime_config):
             user_content.append({"type": "image_url", "image_url": {"url": image_url}})
         user_content.append({"type": "input_audio", "input_audio": {"data": encoded, "format": self.audio_format}})
@@ -287,15 +301,14 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         request is made. The fallback is deliberately isolated from TTS.
         """
         if transcript:
-            resolved = transcript
+            resolved = self._validate_transcript(transcript)
             source = "primary"
         else:
-            key = (vad_audio.turn_id, vad_audio.turn_revision)
-            resolved = self._preview_transcripts.get(key)
-            source = "live" if resolved else "fallback"
-            if not resolved:
-                self._emit_metric(vad_audio, "transcription", "fallback_start", detail={"mode": "final"})
-                resolved = self._transcribe_once(vad_audio)
+            resolved = None
+            source = "fallback"
+        if not resolved:
+            self._emit_metric(vad_audio, "transcription", "fallback_start", detail={"mode": "final"})
+            resolved = self._validate_transcript(self._transcribe_once(vad_audio))
         self._emit_metric(
             vad_audio,
             "transcription",
@@ -392,7 +405,16 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                     # Establish the user transcript before assistant chunks are
                     # forwarded, so the Realtime UI and conversation chronology
                     # cannot render the assistant first.
-                    yield self._direct(vad_audio, "", transcript=transcript, is_final=False)
+                    user_committed = self._commit_user_context(vad_audio, transcript)
+                    self._committed_user_turns.add((vad_audio.turn_id, vad_audio.turn_revision))
+                    yield self._direct(
+                        vad_audio,
+                        "",
+                        transcript=transcript,
+                        is_final=False,
+                        context_committed=user_committed,
+                        transcript_finalized=True,
+                    )
                 assistant_started = True
                 pending_response = after
             elif assistant_started:
@@ -409,7 +431,19 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         # populate a user bubble: that can hallucinate speech and pollute chat.
         transcript = self._final_transcript(vad_audio, transcript_value or self._extract_transcript(raw_text))
         full_response = self._fallback_response_text(raw_text)
-        committed = self._commit_context(vad_audio, transcript, full_response, tools)
+        if not transcript:
+            yield from self._failed_audio_turn(vad_audio)
+            self._preview_transcripts.pop((vad_audio.turn_id, vad_audio.turn_revision), None)
+            return
+        user_key = (vad_audio.turn_id, vad_audio.turn_revision)
+        committed = self._commit_context(
+            vad_audio,
+            transcript,
+            full_response,
+            tools,
+            include_user=user_key not in self._committed_user_turns,
+        )
+        self._committed_user_turns.discard(user_key)
         self._preview_transcripts.pop((vad_audio.turn_id, vad_audio.turn_revision), None)
         if final_text:
             logger.info("Gemma audio response ready (%d characters)", len(final_text))
@@ -424,6 +458,10 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
 
     def _responses_from_text(self, text: str, vad_audio: STTIn, *, tools: list[ResponseFunctionToolCall] | None = None) -> Iterator[DirectAssistantResponse]:
         transcript = self._final_transcript(vad_audio, self._extract_transcript(text))
+        if not transcript:
+            yield from self._failed_audio_turn(vad_audio)
+            self._preview_transcripts.pop((vad_audio.turn_id, vad_audio.turn_revision), None)
+            return
         response_text = self._fallback_response_text(text)
         if response_text:
             logger.info("Gemma audio response ready (%d characters)", len(response_text))
@@ -439,8 +477,8 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             context_committed=committed,
         )
 
-    def _direct(self, vad_audio: STTIn, text: str, *, transcript: str | None = None, tools: list[ResponseFunctionToolCall] | None = None, is_final: bool, context_committed: bool = False) -> DirectAssistantResponse:
-        return DirectAssistantResponse(text=text, transcript=transcript, is_final=is_final, tools=tools or [], language_code=None, turn_id=vad_audio.turn_id, turn_revision=vad_audio.turn_revision, speech_stopped_at_s=vad_audio.created_at_s, runtime_config=getattr(vad_audio, "runtime_config", None), context_committed=context_committed)
+    def _direct(self, vad_audio: STTIn, text: str, *, transcript: str | None = None, tools: list[ResponseFunctionToolCall] | None = None, is_final: bool, context_committed: bool = False, transcript_finalized: bool = False) -> DirectAssistantResponse:
+        return DirectAssistantResponse(text=text, transcript=transcript, is_final=is_final, tools=tools or [], language_code=None, turn_id=vad_audio.turn_id, turn_revision=vad_audio.turn_revision, speech_stopped_at_s=vad_audio.created_at_s, runtime_config=getattr(vad_audio, "runtime_config", None), context_committed=context_committed, transcript_finalized=transcript_finalized)
 
     def _commit_context(
         self,
@@ -448,16 +486,16 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         transcript: str | None,
         assistant_text: str,
         tools: list[ResponseFunctionToolCall],
+        *,
+        include_user: bool = True,
     ) -> bool:
         runtime_config = getattr(vad_audio, "runtime_config", None)
         chat = getattr(runtime_config, "chat", None)
         if chat is None:
             return False
-        before = chat.stats()
-        # Fail closed when the audio model omits its transcript metadata. A
-        # fabricated placeholder is not user speech and must not enter context.
-        # Function calls remain valid partners for their later tool outputs.
-        if transcript:
+        if not transcript:
+            return False
+        if include_user:
             chat.add_item(make_user_message(transcript))
         if assistant_text:
             chat.add_item(make_assistant_message(assistant_text))
@@ -476,13 +514,15 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         # path trims after its final assistant response is committed.
         if not tools:
             chat.trim_if_needed(None)
-        stats = chat.stats()
-        self._emit_metric(
-            vad_audio,
-            "context",
-            "trimmed" if stats["trim_count"] > before["trim_count"] else "committed",
-            detail={**stats, "policy": "visible_trim"},
-        )
+        return True
+
+    @staticmethod
+    def _commit_user_context(vad_audio: STTIn, transcript: str) -> bool:
+        runtime_config = getattr(vad_audio, "runtime_config", None)
+        chat = getattr(runtime_config, "chat", None)
+        if chat is None:
+            return False
+        chat.add_item(make_user_message(transcript))
         return True
 
     @staticmethod
@@ -490,8 +530,23 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         match = _FINAL_TRANSCRIPT_RE.search(text)
         if not match:
             return None
-        transcript = match.group(1).strip().strip('"')
-        return transcript or None
+        return GemmaAudioSTTHandler._validate_transcript(match.group(1))
+
+    @staticmethod
+    def _validate_transcript(value: str | None) -> str | None:
+        if not value:
+            return None
+        transcript = str(value).strip().strip('"')
+        if not transcript or "\n" in transcript or len(transcript) > 1200:
+            return None
+        normalized = " ".join(transcript.lower().split())
+        if transcript.startswith("[") and transcript.endswith("]"):
+            return None
+        if any(control in normalized for control in _TRANSCRIPT_CONTROL_TEXT):
+            return None
+        if normalized.startswith(("system:", "assistant:", "response:", "user:")):
+            return None
+        return transcript
 
     @staticmethod
     def _extract_preview_transcript(text: str) -> str | None:
@@ -507,9 +562,19 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         if prefix.strip() or _TRANSCRIPT_MARKER in transcript or _RESPONSE_MARKER in transcript:
             return None
         transcript = transcript.strip().strip('"')
-        if not transcript or "\n" in transcript:
-            return None
-        return transcript
+        return GemmaAudioSTTHandler._validate_transcript(transcript)
+
+    def _failed_audio_turn(self, vad_audio: STTIn) -> Iterator[DirectAssistantResponse]:
+        """Produce a visible deterministic retry turn without generated transcript text."""
+        self._emit_metric(vad_audio, "transcription", "failed", detail={"mode": "final", "source": "fallback"})
+        committed = self._commit_context(vad_audio, FAILED_TRANSCRIPT_TEXT, FAILED_TRANSCRIPT_REPLY, [])
+        yield self._direct(
+            vad_audio,
+            FAILED_TRANSCRIPT_REPLY,
+            transcript=FAILED_TRANSCRIPT_TEXT,
+            is_final=True,
+            context_committed=committed,
+        )
 
     @staticmethod
     def _fallback_response_text(text: str) -> str:

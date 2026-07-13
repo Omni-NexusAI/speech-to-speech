@@ -868,9 +868,10 @@ async function runTool(name, argsJson, callId) {
     result.output = `Tool failed: ${msg}`;
   }
   try {
-    addPipelineMetric({ stage: "tool", status: "awaiting_response_close", detail: { name, callId } });
-    await client.waitForResponseIdle();
-    await client.sendToolOutput(callId, result.output);
+    addPipelineMetric({ stage: "tool", status: "sending_output", detail: { name, callId } });
+    const outputAck = client.sendToolOutput(callId, result.output);
+    const responseClosed = client.waitForResponseIdle();
+    await Promise.all([outputAck, responseClosed]);
     addPipelineMetric({ stage: "tool", status: "output_acknowledged", detail: { name, callId } });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -980,7 +981,8 @@ function renderDiagnostics() {
   for (const metric of visibleMetrics) latestByStage.set(metric.stage, metric);
   const measured = visibleMetrics.filter((m) => typeof m.elapsed_ms === "number" && m.elapsed_ms >= 0);
   const bottleneck = measured.reduce((best, item) => !best || item.elapsed_ms > best.elapsed_ms ? item : best, null);
-  const context = latestByStage.get("context") || (backendRuntime?.context
+  const latestContext = [...pipelineMetrics].reverse().find((metric) => metric.stage === "context");
+  const context = latestContext || (backendRuntime?.context
     ? { status: "ready", detail: backendRuntime.context }
     : null);
   const contextMax = context?.detail?.max_tokens ?? localPipeline?.gemma?.contextWindow;

@@ -104,6 +104,15 @@ class ResponseFailedEvent(PipelineEvent):
     turn_revision: int | None = None
 
 
+class ResponseOutputCompleteEvent(PipelineEvent):
+    """Text/tool output for one response is fully queued before TTS completion."""
+
+    type: Literal["response_output_complete"] = "response_output_complete"
+    turn_id: str | None = None
+    turn_revision: int | None = None
+    cancel_generation: int | None = None
+
+
 class PipelineMetricEvent(PipelineEvent):
     """Low-overhead timing/status event for the realtime diagnostics panel."""
 

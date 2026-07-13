@@ -13,7 +13,12 @@ from collections.abc import Iterator
 from queue import Queue
 
 from speech_to_speech.baseHandler import BaseHandler
-from speech_to_speech.pipeline.events import AssistantTextEvent, ResponseFailedEvent, TokenUsageEvent
+from speech_to_speech.pipeline.events import (
+    AssistantTextEvent,
+    ResponseFailedEvent,
+    ResponseOutputCompleteEvent,
+    TokenUsageEvent,
+)
 from speech_to_speech.pipeline.handler_types import LLMOut, TTSIn
 from speech_to_speech.pipeline.messages import EndOfResponse, LLMResponseChunk, TokenUsage, TTSInput
 from speech_to_speech.pipeline.queue_types import TextEventItem
@@ -98,6 +103,14 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn]):
                         message=lm_output.error,
                         turn_id=lm_output.turn_id,
                         turn_revision=lm_output.turn_revision,
+                    )
+                )
+            if self.text_output_queue is not None:
+                self.text_output_queue.put(
+                    ResponseOutputCompleteEvent(
+                        turn_id=lm_output.turn_id,
+                        turn_revision=lm_output.turn_revision,
+                        cancel_generation=lm_output.cancel_generation,
                     )
                 )
             yield EndOfResponse(

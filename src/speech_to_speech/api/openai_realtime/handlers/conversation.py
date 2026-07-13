@@ -38,7 +38,7 @@ class ConversationHandler(RealtimeBaseHandler):
         generation on their own.  A subsequent ``response.create`` event is
         required to trigger the model.
 
-        While a response is generating, the item is *deferred*: applying it now
+        While a response is generating, ordinary items are *deferred*: applying them now
         would race the LLM handler's end-of-turn chat write-back, which runs on
         the pipeline thread (e.g. a ``function_call_output`` arriving before its
         ``function_call`` is recorded, or an image stripped before the next
@@ -46,7 +46,10 @@ class ConversationHandler(RealtimeBaseHandler):
         completes — see :meth:`flush_deferred_items`.
         """
         st = self._state(conn_id)
-        if st.in_response:
+        # Direct Gemma persists function calls before exposing them to the
+        # browser. The matching output is therefore safe to acknowledge now and
+        # must not wait behind the response that produced the call.
+        if st.in_response and getattr(event.item, "type", None) != "function_call_output":
             st.deferred_items.append(event.item)
             logger.debug("Deferred conversation item until the active response completes")
             return []

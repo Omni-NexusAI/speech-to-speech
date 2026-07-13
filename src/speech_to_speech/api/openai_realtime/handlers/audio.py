@@ -98,8 +98,13 @@ class AudioHandler(RealtimeBaseHandler):
         response = self._service.response
         events: list[ServerEvent] = []
         st = self._state(conn_id)
+        st.text_output_complete = False
+        st.await_text_output_complete = True
         if st.pending_tool_call_ids or st.tool_followup_ready:
             logger.info("Superseding unresolved tool transaction for a newer user turn")
+            self._service._state(conn_id).runtime_config.chat.discard_pending_tool_calls(
+                set(st.pending_tool_call_ids)
+            )
             st.pending_tool_call_ids.clear()
             st.tool_followup_ready = False
             st.tool_followup_started = False

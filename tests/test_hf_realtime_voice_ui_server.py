@@ -89,12 +89,13 @@ def test_live_transcript_toggle_only_controls_the_floating_user_bubble():
     assert "this._pendingUserHist || this._appendHistMsg" in chat_js
 
 
-def test_tool_output_waits_for_originating_response_to_close():
+def test_tool_output_is_acknowledged_before_one_post_tool_response():
     ui_dir = Path(__file__).resolve().parents[1] / "web" / "hf-realtime-voice"
     main_js = (ui_dir / "main.js").read_text(encoding="utf-8")
     client_js = (ui_dir / "ws" / "s2s-ws-client.js").read_text(encoding="utf-8")
 
-    assert main_js.index("await client.waitForResponseIdle()") < main_js.index("await client.sendToolOutput")
+    assert main_js.index("client.sendToolOutput") < main_js.index("client.waitForResponseIdle")
+    assert "await Promise.all([outputAck, responseClosed])" in main_js
     assert "waitForResponseIdle(timeoutMs = 20000)" in client_js
     assert "_resolveResponseIdleWaiters" in client_js
 

@@ -34,6 +34,7 @@ from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
     PartialTranscriptionEvent,
+    ResponseOutputCompleteEvent,
     SpeechStartedEvent,
     SpeechStoppedEvent,
     TranscriptionCompletedEvent,
@@ -385,6 +386,7 @@ class TestSDKPhantomSpeech:
             assert event.type == RESPONSE_CREATED
             await _recv(conn)  # audio delta
 
+            server_env.text_output_queue.put(ResponseOutputCompleteEvent())
             server_env.output_queue.put(AUDIO_RESPONSE_DONE)
             event = await _recv(conn)
             assert event.type == AUDIO_DONE

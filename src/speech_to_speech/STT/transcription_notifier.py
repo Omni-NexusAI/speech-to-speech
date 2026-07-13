@@ -44,6 +44,7 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
         self.text_output_queue = text_output_queue
         self.runtime_config = runtime_config
         self.should_listen = should_listen
+        self._finalized_direct_transcripts: set[tuple[str | None, int | None]] = set()
 
     def process(self, transcription: STTOut) -> Iterator[Union[STTOut, LLMIn]]:
         if isinstance(transcription, DirectAssistantResponse):
@@ -51,7 +52,13 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
             transcript = (transcription.transcript or "").strip()
             runtime_config = transcription.runtime_config or self.runtime_config
             if transcript and self.text_output_queue is not None:
-                if transcription.is_final:
+                transcript_key = (transcription.turn_id, transcription.turn_revision)
+                should_finalize = (
+                    (transcription.is_final or transcription.transcript_finalized)
+                    and transcript_key not in self._finalized_direct_transcripts
+                )
+                if should_finalize:
+                    self._finalized_direct_transcripts.add(transcript_key)
                     self.text_output_queue.put(
                         TranscriptionCompletedEvent(
                             transcript=transcript,
@@ -63,7 +70,7 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
                             direct_audio_completed=True,
                         )
                     )
-                else:
+                elif not transcription.is_final:
                     self.text_output_queue.put(
                         PartialTranscriptionEvent(
                             delta=transcript,
@@ -73,6 +80,8 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
                     )
             if self.runtime_config is not None and transcript:
                 self.runtime_config.chat.add_item(make_user_message(transcript))
+            if transcription.is_final:
+                self._finalized_direct_transcripts.discard((transcription.turn_id, transcription.turn_revision))
             if not text and not transcription.tools and not transcription.is_final:
                 return
             if text:

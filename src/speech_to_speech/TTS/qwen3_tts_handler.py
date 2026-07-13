@@ -26,7 +26,6 @@ import httpx
 import numpy as np
 import torch
 from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
-from rich.console import Console
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.baseHandler import BaseHandler
@@ -39,7 +38,19 @@ from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 from speech_to_speech.utils.mlx_lock import MLXLockContext
 
 logger = logging.getLogger(__name__)
-console = Console()
+
+
+class _NoopConsole:
+    """Compatibility shim for callers that previously patched the Rich console."""
+
+    @staticmethod
+    def print(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+# Kept for downstream test compatibility. The handler never writes assistant
+# content through it, so non-ASCII output cannot poison a Windows console.
+console = _NoopConsole()
 
 DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 DEFAULT_MLX_MODEL = "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit"
@@ -981,7 +992,10 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         if self.backend != "openai_api":
             self._apply_session_voice_override(model_type, runtime_config, response)
 
-        console.print(f"[green]ASSISTANT: {text}")
+        # Do not print assistant content through Rich here. A Windows CP1252
+        # console can reject non-ASCII text and leave Rich's buffer poisoned,
+        # blocking every later TTS request in the process.
+        logger.info("Qwen3 TTS request chars=%d backend=%s", len(text), self.backend)
         start_s = perf_counter()
         self._emit_metric(
             "tts",

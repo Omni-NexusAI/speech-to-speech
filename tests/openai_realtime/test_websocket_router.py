@@ -11,7 +11,6 @@ import base64
 import time
 from queue import Empty, Queue
 from threading import Event as ThreadingEvent
-from threading import Timer
 
 import pytest
 from starlette.testclient import TestClient
@@ -23,7 +22,12 @@ from speech_to_speech.api.openai_realtime.service import CHUNK_SIZE_BYTES, Realt
 from speech_to_speech.api.openai_realtime.websocket_router import create_app
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.control import SESSION_END, PipelineControlMessage, is_control_message
-from speech_to_speech.pipeline.events import AssistantTextEvent, SpeechStartedEvent, TokenUsageEvent
+from speech_to_speech.pipeline.events import (
+    AssistantTextEvent,
+    ResponseOutputCompleteEvent,
+    SpeechStartedEvent,
+    TokenUsageEvent,
+)
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, PIPELINE_END, AudioOutput
 
 # ---------------------------------------------------------------------------
@@ -570,26 +574,22 @@ class TestSendLoop:
                 assert service._state(conn_id).response_usage.input_tokens == 0
                 assert service._state(conn_id).response_usage.output_tokens == 0
 
-    def test_tool_only_event_arriving_after_audio_done_still_closes_response(self, setup):
+    def test_tool_only_event_closes_after_explicit_text_terminal(self, setup):
         app, service, _, output_queue, text_output_queue, *_ = setup
         with TestClient(app) as client:
             with client.websocket_connect("/v1/realtime") as ws:
                 ws.receive_json()  # session.created
                 conn_id = list(service._conns.keys())[0]
-                delayed_tool = Timer(
-                    0.01,
-                    lambda: text_output_queue.put(
-                        AssistantTextEvent(
-                            text="",
-                            tools=[{"type": "function_call", "call_id": "c1", "name": "f1", "arguments": "{}"}],
-                        )
-                    ),
+                text_output_queue.put(
+                    AssistantTextEvent(
+                        text="",
+                        tools=[{"type": "function_call", "call_id": "c1", "name": "f1", "arguments": "{}"}],
+                    )
                 )
-                delayed_tool.start()
+                text_output_queue.put(ResponseOutputCompleteEvent())
                 output_queue.put(AUDIO_RESPONSE_DONE)
 
                 types = [ws.receive_json()["type"] for _ in range(4)]
-                delayed_tool.join(timeout=1.0)
 
                 assert types == [
                     "response.created",

@@ -151,6 +151,25 @@ class Chat:
         with self._lock:
             self._append_tool_output_locked(call_id, output_item)
 
+    def discard_pending_tool_calls(self, call_ids: set[str]) -> None:
+        """Drop unresolved calls that were superseded by newer user speech."""
+        if not call_ids:
+            return
+        with self._lock:
+            self._pending_tool_calls = {
+                call_id: call
+                for call_id, call in self._pending_tool_calls.items()
+                if call_id not in call_ids
+            }
+            self.buffer = [
+                item
+                for item in self.buffer
+                if not (
+                    isinstance(item, RealtimeConversationItemFunctionCall)
+                    and item.call_id in call_ids
+                )
+            ]
+
     def _append_tool_output_locked(self, call_id: str, output_item: RealtimeConversationItemFunctionCallOutput) -> None:
         """Body of :meth:`append_tool_output`. Caller must hold ``_lock``."""
         if self._has_call_id_in_buffer(call_id):

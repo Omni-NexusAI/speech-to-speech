@@ -177,6 +177,8 @@ class ResponseHandler(RealtimeBaseHandler):
 
         st.in_response = True
         st.response_pending = False
+        st.text_output_complete = False
+        st.await_text_output_complete = True
 
         st.current_response_params = event.response
         st.current_response_id = _generate_id("resp")
@@ -266,6 +268,8 @@ class ResponseHandler(RealtimeBaseHandler):
                 )
             )
             self._end_response(conn_id, status)
+            st.text_output_complete = False
+            st.await_text_output_complete = False
             if st.current_response_is_tool_followup:
                 st.current_response_is_tool_followup = False
                 st.tool_followup_started = False

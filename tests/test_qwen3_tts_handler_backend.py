@@ -751,6 +751,19 @@ def test_estimate_max_new_tokens_can_exceed_default_ceiling_when_raised():
     assert handler._estimate_max_new_tokens(long_text) > 1536
 
 
+def test_openai_payload_preserves_multilingual_text_unchanged():
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.api_model = "qwen3-tts"
+    handler.api_response_format = "pcm"
+    text = "Guten Morgen. \u041f\u0440\u0438\u0432\u0435\u0442. \u3053\u3093\u306b\u3061\u306f\u3002"
+
+    payload = handler._openai_api_payload(text, "clone:16d9bb336799")
+
+    assert payload["input"] == text
+    assert payload["voice"] == "clone:16d9bb336799"
+    assert payload["stream"] is True
+
+
 def test_process_voice_clone_scales_max_new_tokens_for_faster_backend(monkeypatch):
     captured = {}
     handler = object.__new__(Qwen3TTSHandler)

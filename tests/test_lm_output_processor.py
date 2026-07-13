@@ -4,6 +4,7 @@ from threading import Event, Thread
 from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
 
 from speech_to_speech.LLM.lm_output_processor import LMOutputProcessor
+from speech_to_speech.pipeline.events import ResponseOutputCompleteEvent
 from speech_to_speech.pipeline.messages import EndOfResponse, LLMResponseChunk, TTSInput
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 
@@ -34,6 +35,9 @@ def test_latest_end_of_response_is_forwarded_to_tts():
     assert len(outputs) == 1
     assert outputs[0].turn_id == "turn_1"
     assert outputs[0].turn_revision == 1
+    terminal = processor.text_output_queue.get_nowait()
+    assert isinstance(terminal, ResponseOutputCompleteEvent)
+    assert terminal.turn_id == "turn_1"
 
 
 def test_cancel_generation_is_forwarded_to_tts():

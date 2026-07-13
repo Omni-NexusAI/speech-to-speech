@@ -2,12 +2,14 @@ from threading import Event
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from openai.types.realtime.conversation_item import RealtimeConversationItemFunctionCallOutput
 from openai.types.responses import ResponseFunctionToolCall
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.LLM.base_openai_compatible_language_model import BaseOpenAICompatibleHandler
 from speech_to_speech.LLM.chat import Chat, make_assistant_message, make_user_message
+from speech_to_speech.pipeline.events import TranscriptionCompletedEvent
 from speech_to_speech.pipeline.messages import DirectAssistantRequest, DirectAssistantResponse, LLMResponseChunk
 from speech_to_speech.STT.gemma_audio_handler import GemmaAudioSTTHandler
 from speech_to_speech.STT.transcription_notifier import TranscriptionNotifier
@@ -45,9 +47,9 @@ def test_gemma_audio_payload_uses_input_audio_wav_base64():
     assert payload["model"] == "gemma-test"
     assert payload["stream"] is False
     content = payload["messages"][1]["content"]
-    assert content[1]["type"] == "input_audio"
-    assert content[1]["input_audio"]["format"] == "wav"
-    assert isinstance(content[1]["input_audio"]["data"], str)
+    assert [part["type"] for part in content] == ["input_audio"]
+    assert content[0]["input_audio"]["format"] == "wav"
+    assert isinstance(content[0]["input_audio"]["data"], str)
 
 
 def test_gemma_audio_full_buffer_keeps_cancellable_streaming_transport():
@@ -86,8 +88,8 @@ def test_gemma_audio_payload_includes_recent_camera_images():
     payload = handler._payload(np.zeros(1600, dtype=np.float32), vad_audio)
 
     content = payload["messages"][1]["content"]
-    assert content[1] == {"type": "image_url", "image_url": {"url": image_url}}
-    assert content[2]["type"] == "input_audio"
+    assert content[0] == {"type": "image_url", "image_url": {"url": image_url}}
+    assert content[1]["type"] == "input_audio"
 
 
 def test_gemma_audio_payload_includes_instructions_history_tools_and_disables_thinking():
@@ -132,9 +134,12 @@ def test_preview_transcript_requires_the_transcript_prefix_and_rejects_assistant
 
 
 def test_final_transcript_accepts_narrow_equivalent_labels():
-    assert GemmaAudioSTTHandler._extract_transcript("USER: Open the camera\nASSISTANT: Certainly.") == "Open the camera"
+    assert GemmaAudioSTTHandler._extract_transcript("USER_TRANSCRIPT: Open the camera\nASSISTANT: Certainly.") == "Open the camera"
     assert GemmaAudioSTTHandler._extract_transcript("TRANSCRIPT: Search for Control 2\nRESPONSE: One moment.") == "Search for Control 2"
     assert GemmaAudioSTTHandler._extract_transcript("I can help with that.") is None
+    assert GemmaAudioSTTHandler._extract_transcript(
+        "USER_TRANSCRIPT: Listen to the attached user audio and respond directly as a concise voice assistant."
+    ) is None
 
 
 def test_missing_primary_transcript_uses_one_transcript_only_fallback():
@@ -202,7 +207,7 @@ def test_direct_tool_call_is_committed_before_browser_output():
     assert chat.stats()["pending_tool_calls"] == 0
 
 
-def test_direct_tool_call_without_transcript_keeps_only_the_function_call_partner():
+def test_direct_tool_call_without_transcript_does_not_pollute_context():
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
     chat = Chat(30)
@@ -216,9 +221,29 @@ def test_direct_tool_call_without_transcript_keeps_only_the_function_call_partne
         status="completed",
     )
 
-    assert handler._commit_context(vad_audio, None, "", [tool]) is True
-    assert chat.stats()["pending_tool_calls"] == 1
+    assert handler._commit_context(vad_audio, None, "", [tool]) is False
+    assert chat.stats()["pending_tool_calls"] == 0
     assert chat.buffer == []
+
+
+def test_invalid_direct_turn_uses_canonical_retry_without_tools():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    handler._transcribe_once = lambda _vad: None
+    chat = Chat(30)
+    vad_audio = SimpleNamespace(
+        runtime_config=RuntimeConfig(chat=chat),
+        turn_id="turn_bad_audio",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+
+    outputs = list(handler._responses_from_text("ASSISTANT_RESPONSE: fabricated response", vad_audio))
+
+    assert outputs[0].transcript == "Speech could not be transcribed."
+    assert outputs[0].text == "I didn't catch that. Please repeat your request."
+    assert outputs[0].tools == []
+    assert [item.type for item in chat.buffer] == ["message", "message"]
 
 def test_direct_assistant_response_passes_through_transcription_notifier_and_llm():
     notifier = object.__new__(TranscriptionNotifier)
@@ -263,3 +288,36 @@ def test_final_direct_response_marks_transcription_as_already_answered():
     completed = queue.get_nowait()
     assert completed.transcript == "Hello there"
     assert completed.direct_audio_completed is True
+
+
+def test_early_finalized_direct_transcript_is_persistent_and_not_duplicated():
+    from queue import Empty, Queue
+
+    queue = Queue()
+    notifier = object.__new__(TranscriptionNotifier)
+    notifier.setup(text_output_queue=queue, runtime_config=None, should_listen=Event())
+    early = DirectAssistantResponse(
+        text="",
+        transcript="Search for Control 2.",
+        is_final=False,
+        transcript_finalized=True,
+        turn_id="turn_early",
+        turn_revision=0,
+    )
+    final = DirectAssistantResponse(
+        text="I will look that up.",
+        transcript="Search for Control 2.",
+        is_final=True,
+        turn_id="turn_early",
+        turn_revision=0,
+    )
+
+    list(notifier.process(early))
+    event = queue.get_nowait()
+    assert isinstance(event, TranscriptionCompletedEvent)
+    assert event.transcript == "Search for Control 2."
+    assert event.direct_audio_completed is True
+
+    list(notifier.process(final))
+    with pytest.raises(Empty):
+        queue.get_nowait()

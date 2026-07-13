@@ -90,6 +90,9 @@ class DirectAssistantResponse(PipelineMessage):
     runtime_config: RuntimeConfig | None = None
     response: RealtimeResponseCreateParams | None = None
     context_committed: bool = False
+    # A validated user transcript may be finalized before the direct Gemma
+    # answer is complete so persistent history precedes streamed assistant text.
+    transcript_finalized: bool = False
 
 
 class DirectAssistantRequest(DirectAssistantResponse):

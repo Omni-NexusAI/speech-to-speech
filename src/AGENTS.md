@@ -6,7 +6,7 @@
 
 ## Local Contracts
 
-- Direct-audio Gemma requests include session instructions and a snapshot of bounded chat history with thinking disabled.
+- Direct-audio Gemma requests include session instructions and a snapshot of bounded chat history with thinking disabled; the current user message carries only audio plus an optional camera frame, never internal control text.
 - Progressive Gemma transcript previews are opt-in and ephemeral; final transcription is mandatory regardless of preview mode. Missing primary transcripts use one transcript-only fallback, and assistant text must never become user history.
 - Local history retains 30 complete turns without automatic summarization and emits content-free context metrics when committed or trimmed.
 - The realtime backend publishes runtime identity through `/v1/pool` and `pipeline.runtime`; local UI diagnostics use it to detect stale backend code.
@@ -23,8 +23,8 @@
 - Direct-audio completion events must close the user transcription without queuing the normal `GenerateResponseRequest`; otherwise one Gemma answer can create duplicate TTS playback and block later tool turns.
 - Provisional transcript bubbles are fail-closed: emit them only from a strict transcript-only Gemma preview, never from the direct assistant response formatter.
 - Pipeline stage timings should be emitted as realtime `pipeline.metric` events for VAD, Gemma, TTS, playback, and end-to-end diagnostics.
-- Tool-only direct responses must drain their assistant/tool side-channel event before the separately queued audio completion sentinel closes the response.
-- Client tool outputs are accepted only after the originating response closes, then acknowledged before one call-ID-bound follow-up response begins.
+- Tool-only direct responses must drain their assistant/tool side-channel event before the separately queued audio completion sentinel closes the response. A response-ID terminal barrier requires both text/tool completion and audio completion before one `response.done`.
+- Client tool outputs are accepted and acknowledged immediately when their `call_id` matches, then one call-ID-bound follow-up response begins only after the initial response closes.
 - Full-buffer Gemma mode keeps a cancellable streaming HTTP transport and buffers text locally so session Stop can abort in-flight generation.
 - Local-only realtime config may use `local.pipeline.update` for diagnostic/runtime toggles such as `full_buffer_tts`; do not put custom local fields into strict OpenAI `session.update` payloads.
 

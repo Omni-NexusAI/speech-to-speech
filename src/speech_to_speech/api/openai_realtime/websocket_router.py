@@ -28,6 +28,8 @@ from speech_to_speech.pipeline.events import (
     PartialTranscriptionEvent,
     PipelineEvent,
     PipelineMetricEvent,
+    ResponseFailedEvent,
+    ResponseOutputCompleteEvent,
     SpeechStartedEvent,
     SpeechStoppedEvent,
     TokenUsageEvent,
@@ -38,10 +40,6 @@ from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, PIPELINE_END
 
 logger = logging.getLogger(__name__)
 MAX_AUDIO_BATCH_BYTES = 6400
-# The TTS completion sentinel and assistant/tool events travel on separate
-# queues. A tool-only turn can put the sentinel a few milliseconds first, so
-# allow the side channel one scheduler slice to catch up before closing.
-PENDING_RESPONSE_EVENT_GRACE_S = 0.05
 # How long the release path waits for SESSION_END to propagate through the
 # handler chain back to output_queue before clearing unit.session. Tests
 # monkeypatch this to a small value since their fixtures usually skip the
@@ -128,38 +126,58 @@ async def _drain_pending_response_events(
     if session_id is None:
         return
 
-    st = unit.service._state(session_id)
-    if st.current_response_id is None and unit.text_output_queue.empty():
-        deadline = asyncio.get_running_loop().time() + PENDING_RESPONSE_EVENT_GRACE_S
-        while unit.text_output_queue.empty() and asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(0.005)
-
     preserved: list[Any] = []
     drained_assistant = 0
     drained_usage = 0
-    drain_assistant_events = True
+    response_boundary_seen = False
     try:
         while True:
             try:
                 item = unit.text_output_queue.get_nowait()
             except Empty:
                 break
-            # Usage is accounting-only, so keep the old whole-queue drain behavior.
-            # Assistant events are client-visible response output and stop at the
-            # first non-response boundary to preserve normal text-event ordering.
-            if isinstance(item, TokenUsageEvent):
-                unit.service.dispatch_pipeline_event(session_id, item)
-                drained_usage += 1
-            elif drain_assistant_events and isinstance(item, AssistantTextEvent):
-                drained_assistant += 1
-                if _generation_is_discardable(unit, item.cancel_generation):
+            if isinstance(item, SpeechStartedEvent):
+                # The next turn has started. Retain its response-bearing events
+                # for the normal send loop while still allowing token accounting
+                # already queued behind this marker to settle the prior turn.
+                response_boundary_seen = True
+                preserved.append(item)
+                continue
+            if response_boundary_seen and isinstance(
+                item,
+                (
+                    AssistantTextEvent,
+                    PartialTranscriptionEvent,
+                    TranscriptionCompletedEvent,
+                    ResponseFailedEvent,
+                    ResponseOutputCompleteEvent,
+                ),
+            ):
+                preserved.append(item)
+                continue
+            if isinstance(
+                item,
+                (
+                    TokenUsageEvent,
+                    AssistantTextEvent,
+                    PartialTranscriptionEvent,
+                    TranscriptionCompletedEvent,
+                    PipelineMetricEvent,
+                    ResponseFailedEvent,
+                    ResponseOutputCompleteEvent,
+                ),
+            ):
+                if isinstance(item, TokenUsageEvent):
+                    drained_usage += 1
+                elif isinstance(item, AssistantTextEvent):
+                    drained_assistant += 1
+                if _generation_is_discardable(unit, getattr(item, "cancel_generation", None)):
                     continue
                 events = unit.service.dispatch_pipeline_event(session_id, item)
                 if ws is not None and events:
                     await _send_events(ws, events)
             else:
                 preserved.append(item)
-                drain_assistant_events = False
     finally:
         if preserved:
             with unit.text_output_queue.mutex:
@@ -583,6 +601,18 @@ def create_app(
                             unit.cancel_scope.response_done(audio_generation)
                             unit.should_listen.set()
                             logger.info(f"Pipeline {unit.index}: stale response complete, listening re-enabled")
+                            continue
+                        if (
+                            session_id
+                            and unit.service._state(session_id).in_response
+                            and unit.service._state(session_id).await_text_output_complete
+                            and not unit.service._state(session_id).text_output_complete
+                        ):
+                            # The LLM side writes an explicit terminal marker before
+                            # TTS emits this sentinel. Hold it until that marker is
+                            # dispatched; this is a response barrier, not a timer.
+                            if session is not None:
+                                session.pending_output_item = audio_chunk
                             continue
                         await _drain_pending_response_events(ws, unit, session_id)
                         if ws is not None and session_id:
