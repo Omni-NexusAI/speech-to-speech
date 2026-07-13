@@ -1,9 +1,11 @@
 import logging
+import time
 from collections.abc import Mapping
 from queue import Queue
 from threading import Event as ThreadingEvent
 from typing import Any, Callable, Literal, Optional, TypeVar, Union
 
+import httpx
 from openai.types.realtime import (
     ConversationItem,
     ConversationItemCreatedEvent,
@@ -225,11 +227,14 @@ class RealtimeService:
         should_listen: ThreadingEvent | None = None,
         chat_size: int = 10,
         speculative_turns: SpeculativeTurnTracker | None = None,
+        context_tokenizer_base_url: str | None = None,
     ) -> None:
         self.text_prompt_queue = text_prompt_queue
         self.should_listen = should_listen
         self._chat_size = chat_size
         self.speculative_turns = speculative_turns
+        self.context_tokenizer_base_url = context_tokenizer_base_url.rstrip("/") if context_tokenizer_base_url else None
+        self.context_window = self._probe_context_window()
         self._conns: dict[str, ConnState] = {}
         self.total_usage = GlobalUsageMetrics()
 
@@ -247,6 +252,57 @@ class RealtimeService:
             ResponseFailedEvent: self._on_response_failed,
             PipelineMetricEvent: self._on_pipeline_metric,
         }
+
+    def _probe_context_window(self) -> int | None:
+        if not self.context_tokenizer_base_url:
+            return None
+        try:
+            response = httpx.get(
+                f"{self.context_tokenizer_base_url.removesuffix('/v1')}/props",
+                timeout=1.0,
+            )
+            response.raise_for_status()
+            value = response.json().get("default_generation_settings", {}).get("n_ctx")
+            return int(value) if value else None
+        except Exception:
+            logger.warning("Could not detect llama.cpp context window", exc_info=True)
+            return None
+
+    def _history_tokens(self, chat: Chat) -> int:
+        content = chat.history_token_text()
+        if not content:
+            return 0
+        if self.context_tokenizer_base_url:
+            try:
+                response = httpx.post(
+                    f"{self.context_tokenizer_base_url.removesuffix('/v1')}/tokenize",
+                    json={"content": content, "add_special": False, "with_pieces": False},
+                    timeout=1.0,
+                )
+                response.raise_for_status()
+                return len(response.json().get("tokens") or [])
+            except Exception:
+                logger.warning("Could not tokenize retained conversation history", exc_info=True)
+        return max(1, len(content) // 4)
+
+    def context_detail(self, conn_id: str) -> dict[str, Any]:
+        chat = self._state(conn_id).runtime_config.chat
+        detail: dict[str, Any] = {**chat.stats(), "history_tokens": self._history_tokens(chat)}
+        detail["max_tokens"] = self.context_window
+        detail["percent"] = (
+            round(100 * detail["history_tokens"] / self.context_window, 2) if self.context_window else None
+        )
+        detail["policy"] = "visible_trim"
+        return detail
+
+    def context_metric(self, conn_id: str, status: str = "updated") -> PipelineMetricServerEvent:
+        return PipelineMetricServerEvent(
+            event_id=self._next_event_id(),
+            stage="context",
+            status=status,
+            at_s=time.time(),
+            detail=self.context_detail(conn_id),
+        )
 
     # ── Connection lifecycle ─────────────────────
 

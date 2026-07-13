@@ -522,6 +522,7 @@ def _build_realtime_pipeline_unit(
     vars(vad_kw)["text_output_queue"] = text_output_queue
     vars(vad_kw)["speculative_turns"] = speculative_turns
     vars(gemma_audio_kw)["text_output_queue"] = text_output_queue
+    vars(gemma_audio_kw)["cancel_scope"] = cancel_scope
     vars(qwen3_tts_kw)["text_output_queue"] = text_output_queue
     for kw in (
         lm_kw,
@@ -545,6 +546,9 @@ def _build_realtime_pipeline_unit(
         should_listen=should_listen,
         chat_size=chat_size,
         speculative_turns=speculative_turns,
+        context_tokenizer_base_url=(
+            gemma_audio_kw.base_url if module_kwargs.stt == "gemma-audio" else None
+        ),
     )
 
     if module_kwargs.enable_live_transcription or module_kwargs.stt == "gemma-audio":
@@ -703,6 +707,9 @@ def build_pipeline(
                 "live_transcription_update_interval": module_kwargs.live_transcription_update_interval,
                 "context": {
                     "limit": runtime_lm_kwargs.chat_size,
+                    "turn_limit": runtime_lm_kwargs.chat_size,
+                    "history_tokens": 0,
+                    "max_tokens": pool[0].service.context_window,
                     "compact_history": runtime_lm_kwargs.compact_history,
                     "policy": "visible_trim" if not runtime_lm_kwargs.compact_history else "compact",
                 },

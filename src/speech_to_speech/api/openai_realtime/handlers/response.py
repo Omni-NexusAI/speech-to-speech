@@ -273,6 +273,8 @@ class ResponseHandler(RealtimeBaseHandler):
         # is cleared and the generation's own write-back has landed. Done outside
         # the in_response guard so a stray terminal call still drains the buffer.
         events.extend(self._service.conversation.flush_deferred_items(conn_id))
+        if events and self._service.context_tokenizer_base_url:
+            events.append(self._service.context_metric(conn_id, "committed"))
         return events
 
     # ── Pipeline event handlers ───────────────────

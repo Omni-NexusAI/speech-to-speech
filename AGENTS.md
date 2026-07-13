@@ -11,7 +11,8 @@
 ## Local Voice-Agent Testing Contract
 
 - Local realtime defaults retain 30 complete turns with compaction disabled; context is session-scoped and resets with the WebSocket/backend.
-- Local direct-audio testing defaults to final-only user transcripts. Live previews are an explicit UI/runtime opt-in because the current Gemma audio path is generative rather than dedicated ASR.
+- Every completed direct-audio turn produces a validated final user transcript for history and context. The live-transcription toggle controls only the temporary speaking bubble.
+- Context diagnostics report retained history tokens against the live llama.cpp context window; turn retention remains a separate 30-turn policy.
 - `scripts/local_realtime.ps1` is the managed background entry point; foreground launchers remain available for raw-console debugging.
 
 - This fork is used for local speech-to-speech testing with the OpenAI Realtime-compatible server preserved.

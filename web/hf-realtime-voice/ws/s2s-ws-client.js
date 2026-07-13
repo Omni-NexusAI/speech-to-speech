@@ -197,6 +197,8 @@ export class S2sWsRealtimeClient extends EventTarget {
     this._createQueue = [];
     /** @type {Map<string, { resolve: () => void, reject: (reason?: unknown) => void, timer: number }>} */
     this._toolOutputAcks = new Map();
+    /** @type {Set<{ resolve: () => void, reject: (reason?: unknown) => void, timer: number }>} */
+    this._responseIdleWaiters = new Set();
     /** @type {Promise<void> | null} */
     this._readyPromise = null;
     this._sessionConfigured = false;
@@ -739,6 +741,7 @@ export class S2sWsRealtimeClient extends EventTarget {
         this.dispatchEvent(new CustomEvent("response-finished", {
           detail: { responseId, status, audible, transcript },
         }));
+        if (!this._responseActive()) this._resolveResponseIdleWaiters();
         // The slot is free now — replay a queued create (e.g. a tool follow-up
         // that arrived while this response was still running).
         this._flushQueuedCreate();
@@ -999,6 +1002,30 @@ export class S2sWsRealtimeClient extends EventTarget {
     return ack;
   }
 
+  /** Wait until the response that emitted a tool call has fully closed. */
+  waitForResponseIdle(timeoutMs = 20000) {
+    if (!this._responseActive()) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const waiter = {
+        resolve,
+        reject,
+        timer: window.setTimeout(() => {
+          this._responseIdleWaiters.delete(waiter);
+          reject(new Error("Timed out waiting for the originating response to close"));
+        }, timeoutMs),
+      };
+      this._responseIdleWaiters.add(waiter);
+    });
+  }
+
+  _resolveResponseIdleWaiters() {
+    for (const waiter of this._responseIdleWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.resolve();
+    }
+    this._responseIdleWaiters.clear();
+  }
+
   /**
    * Add an image to the conversation as user content, so the vision-language
    * model can see it (used by the camera tool). `dataUrl` is a
@@ -1091,6 +1118,11 @@ export class S2sWsRealtimeClient extends EventTarget {
       pending.reject(new Error("WebSocket closed before tool output was acknowledged"));
     }
     this._toolOutputAcks.clear();
+    for (const waiter of this._responseIdleWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error("WebSocket closed before the response finished"));
+    }
+    this._responseIdleWaiters.clear();
     if (this._queueWake) {
       clearTimeout(this._queueTimer);
       const wake = this._queueWake;

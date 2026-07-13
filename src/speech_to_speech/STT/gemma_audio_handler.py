@@ -15,7 +15,6 @@ import httpx
 import numpy as np
 from openai.types.realtime.conversation_item import RealtimeConversationItemFunctionCall
 from openai.types.responses import ResponseFunctionToolCall
-from rich.console import Console
 
 from speech_to_speech.LLM.chat import make_assistant_message, make_user_message
 from speech_to_speech.LLM.chat_completions_language_model import (
@@ -30,10 +29,16 @@ from speech_to_speech.STT.base_stt_handler import BaseSTTHandler
 from speech_to_speech.utils.utils import _generate_id
 
 logger = logging.getLogger(__name__)
-console = Console()
 _TRANSCRIPT_MARKER = "USER_TRANSCRIPT:"
 _RESPONSE_MARKER = "ASSISTANT_RESPONSE:"
 _PREVIEW_TRANSCRIPT_MARKER = "TRANSCRIPT:"
+_FINAL_TRANSCRIPT_RE = re.compile(
+    r"(?ims)^\s*(?:USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER)\s*:\s*(.+?)"
+    r"(?=^\s*(?:ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:|\Z)"
+)
+_ASSISTANT_RESPONSE_RE = re.compile(
+    r"(?ims)^\s*(?:ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:\s*(.+)\Z"
+)
 _SENTENCE_RE = re.compile(r"(.+?[.!?](?:\s+|$))", re.DOTALL)
 
 
@@ -52,6 +57,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         system_prompt: str = "You are a local low-latency voice assistant. Answer naturally for speech synthesis.",
         gen_kwargs: dict[str, Any] | None = None,
         text_output_queue: Any | None = None,
+        cancel_scope: Any | None = None,
     ) -> None:
         self.model_name = model_name
         self.base_url = (os.getenv("GEMMA_AUDIO_BASE_URL") or base_url).rstrip("/")
@@ -64,6 +70,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         self.gen_kwargs = gen_kwargs or {}
         self.sample_rate = 16000
         self.text_output_queue: Any | None = text_output_queue
+        self.cancel_scope = cancel_scope
         self._preview_transcripts: dict[tuple[str | None, int | None], str] = {}
         logger.info("Gemma audio direct mode configured for %s at %s", self.model_name, self.base_url)
 
@@ -84,9 +91,11 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             "request_start",
             detail={"audio_s": round(duration_s, 3), "full_buffer_tts": full_buffer_tts},
         )
+        self._emit_metric(vad_audio, "transcription", "active", detail={"mode": "final"})
         first = True
+        generation = self.cancel_scope.generation if self.cancel_scope is not None else None
         try:
-            for response in self._iter_direct_responses(audio, vad_audio):
+            for response in self._iter_direct_responses(audio, vad_audio, generation=generation):
                 if first and (response.text or response.tools):
                     self._emit_metric(vad_audio, "gemma", "first_token", elapsed_ms=(perf_counter() - start_s) * 1000)
                     first = False
@@ -142,7 +151,6 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             user_content.append({"type": "image_url", "image_url": {"url": image_url}})
         user_content.append({"type": "input_audio", "input_audio": {"data": encoded, "format": self.audio_format}})
 
-        full_buffer_tts = self._full_buffer_tts(runtime_config)
         history: list[dict[str, Any]] = []
         chat = getattr(runtime_config, "chat", None)
         if chat is not None and callable(getattr(chat, "copy", None)):
@@ -159,7 +167,9 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 *history,
                 {"role": "user", "content": user_content},
             ],
-            "stream": self.stream and not full_buffer_tts,
+            # Keep the transport streaming even in full-buffer mode so Stop can
+            # close an in-flight llama.cpp request. Buffering is applied locally.
+            "stream": self.stream,
             **self.gen_kwargs,
         }
         chat_template_kwargs = dict(payload.get("chat_template_kwargs") or {})
@@ -205,7 +215,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         audio = self._as_float32_mono(vad_audio.audio)
         key = (vad_audio.turn_id, vad_audio.turn_revision)
         start_s = perf_counter()
-        self._emit_metric(vad_audio, "gemma_preview", "request_start", detail={"audio_s": round(len(audio) / self.sample_rate, 3)})
+        self._emit_metric(vad_audio, "transcription", "live_start", detail={"audio_s": round(len(audio) / self.sample_rate, 3)})
         raw = ""
         first = True
         try:
@@ -236,7 +246,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                         if not content:
                             continue
                         if first:
-                            self._emit_metric(vad_audio, "gemma_preview", "first_token", elapsed_ms=(perf_counter() - start_s) * 1000)
+                            self._emit_metric(vad_audio, "transcription", "live_first_text", elapsed_ms=(perf_counter() - start_s) * 1000)
                             first = False
                         raw += str(content)
                         transcript = self._extract_preview_transcript(raw)
@@ -250,7 +260,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         except Exception:
             logger.exception("Gemma progressive transcription failed for turn=%s", vad_audio.turn_id)
         finally:
-            self._emit_metric(vad_audio, "gemma_preview", "done", elapsed_ms=(perf_counter() - start_s) * 1000)
+            self._emit_metric(vad_audio, "transcription", "live_done", elapsed_ms=(perf_counter() - start_s) * 1000)
 
     def _transcribe_once(self, vad_audio: STTIn) -> str | None:
         payload = self._transcription_payload(self._as_float32_mono(vad_audio.audio))
@@ -268,6 +278,31 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         except Exception:
             logger.exception("Gemma final transcription fallback failed for turn=%s", vad_audio.turn_id)
             return None
+
+    def _final_transcript(self, vad_audio: STTIn, transcript: str | None) -> str | None:
+        """Resolve the mandatory final transcript without trusting assistant text.
+
+        The primary direct-audio response is preferred. A validated live preview
+        can satisfy the final row when enabled; otherwise one transcript-only
+        request is made. The fallback is deliberately isolated from TTS.
+        """
+        if transcript:
+            resolved = transcript
+            source = "primary"
+        else:
+            key = (vad_audio.turn_id, vad_audio.turn_revision)
+            resolved = self._preview_transcripts.get(key)
+            source = "live" if resolved else "fallback"
+            if not resolved:
+                self._emit_metric(vad_audio, "transcription", "fallback_start", detail={"mode": "final"})
+                resolved = self._transcribe_once(vad_audio)
+        self._emit_metric(
+            vad_audio,
+            "transcription",
+            "completed" if resolved else "failed",
+            detail={"mode": "final", "source": source},
+        )
+        return resolved
 
     @staticmethod
     def _full_buffer_tts(runtime_config: Any | None) -> bool:
@@ -299,27 +334,36 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
-    def _iter_direct_responses(self, audio: np.ndarray, vad_audio: STTIn) -> Iterator[DirectAssistantResponse]:
+    def _iter_direct_responses(
+        self, audio: np.ndarray, vad_audio: STTIn, *, generation: int | None = None
+    ) -> Iterator[DirectAssistantResponse]:
         url = f"{self.base_url}/chat/completions"
         payload = self._payload(audio, vad_audio)
         with httpx.Client(timeout=self.timeout) as client:
             if payload.get("stream", self.stream):
                 with client.stream("POST", url, headers=self._headers(), json=payload) as response:
                     response.raise_for_status()
-                    yield from self._consume_stream(response, vad_audio)
+                    yield from self._consume_stream(response, vad_audio, generation=generation)
                     return
             response = client.post(url, headers=self._headers(), json=payload)
             response.raise_for_status()
             text, tools = self._message_text_and_tools(response.json())
             yield from self._responses_from_text(text, vad_audio, tools=tools)
 
-    def _consume_stream(self, response: httpx.Response, vad_audio: STTIn) -> Iterator[DirectAssistantResponse]:
+    def _consume_stream(
+        self, response: httpx.Response, vad_audio: STTIn, *, generation: int | None = None
+    ) -> Iterator[DirectAssistantResponse]:
         raw_text = ""
         tool_accum: dict[int, dict[str, str]] = {}
         assistant_started = False
         pending_response = ""
         transcript_value: str | None = None
+        full_buffer_tts = self._full_buffer_tts(getattr(vad_audio, "runtime_config", None))
         for line in response.iter_lines():
+            if generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation):
+                logger.info("Gemma audio request cancelled for turn=%s", vad_audio.turn_id)
+                response.close()
+                return
             if not line:
                 continue
             if line.startswith("data:"):
@@ -353,20 +397,22 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 pending_response = after
             elif assistant_started:
                 pending_response += str(content)
-            if assistant_started:
+            if assistant_started and not full_buffer_tts:
                 chunks, pending_response = self._pop_sentence_chunks(pending_response)
                 for chunk in chunks:
                     yield self._direct(vad_audio, chunk, is_final=False)
         tools = self._tool_calls_from_accum(tool_accum)
+        if generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation):
+            return
         final_text = pending_response.strip() if assistant_started else self._fallback_response_text(raw_text)
         # Final-only mode must not make a second generative request just to
         # populate a user bubble: that can hallucinate speech and pollute chat.
-        transcript = transcript_value or self._extract_transcript(raw_text)
+        transcript = self._final_transcript(vad_audio, transcript_value or self._extract_transcript(raw_text))
         full_response = self._fallback_response_text(raw_text)
         committed = self._commit_context(vad_audio, transcript, full_response, tools)
         self._preview_transcripts.pop((vad_audio.turn_id, vad_audio.turn_revision), None)
         if final_text:
-            console.print(f"[yellow]GEMMA AUDIO: {final_text}")
+            logger.info("Gemma audio response ready (%d characters)", len(final_text))
         yield self._direct(
             vad_audio,
             final_text,
@@ -377,10 +423,10 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         )
 
     def _responses_from_text(self, text: str, vad_audio: STTIn, *, tools: list[ResponseFunctionToolCall] | None = None) -> Iterator[DirectAssistantResponse]:
-        transcript = self._extract_transcript(text)
+        transcript = self._final_transcript(vad_audio, self._extract_transcript(text))
         response_text = self._fallback_response_text(text)
         if response_text:
-            console.print(f"[yellow]GEMMA AUDIO: {response_text}")
+            logger.info("Gemma audio response ready (%d characters)", len(response_text))
         tools = tools or []
         committed = self._commit_context(vad_audio, transcript, response_text, tools)
         self._preview_transcripts.pop((vad_audio.turn_id, vad_audio.turn_revision), None)
@@ -441,12 +487,10 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
 
     @staticmethod
     def _extract_transcript(text: str) -> str | None:
-        if _TRANSCRIPT_MARKER not in text:
+        match = _FINAL_TRANSCRIPT_RE.search(text)
+        if not match:
             return None
-        after = text.split(_TRANSCRIPT_MARKER, 1)[1]
-        if _RESPONSE_MARKER in after:
-            after = after.split(_RESPONSE_MARKER, 1)[0]
-        transcript = after.strip().strip('"')
+        transcript = match.group(1).strip().strip('"')
         return transcript or None
 
     @staticmethod
@@ -469,10 +513,11 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
 
     @staticmethod
     def _fallback_response_text(text: str) -> str:
-        if _RESPONSE_MARKER in text:
-            return text.split(_RESPONSE_MARKER, 1)[1].strip()
-        if _TRANSCRIPT_MARKER in text:
-            return text.split(_TRANSCRIPT_MARKER, 1)[0].strip()
+        assistant = _ASSISTANT_RESPONSE_RE.search(text)
+        if assistant:
+            return assistant.group(1).strip()
+        if _FINAL_TRANSCRIPT_RE.search(text):
+            return ""
         return text.strip()
 
     @staticmethod

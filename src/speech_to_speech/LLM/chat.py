@@ -440,6 +440,43 @@ class Chat:
             clone._trim_count = self._trim_count
             return clone
 
+    def history_token_text(self) -> str:
+        """Return retained history as compact text for the server tokenizer.
+
+        System instructions and raw image data are intentionally excluded: the
+        diagnostics counter represents conversation history and therefore starts
+        at zero for a new session.
+        """
+        with self._lock:
+            entries: list[dict[str, Any]] = []
+            for item in self.buffer:
+                if isinstance(item, RealtimeConversationItemUserMessage):
+                    content = [
+                        part.text if part.type == "input_text" else "<image>"
+                        for part in item.content
+                        if (part.type == "input_text" and part.text) or part.type == "input_image"
+                    ]
+                    entries.append({"role": "user", "content": content})
+                elif isinstance(item, RealtimeConversationItemAssistantMessage):
+                    entries.append(
+                        {"role": "assistant", "content": [part.text for part in item.content if part.text]}
+                    )
+                elif isinstance(item, RealtimeConversationItemFunctionCall):
+                    entries.append(
+                        {"role": "tool_call", "name": item.name, "arguments": item.arguments, "call_id": item.call_id}
+                    )
+                elif isinstance(item, RealtimeConversationItemFunctionCallOutput):
+                    entries.append({"role": "tool_output", "output": item.output, "call_id": item.call_id})
+            buffered_calls = {
+                item.call_id for item in self.buffer if isinstance(item, RealtimeConversationItemFunctionCall)
+            }
+            for call_id, item in self._pending_tool_calls.items():
+                if call_id not in buffered_calls:
+                    entries.append(
+                        {"role": "tool_call", "name": item.name, "arguments": item.arguments, "call_id": call_id}
+                    )
+            return json.dumps(entries, ensure_ascii=False, separators=(",", ":")) if entries else ""
+
     def stats(self) -> dict[str, int]:
         """Return content-free counters for local diagnostics."""
         with self._lock:

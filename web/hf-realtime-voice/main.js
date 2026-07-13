@@ -294,9 +294,9 @@ let localPipeline = null;
 let diagnosticsOpen = localStorage.getItem(STORAGE_KEYS.diagnostics) === "1";
 /** @type {Array<any>} */
 let pipelineMetrics = [];
-const EXPECTED_UI_API_VERSION = 2;
-const EXPECTED_BACKEND_API_VERSION = 1;
-const DIAGNOSTIC_STAGES = ["mic", "vad", "gemma_preview", "gemma", "context", "tool", "tts", "playback"];
+const EXPECTED_UI_API_VERSION = 3;
+const EXPECTED_BACKEND_API_VERSION = 2;
+const DIAGNOSTIC_STAGES = ["mic", "vad", "transcription", "gemma", "context", "tool", "tts", "playback"];
 const diagnosticWarnings = new Map();
 let backendRuntime = null;
 let backendMetricTimer = 0;
@@ -868,7 +868,10 @@ async function runTool(name, argsJson, callId) {
     result.output = `Tool failed: ${msg}`;
   }
   try {
+    addPipelineMetric({ stage: "tool", status: "awaiting_response_close", detail: { name, callId } });
+    await client.waitForResponseIdle();
     await client.sendToolOutput(callId, result.output);
+    addPipelineMetric({ stage: "tool", status: "output_acknowledged", detail: { name, callId } });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     result.output = `Tool output was not accepted: ${msg}`;
@@ -977,8 +980,12 @@ function renderDiagnostics() {
   for (const metric of visibleMetrics) latestByStage.set(metric.stage, metric);
   const measured = visibleMetrics.filter((m) => typeof m.elapsed_ms === "number" && m.elapsed_ms >= 0);
   const bottleneck = measured.reduce((best, item) => !best || item.elapsed_ms > best.elapsed_ms ? item : best, null);
-  const context = latestByStage.get("context");
-  const contextText = context?.detail?.turns != null ? `Context ${context.detail.turns}/${context.detail.limit}` : "";
+  const context = latestByStage.get("context") || (backendRuntime?.context
+    ? { status: "ready", detail: backendRuntime.context }
+    : null);
+  const contextMax = context?.detail?.max_tokens ?? localPipeline?.gemma?.contextWindow;
+  const contextUsed = context?.detail?.history_tokens ?? 0;
+  const contextText = contextMax ? `Context ${contextUsed.toLocaleString()} / ${contextMax.toLocaleString()}` : "";
   const runtimeText = backendRuntime
     ? `Backend API ${backendRuntime.api_version} | PID ${backendRuntime.pid} | started ${backendRuntime.started_at_utc}`
     : "Backend identity pending";
@@ -991,9 +998,11 @@ function renderDiagnostics() {
     const node = document.createElement("div");
     node.className = `diag-node ${metric ? "has-data" : ""} ${metric?.status || "idle"}`;
     const name = document.createElement("strong");
-    name.textContent = stage.replace("gemma_preview", "Gemma Preview").replace(/^./, (c) => c.toUpperCase());
+    name.textContent = stage.replace(/^./, (c) => c.toUpperCase());
     const state = document.createElement("span");
-    state.textContent = metric ? `${metric.status}${typeof metric.elapsed_ms === "number" ? ` ${Math.round(metric.elapsed_ms)} ms` : ""}` : "idle";
+    state.textContent = stage === "context" && contextMax
+      ? `${contextUsed.toLocaleString()} / ${contextMax.toLocaleString()}`
+      : metric ? `${metric.status}${typeof metric.elapsed_ms === "number" ? ` ${Math.round(metric.elapsed_ms)} ms` : ""}` : "idle";
     node.append(name, state);
     diagnosticsGraph.append(node);
   }
@@ -1461,7 +1470,7 @@ async function doStart(audioContext = null) {
   });
   c.addEventListener("transcript", (e) => {
     const d = /** @type {CustomEvent<{ role: "user" | "assistant"; text: string; partial: boolean; itemId?: string; responseId?: string }>} */ (e).detail;
-    chat.onTranscript(d);
+    chat.onTranscript(d, { showUserBubble: settings.liveTranscript });
   });
 
   c.addEventListener("response-finished", (e) => {

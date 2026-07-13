@@ -76,7 +76,10 @@ class ConversationHandler(RealtimeBaseHandler):
             item=item,
         )
         st.last_item_id = item.id
-        return [event]
+        events: list[ServerEvent] = [event]
+        if self._service.context_tokenizer_base_url:
+            events.append(self._service.context_metric(conn_id, "updated"))
+        return events
 
     def flush_deferred_items(self, conn_id: str) -> list[ServerEvent]:
         """Apply items buffered during a response, in arrival order.

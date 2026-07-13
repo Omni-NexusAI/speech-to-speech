@@ -38,6 +38,7 @@ from speech_to_speech.api.openai_realtime.service import (
     CHUNK_SIZE_BYTES,
     RealtimeService,
 )
+from speech_to_speech.LLM.chat import make_user_message
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
     PartialTranscriptionEvent,
@@ -49,6 +50,39 @@ from speech_to_speech.pipeline.events import (
 )
 from speech_to_speech.pipeline.messages import GenerateResponseRequest
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
+
+
+class _ContextResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+def test_local_context_metrics_detect_window_and_tokenize_retained_history(monkeypatch):
+    monkeypatch.setattr(
+        "speech_to_speech.api.openai_realtime.service.httpx.get",
+        lambda *args, **kwargs: _ContextResponse({"default_generation_settings": {"n_ctx": 48128}}),
+    )
+    monkeypatch.setattr(
+        "speech_to_speech.api.openai_realtime.service.httpx.post",
+        lambda *args, **kwargs: _ContextResponse({"tokens": [1, 2, 3, 4, 5]}),
+    )
+    service = RealtimeService(context_tokenizer_base_url="http://127.0.0.1:8818/v1", chat_size=30)
+    conn_id = service.register()
+
+    assert service.context_detail(conn_id)["history_tokens"] == 0
+    service._state(conn_id).runtime_config.chat.add_item(make_user_message("hello there"))
+    detail = service.context_detail(conn_id)
+
+    assert detail["history_tokens"] == 5
+    assert detail["max_tokens"] == 48128
+    assert detail["turns"] == 1
+    assert detail["limit"] == 30
 
 # ---------------------------------------------------------------------------
 # Helpers

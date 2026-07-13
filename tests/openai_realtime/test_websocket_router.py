@@ -813,7 +813,7 @@ class TestPool:
             assert data["runtime"]["diagnostic_stages"] == [
                 "mic",
                 "vad",
-                "gemma_preview",
+                "transcription",
                 "gemma",
                 "context",
                 "tool",

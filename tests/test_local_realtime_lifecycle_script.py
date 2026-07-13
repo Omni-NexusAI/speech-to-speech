@@ -14,6 +14,8 @@ def _powershell(expression: str) -> str:
             "powershell.exe",
             "-NoLogo",
             "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
             "-Command",
             f". '{SCRIPT}' -InternalNoRun; {expression}",
         ],

@@ -47,7 +47,7 @@ PENDING_RESPONSE_EVENT_GRACE_S = 0.05
 # monkeypatch this to a small value since their fixtures usually skip the
 # real handler chain.
 SESSION_END_DRAIN_TIMEOUT_S = 10.0
-BACKEND_RUNTIME_API_VERSION = 1
+BACKEND_RUNTIME_API_VERSION = 2
 QItem = TypeVar("QItem")
 
 
@@ -283,7 +283,7 @@ def create_app(
         "diagnostic_stages": [
             "mic",
             "vad",
-            "gemma_preview",
+            "transcription",
             "gemma",
             "context",
             "tool",

@@ -77,3 +77,33 @@ def test_local_ui_identity_keeps_upstream_credit_and_shows_local_provider_slots(
     assert 'id="local-provider-tts"' in html
     assert 'set("local-provider-gemma"' in main_js
     assert 'set("local-provider-tts"' in main_js
+
+
+def test_live_transcript_toggle_only_controls_the_floating_user_bubble():
+    ui_dir = Path(__file__).resolve().parents[1] / "web" / "hf-realtime-voice"
+    main_js = (ui_dir / "main.js").read_text(encoding="utf-8")
+    chat_js = (ui_dir / "ui" / "chat.js").read_text(encoding="utf-8")
+
+    assert "showUserBubble: settings.liveTranscript" in main_js
+    assert "if (options.showUserBubble)" in chat_js
+    assert "this._pendingUserHist || this._appendHistMsg" in chat_js
+
+
+def test_tool_output_waits_for_originating_response_to_close():
+    ui_dir = Path(__file__).resolve().parents[1] / "web" / "hf-realtime-voice"
+    main_js = (ui_dir / "main.js").read_text(encoding="utf-8")
+    client_js = (ui_dir / "ws" / "s2s-ws-client.js").read_text(encoding="utf-8")
+
+    assert main_js.index("await client.waitForResponseIdle()") < main_js.index("await client.sendToolOutput")
+    assert "waitForResponseIdle(timeoutMs = 20000)" in client_js
+    assert "_resolveResponseIdleWaiters" in client_js
+
+
+def test_diagnostics_use_transcription_and_dynamic_context_tokens():
+    ui_dir = Path(__file__).resolve().parents[1] / "web" / "hf-realtime-voice"
+    main_js = (ui_dir / "main.js").read_text(encoding="utf-8")
+
+    assert '"transcription"' in main_js
+    assert '"gemma_preview"' not in main_js
+    assert "history_tokens" in main_js
+    assert "contextWindow" in main_js

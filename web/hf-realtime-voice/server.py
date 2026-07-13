@@ -69,7 +69,7 @@ LIMITER_ENABLED = bool(LOAD_BALANCER_URL) and bool(SPACE_ID)
 SERPER_URL = "https://google.serper.dev/search"
 # Cap results so the tool output stays small enough to feed back to the model.
 MAX_RESULTS = 5
-LOCAL_UI_API_VERSION = 2
+LOCAL_UI_API_VERSION = 3
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_QWEN3_VOICE_ID = "16d9bb336799"
 DEFAULT_QWEN3_VOICE = f"clone:{DEFAULT_QWEN3_VOICE_ID}"
@@ -202,6 +202,13 @@ async def local_pipeline():
                     status["gemma"]["model"] = models[0].get("id") or status["gemma"]["model"]
         except Exception:
             status["gemma"]["reachable"] = False
+        try:
+            props = await http.get(f"{gemma_base.removesuffix('/v1')}/props")
+            if props.status_code == 200:
+                n_ctx = props.json().get("default_generation_settings", {}).get("n_ctx")
+                status["gemma"]["contextWindow"] = int(n_ctx) if n_ctx else None
+        except Exception:
+            status["gemma"]["contextWindow"] = None
         try:
             health_base = tts_base.removesuffix("/v1")
             tts = await http.get(f"{health_base}/health")

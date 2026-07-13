@@ -5,6 +5,7 @@ import numpy as np
 from openai.types.realtime.conversation_item import RealtimeConversationItemFunctionCallOutput
 from openai.types.responses import ResponseFunctionToolCall
 
+from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.LLM.base_openai_compatible_language_model import BaseOpenAICompatibleHandler
 from speech_to_speech.LLM.chat import Chat, make_assistant_message, make_user_message
 from speech_to_speech.pipeline.messages import DirectAssistantRequest, DirectAssistantResponse, LLMResponseChunk
@@ -49,7 +50,7 @@ def test_gemma_audio_payload_uses_input_audio_wav_base64():
     assert isinstance(content[1]["input_audio"]["data"], str)
 
 
-def test_gemma_audio_payload_can_disable_streaming_for_full_buffer_tts():
+def test_gemma_audio_full_buffer_keeps_cancellable_streaming_transport():
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
     vad_audio = SimpleNamespace(
@@ -62,7 +63,7 @@ def test_gemma_audio_payload_can_disable_streaming_for_full_buffer_tts():
 
     payload = handler._payload(np.zeros(1600, dtype=np.float32), vad_audio)
 
-    assert payload["stream"] is False
+    assert payload["stream"] is True
 
 
 def test_gemma_audio_payload_includes_recent_camera_images():
@@ -128,6 +129,41 @@ def test_preview_transcript_requires_the_transcript_prefix_and_rejects_assistant
     assert GemmaAudioSTTHandler._extract_preview_transcript("TRANSCRIPT: Set a timer for five minutes") == "Set a timer for five minutes"
     assert GemmaAudioSTTHandler._extract_preview_transcript("I can set a timer for you.") is None
     assert GemmaAudioSTTHandler._extract_preview_transcript("TRANSCRIPT: hello\nASSISTANT_RESPONSE: Certainly.") is None
+
+
+def test_final_transcript_accepts_narrow_equivalent_labels():
+    assert GemmaAudioSTTHandler._extract_transcript("USER: Open the camera\nASSISTANT: Certainly.") == "Open the camera"
+    assert GemmaAudioSTTHandler._extract_transcript("TRANSCRIPT: Search for Control 2\nRESPONSE: One moment.") == "Search for Control 2"
+    assert GemmaAudioSTTHandler._extract_transcript("I can help with that.") is None
+
+
+def test_missing_primary_transcript_uses_one_transcript_only_fallback():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
+    calls = []
+    handler._transcribe_once = lambda vad: calls.append(vad.turn_id) or "What did the search find?"
+    vad_audio = SimpleNamespace(turn_id="turn_2", turn_revision=0)
+
+    assert handler._final_transcript(vad_audio, None) == "What did the search find?"
+    assert calls == ["turn_2"]
+
+
+def test_unicode_assistant_text_is_preserved_without_console_output():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    chat = Chat(30)
+    vad_audio = SimpleNamespace(
+        runtime_config=RuntimeConfig(chat=chat),
+        turn_id="turn_ru",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+
+    outputs = list(handler._responses_from_text("USER: Say it in Russian\nASSISTANT: Привет, как дела?", vad_audio))
+
+    assert outputs[0].text == "Привет, как дела?"
+    assert outputs[0].transcript == "Say it in Russian"
+    assert chat.stats()["turns"] == 1
 
 
 def test_direct_tool_call_is_committed_before_browser_output():

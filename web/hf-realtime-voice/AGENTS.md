@@ -19,6 +19,8 @@
 - Local runtime toggles such as full response buffering and live transcript previews should use `local.pipeline.update`, leaving OpenAI-compatible `session.update` for standard voice/instructions/tool fields.
 - Tool output must wait for its `conversation.item.created` acknowledgement before requesting the one post-tool response. Never replay a rejected `response.create` on a later user turn.
 - Speech stop may reserve user chronology, but a turn without a validated final transcript must remove that reservation instead of displaying synthetic transcript text.
+- The live-transcription setting controls only the temporary floating user bubble. Final user text always updates the persistent conversation panel.
+- Diagnostics label the always-on final stage `Transcription` and show retained history tokens against the context window detected from llama.cpp.
 - Camera preview and Diagnostics should not occupy the same desktop corner; keep the camera self-view clear when diagnostics are open.
 
 ## Child DOX Index

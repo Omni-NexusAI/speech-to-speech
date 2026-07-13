@@ -331,7 +331,7 @@ export class ChatView {
    * A streamed transcript delta (user or assistant).
    * @param {{ role: "user" | "assistant"; text: string; partial: boolean; itemId?: string; responseId?: string }} d
    */
-  onTranscript(d) {
+  onTranscript(d, options = {}) {
     if (DEBUG) console.debug(`[ui] transcript role=${d.role} partial=${d.partial} item=${d.itemId} resp=${d.responseId} text=${JSON.stringify(d.text)}`);
 
     if (d.role === "user") {
@@ -355,13 +355,15 @@ export class ChatView {
       // refreshed on every delta, so it stays while the user keeps talking and
       // fades a few seconds after they stop — no dependency on a response ever
       // arriving, so it can never get stuck.
-      if (this._activeUserItemId !== id || !this._activeUserBubble) {
-        this._activeUserBubble = this._spawnBubble("user", text);
-        this._activeUserItemId = id;
-      } else {
-        this._updateBubbleText(this._activeUserBubble, text);
+      if (options.showUserBubble) {
+        if (this._activeUserItemId !== id || !this._activeUserBubble) {
+          this._activeUserBubble = this._spawnBubble("user", text);
+          this._activeUserItemId = id;
+        } else {
+          this._updateBubbleText(this._activeUserBubble, text);
+        }
+        this._bumpDismiss(this._activeUserBubble, 6000);
       }
-      this._bumpDismiss(this._activeUserBubble, 6000);
       this._markUnread();
     } else if (d.role === "assistant") {
       // Assistant transcript arrives once, as the full text, keyed by
