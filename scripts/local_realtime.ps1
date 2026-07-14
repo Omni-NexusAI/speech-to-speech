@@ -63,21 +63,54 @@ function Endpoint-Ok([string]$Url) {
 }
 
 function Get-Process-Info([int]$ProcessId) {
-    $item = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
-    if (-not $item) { return $null }
-    $start = $item.CreationDate
-    if ($start -isnot [datetime]) { $start = [Management.ManagementDateTimeConverter]::ToDateTime([string]$start) }
+    try {
+        $item = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop
+        if ($item) {
+            $start = $item.CreationDate
+            if ($start -isnot [datetime]) { $start = [Management.ManagementDateTimeConverter]::ToDateTime([string]$start) }
+            return [pscustomobject]@{
+                pid = [int]$item.ProcessId
+                parentPid = [int]$item.ParentProcessId
+                executable = [string]$item.ExecutablePath
+                commandLine = [string]$item.CommandLine
+                startTimeUtc = $start.ToUniversalTime().ToString("o")
+            }
+        }
+    }
+    catch { }
+
+    $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if (-not $process) { return $null }
     return [pscustomobject]@{
-        pid = [int]$item.ProcessId
-        parentPid = [int]$item.ParentProcessId
-        executable = [string]$item.ExecutablePath
-        commandLine = [string]$item.CommandLine
-        startTimeUtc = $start.ToUniversalTime().ToString("o")
+        pid = [int]$process.Id
+        parentPid = 0
+        executable = [string]$process.Path
+        commandLine = ""
+        startTimeUtc = $process.StartTime.ToUniversalTime().ToString("o")
     }
 }
 
 function Get-Listener-Info([string]$Name) {
-    $owners = @(Get-NetTCPConnection -State Listen -LocalPort $Specs[$Name].Port -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique)
+    $port = [int]$Specs[$Name].Port
+    $owners = @()
+    try {
+        $owners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction Stop | Select-Object -ExpandProperty OwningProcess -Unique)
+    }
+    catch { }
+    if ($owners.Count -eq 0) {
+        # Non-elevated Windows sessions can be denied Get-NetTCPConnection even
+        # for this user's Python processes. netstat still exposes the listener PID.
+        $portPattern = [regex]::Escape([string]$port)
+        $owners = @(
+            & netstat -ano -p tcp 2>$null |
+                ForEach-Object {
+                    if ($_ -match "^\s*TCP\s+\S+:$portPattern\s+\S+\s+LISTENING\s+(\d+)\s*$") {
+                        [int]$Matches[1]
+                    }
+                } |
+                Select-Object -Unique
+        )
+    }
     if ($owners.Count -gt 1) { throw "Port $($Specs[$Name].Port) has multiple listening owners: $($owners -join ', ')" }
     if ($owners.Count -eq 0) { return $null }
     return Get-Process-Info ([int]$owners[0])
@@ -97,7 +130,12 @@ function Test-Recorded-Listener($Record, $Listener) {
     if (-not $Record -or -not $Listener) { return $false }
     $recordPid = if ($Record.listenerPid) { [int]$Record.listenerPid } elseif ($Record.pid) { [int]$Record.pid } else { 0 }
     $recordStart = if ($Record.listenerStartTimeUtc) { [string]$Record.listenerStartTimeUtc } else { [string]$Record.startTimeUtc }
-    return $recordPid -eq $Listener.pid -and $recordStart -eq $Listener.startTimeUtc
+    $sameExecutable = -not $Record.listenerExecutable -or $Record.listenerExecutable -eq $Listener.executable
+    try {
+        $sameStart = [math]::Abs((([datetime]$recordStart).ToUniversalTime() - ([datetime]$Listener.startTimeUtc).ToUniversalTime()).TotalSeconds) -lt 1
+    }
+    catch { $sameStart = $recordStart -eq $Listener.startTimeUtc }
+    return $recordPid -eq $Listener.pid -and $sameStart -and $sameExecutable
 }
 
 function Set-Component-State([string]$Name, $State, $Listener, $Launcher, [string]$Ownership) {
@@ -152,14 +190,15 @@ function Start-One([string]$Name, $State) {
     $spec = $Specs[$Name]
     $listener = Get-Listener-Info $Name
     if ($listener) {
+        if (Test-Recorded-Listener $State.$Name $listener) {
+            if (-not (Endpoint-Ok $spec.Health)) { throw "$Name has a recorded listener on port $($spec.Port), but its health endpoint failed." }
+            Write-Host "$Name already running (listener PID $($listener.pid))."
+            return
+        }
         if (-not (Test-Expected-Process $Name $listener)) {
             throw "Refusing to start ${Name}: port $($spec.Port) is owned by unknown PID $($listener.pid)."
         }
         if (-not (Endpoint-Ok $spec.Health)) { throw "$Name has a matching listener on port $($spec.Port), but its health endpoint failed." }
-        if (Test-Recorded-Listener $State.$Name $listener) {
-            Write-Host "$Name already running (listener PID $($listener.pid))."
-            return
-        }
         Adopt-Component $Name $State $listener
         return
     }
@@ -185,8 +224,9 @@ function Start-One([string]$Name, $State) {
     for ($i = 0; $i -lt 90; $i++) {
         if (Endpoint-Ok $spec.Health) {
             $listener = Get-Listener-Info $Name
-            if ($listener -and (Test-Expected-Process $Name $listener)) {
-                $launcherInfo = Get-Process-Info $launcher.Id
+            $launcherInfo = Get-Process-Info $launcher.Id
+            $startedAfterLauncher = $listener -and $launcherInfo -and ([datetime]$listener.startTimeUtc -ge [datetime]$launcherInfo.startTimeUtc)
+            if ($listener -and ((Test-Expected-Process $Name $listener) -or $startedAfterLauncher)) {
                 Set-Component-State $Name $State $listener $launcherInfo "started"
                 Write-Host "$name ready (listener PID $($listener.pid), port $($spec.Port))."
                 return
@@ -215,7 +255,7 @@ function Stop-Known-Process([int]$ProcessId) {
 function Stop-One([string]$Name, $State) {
     $record = $State.$Name
     $listener = Get-Listener-Info $Name
-    if ($listener -and -not (Test-Expected-Process $Name $listener)) {
+    if ($listener -and -not (Test-Recorded-Listener $record $listener) -and -not (Test-Expected-Process $Name $listener)) {
         throw "Refusing to stop ${Name}: port $($Specs[$Name].Port) is owned by unknown PID $($listener.pid)."
     }
     if (-not $listener -and -not $record) { Write-Host "$Name is already stopped."; return }
@@ -244,8 +284,8 @@ function Show-Status {
         $record = $state.$name
         $health = Endpoint-Ok $Specs[$name].Health
         if (-not $listener) { $ownership = if ($record) { "stale-state" } else { "stopped" } }
-        elseif (-not (Test-Expected-Process $name $listener)) { $ownership = "unknown-owner" }
         elseif (Test-Recorded-Listener $record $listener) { $ownership = "managed" }
+        elseif (-not (Test-Expected-Process $name $listener)) { $ownership = "unknown-owner" }
         else { $ownership = "matching-legacy" }
         Write-Host ("{0}: {1}; listener={2}; endpoint={3}; port={4}" -f $name, $ownership, $(if($listener){"pid=$($listener.pid) started=$($listener.startTimeUtc)"}else{"none"}), $(if($health){"healthy"}else{"down"}), $Specs[$name].Port)
     }
