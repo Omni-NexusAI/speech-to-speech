@@ -207,7 +207,7 @@ def test_direct_tool_call_is_committed_before_browser_output():
     assert chat.stats()["pending_tool_calls"] == 0
 
 
-def test_direct_tool_call_without_transcript_does_not_pollute_context():
+def test_direct_tool_call_without_transcript_is_persisted_without_fabricated_user_text():
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
     chat = Chat(30)
@@ -221,12 +221,12 @@ def test_direct_tool_call_without_transcript_does_not_pollute_context():
         status="completed",
     )
 
-    assert handler._commit_context(vad_audio, None, "", [tool]) is False
-    assert chat.stats()["pending_tool_calls"] == 0
+    assert handler._commit_context(vad_audio, None, "", [tool]) is True
+    assert chat.stats()["pending_tool_calls"] == 1
     assert chat.buffer == []
 
 
-def test_invalid_direct_turn_uses_canonical_retry_without_tools():
+def test_invalid_direct_turn_emits_ui_only_transcript_failure_without_spoken_retry():
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
     handler._transcribe_once = lambda _vad: None
@@ -240,10 +240,26 @@ def test_invalid_direct_turn_uses_canonical_retry_without_tools():
 
     outputs = list(handler._responses_from_text("ASSISTANT_RESPONSE: fabricated response", vad_audio))
 
-    assert outputs[0].transcript == "Speech could not be transcribed."
-    assert outputs[0].text == "I didn't catch that. Please repeat your request."
+    assert outputs[0].transcript is None
+    assert outputs[0].text == ""
     assert outputs[0].tools == []
-    assert [item.type for item in chat.buffer] == ["message", "message"]
+    assert chat.buffer == []
+
+def test_direct_response_records_language_for_post_tool_tts():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    runtime_config = RuntimeConfig()
+    vad_audio = SimpleNamespace(
+        runtime_config=runtime_config,
+        turn_id="turn_language",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+
+    response = handler._direct(vad_audio, "Ich suche danach.", is_final=True, language_code="German")
+
+    assert response.language_code == "German"
+    assert runtime_config.local_pipeline["assistant_language"] == "German"
+
 
 def test_direct_assistant_response_passes_through_transcription_notifier_and_llm():
     notifier = object.__new__(TranscriptionNotifier)

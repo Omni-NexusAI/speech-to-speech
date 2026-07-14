@@ -14,7 +14,9 @@ On this Windows machine, the target TTS container for this framework is:
 - URL: `http://127.0.0.1:8881/v1`
 - endpoint: `/audio/speech`
 
-The example config defaults to `8881` and expects the `1.7B-Base` backend model. This container hardcodes `Qwen/Qwen3-TTS-12Hz-1.7B-Base` and does not expose the candidate container's `/v1/backend/models` switch API. Live verification may start this existing container and trigger its lazy model load with a short TTS request, but it must not modify the container image or source.
+The example config defaults to `8881` and expects the `1.7B-Base` backend model. This container hardcodes `Qwen/Qwen3-TTS-12Hz-1.7B-Base` and exposes native clone PCM streaming. Its local server accepts an optional `language` value so multilingual requests do not inherit the profile's stored English language. The reproducible source patch is stored at `integrations/qwen3-tts-faster-language.patch`.
+
+The Settings panel also lists the optional user-managed Groxaxo candidate on `http://127.0.0.1:8882/v1`. The UI reads `/v1/backend/models` and permits a new conversation only when Voice Studio already has `0.6B-Base` or `1.7B-Base` loaded. The pipeline never starts, stops, loads, unloads, switches, or silently falls back from that candidate.
 
 Gemma should be launched with the local llama.cpp settings from `C:\llama.cpp\launch_gemma-4-12B-it-qat-MTP.ps1`, with context reduced to 16k. This repo includes a wrapper:
 
@@ -65,11 +67,13 @@ The UI runs on `http://127.0.0.1:7862` and should point Settings to `http://127.
 ## Notes
 
 - No separate ASR model is used in `gemma-audio` mode.
-- The TTS container is treated as frozen; this repo only calls its OpenAI-compatible API.
+- Faster on `8881` is the default. A Settings provider change is conversation-scoped and takes effect on the next conversation.
 - Voice defaults to `clone:16d9bb336799`, displayed as `J.A.R.V.I.S`.
 - The realtime UI lists saved Voice Studio profiles from `profiles/*/meta.json` and only exposes `Base` clone profiles.
 - The realtime session stores clone IDs, but the frozen `qwen3-tts-faster` API looks up clones by profile name, so the adapter maps `clone:16d9bb336799` to `clone:J.A.R.V.I.S` before calling `/v1/audio/speech`.
 - Pretrained Qwen voices are intentionally hidden for this local test path.
+- Both providers receive `stream: true`, `response_format: pcm`, the selected clone ID, and an explicit assistant language when Gemma supplies one. Cyrillic, Japanese, Korean, and Chinese script detection is a fallback only.
+- TTS streams are cancelled on Stop/disconnect and aborted when they exceed `min(60s, max(12s, 3x estimated speech duration + 5s))`.
 # Managed lifecycle
 
 Use the tracked background launcher for routine local testing:
@@ -86,3 +90,7 @@ Add `-Component frontend` or `-Component backend` to scope an action, and `-Open
 # Conversation context
 
 The local direct-audio mode keeps the latest 30 complete turns with `compact_history` disabled. System instructions live outside that bounded buffer. Progressive transcript previews are display-only; the final transcript, assistant response, function calls, and tool outputs share one session-scoped history. Context diagnostics report counts and trimming events without logging conversation text.
+
+# Tool follow-ups
+
+The browser sends `function_call_output`, an optional camera image, and one `response.create` immediately. The backend binds these to the model's original `call_id`, waits for the originating response to close, and starts exactly one continuation. A valid tool call remains executable even if Gemma omits a trustworthy transcript; that failure produces a temporary UI notice rather than fabricated conversation text.

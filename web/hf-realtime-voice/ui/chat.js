@@ -391,6 +391,11 @@ export class ChatView {
     this._markUnread();
   }
 
+  discardPendingUserTurn() {
+    if (this._pendingUserHist) this._pendingUserHist.remove();
+    this._pendingUserHist = null;
+  }
+
   /**
    * A response closed (completed or cancelled).
    * @param {{ responseId: string; status: string; audible?: boolean; transcript?: string }} detail

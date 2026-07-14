@@ -453,6 +453,9 @@ class TestSDKToolCalling:
                 )
             )
 
+            created = await _recv(conn)
+            assert created.type == "response.created"
+
             event = await _recv(conn)
             assert event.type == TRANSCRIPT_DONE
             assert event.transcript == "Checking weather"

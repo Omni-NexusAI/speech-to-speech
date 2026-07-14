@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import json
 import sys
@@ -64,6 +65,49 @@ def test_load_base_clone_profiles_handles_missing_library(tmp_path):
     assert server._load_base_clone_profiles(tmp_path / "missing") == []
 
 
+def test_tts_backend_status_reports_faster_and_voice_studio_model(monkeypatch):
+    server = _load_ui_server_module()
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url):
+            if url.endswith("/health"):
+                return Response(
+                    {
+                        "model_loaded": True,
+                        "capabilities": {"native_pcm_streaming": True, "clone_only": True},
+                    }
+                )
+            return Response(
+                {"state": "loaded", "current": "0.6B-Base", "loaded_models": ["0.6B-Base"]}
+            )
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda **kwargs: Client())
+
+    faster = asyncio.run(server._probe_tts_backend("faster", server.TTS_BACKENDS["faster"]))
+    groxaxo = asyncio.run(server._probe_tts_backend("groxaxo", server.TTS_BACKENDS["groxaxo"]))
+
+    assert faster["ready"] is True
+    assert faster["currentModel"] == "1.7B-Base"
+    assert groxaxo["ready"] is True
+    assert groxaxo["currentModel"] == "0.6B-Base"
+
+
 def test_local_ui_identity_keeps_upstream_credit_and_shows_local_provider_slots():
     ui_dir = Path(__file__).resolve().parents[1] / "web" / "hf-realtime-voice"
     html = (ui_dir / "index.html").read_text(encoding="utf-8")
@@ -94,10 +138,10 @@ def test_tool_output_is_acknowledged_before_one_post_tool_response():
     main_js = (ui_dir / "main.js").read_text(encoding="utf-8")
     client_js = (ui_dir / "ws" / "s2s-ws-client.js").read_text(encoding="utf-8")
 
-    assert main_js.index("client.sendToolOutput") < main_js.index("client.waitForResponseIdle")
-    assert "await Promise.all([outputAck, responseClosed])" in main_js
-    assert "waitForResponseIdle(timeoutMs = 20000)" in client_js
-    assert "_resolveResponseIdleWaiters" in client_js
+    assert main_js.index("client.sendToolOutput") < main_js.index("client.requestToolResponse")
+    assert main_js.index("client.requestToolResponse") < main_js.index("await outputAck")
+    assert "requestToolResponse(opts = {})" in client_js
+    assert 'this._send({ type: "response.create" })' in client_js
 
 
 def test_diagnostics_use_transcription_and_dynamic_context_tokens():

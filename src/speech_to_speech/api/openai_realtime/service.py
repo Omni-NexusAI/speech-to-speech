@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 from collections.abc import Mapping
 from queue import Queue
@@ -211,9 +212,15 @@ class ConnState(BaseModel):
     pending_tool_call_ids: set[str] = Field(default_factory=set)
     tool_followup_ready: bool = False
     tool_followup_started: bool = False
+    tool_followup_requested: bool = False
+    tool_followup_response: RealtimeResponseCreateParams | None = None
     current_response_is_tool_followup: bool = False
     text_output_complete: bool = False
     await_text_output_complete: bool = False
+    history_tokens: int = 0
+    history_token_source: str = "empty"
+    history_token_fingerprint: str = ""
+    history_token_pending: bool = False
 
 
 class RealtimeService:
@@ -272,26 +279,64 @@ class RealtimeService:
             logger.warning("Could not detect llama.cpp context window", exc_info=True)
             return None
 
-    def _history_tokens(self, chat: Chat) -> int:
+    def _refresh_history_tokens(self, conn_id: str, content: str, fingerprint: str) -> None:
+        """Refresh llama.cpp token counts off the websocket/send-loop thread."""
+        try:
+            response = httpx.post(
+                f"{self.context_tokenizer_base_url.removesuffix('/v1')}/tokenize",
+                json={"content": content, "add_special": False, "with_pieces": False},
+                timeout=2.0,
+            )
+            response.raise_for_status()
+            tokens = len(response.json().get("tokens") or [])
+        except Exception:
+            logger.debug("Could not refresh retained-history token count", exc_info=True)
+            tokens = None
+        st = self._conns.get(conn_id)
+        if st is None:
+            return
+        if tokens is not None and st.runtime_config.chat.history_token_text() == content:
+            st.history_tokens = tokens
+            st.history_token_source = "llama.cpp"
+            st.history_token_fingerprint = fingerprint
+        st.history_token_pending = False
+
+    def _history_tokens(self, conn_id: str, chat: Chat) -> tuple[int, str]:
         content = chat.history_token_text()
+        st = self._state(conn_id)
         if not content:
-            return 0
-        if self.context_tokenizer_base_url:
-            try:
-                response = httpx.post(
-                    f"{self.context_tokenizer_base_url.removesuffix('/v1')}/tokenize",
-                    json={"content": content, "add_special": False, "with_pieces": False},
-                    timeout=1.0,
-                )
-                response.raise_for_status()
-                return len(response.json().get("tokens") or [])
-            except Exception:
-                logger.warning("Could not tokenize retained conversation history", exc_info=True)
-        return max(1, len(content) // 4)
+            st.history_tokens = 0
+            st.history_token_source = "empty"
+            st.history_token_fingerprint = ""
+            return 0, "empty"
+
+        fingerprint = str(hash(content))
+        if fingerprint != st.history_token_fingerprint:
+            # Keep the last exact value while llama.cpp is busy, but never report
+            # zero for non-empty history. The estimate is replaced asynchronously.
+            estimate = max(1, len(content) // 4)
+            st.history_tokens = max(st.history_tokens, estimate)
+            st.history_token_source = "estimated" if st.history_token_source == "empty" else "cached"
+            if self.context_tokenizer_base_url and not st.history_token_pending:
+                st.history_token_pending = True
+                threading.Thread(
+                    target=self._refresh_history_tokens,
+                    args=(conn_id, content, fingerprint),
+                    name=f"context-tokenizer-{conn_id[-8:]}",
+                    daemon=True,
+                ).start()
+            elif not self.context_tokenizer_base_url:
+                st.history_token_fingerprint = fingerprint
+        return st.history_tokens, st.history_token_source
 
     def context_detail(self, conn_id: str) -> dict[str, Any]:
         chat = self._state(conn_id).runtime_config.chat
-        detail: dict[str, Any] = {**chat.stats(), "history_tokens": self._history_tokens(chat)}
+        history_tokens, token_source = self._history_tokens(conn_id, chat)
+        detail: dict[str, Any] = {
+            **chat.stats(),
+            "history_tokens": history_tokens,
+            "token_source": token_source,
+        }
         detail["max_tokens"] = self.context_window
         detail["percent"] = (
             round(100 * detail["history_tokens"] / self.context_window, 2) if self.context_window else None

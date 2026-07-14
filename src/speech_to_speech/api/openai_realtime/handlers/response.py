@@ -25,6 +25,8 @@ from speech_to_speech.pipeline.messages import GenerateResponseRequest
 from speech_to_speech.utils.utils import _generate_id, is_out_of_band, response_wants_audio
 
 if TYPE_CHECKING:
+    from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
+
     from speech_to_speech.api.openai_realtime.service import ServerEvent, _ResponseStatus, _StatusReason
 
 logger = logging.getLogger(__name__)
@@ -141,16 +143,25 @@ class ResponseHandler(RealtimeBaseHandler):
         on failure, or ``None`` if there is no text_prompt_queue.
         """
         st = self._state(conn_id)
-        if st.pending_tool_call_ids:
-            return self.make_error(
-                message="Cannot create a response until all pending tool outputs are received.",
-                _type="tool_output_pending",
-            )
         if st.tool_followup_started:
             return self.make_error(
-                message="A response has already been created for the current tool transaction.",
+                message="The tool follow-up response has already been requested.",
                 _type="duplicate_tool_followup",
             )
+        tool_transaction = bool(st.pending_tool_call_ids or st.tool_followup_ready)
+        if tool_transaction:
+            # Hosted-compatible ordering sends response.create immediately after
+            # function_call_output. Queue it behind the originating response and
+            # optional deferred camera image; the backend owns the barrier.
+            if st.tool_followup_started or st.tool_followup_requested:
+                logger.info("Ignoring duplicate response.create for the active tool transaction")
+                return None
+            st.tool_followup_requested = True
+            st.tool_followup_response = event.response
+            if st.tool_followup_ready and not st.in_response and not st.pending_tool_call_ids:
+                return self._start_generation(conn_id, event.response, tool_followup=True)
+            logger.info("Queued one response.create for the active tool transaction")
+            return None
         if event.response:
             if event.response.tool_choice and not isinstance(event.response.tool_choice, str):
                 return self.make_error(
@@ -175,40 +186,8 @@ class ResponseHandler(RealtimeBaseHandler):
                 except ChatItemError as exc:
                     return self.make_error(message=str(exc), _type="invalid_input_item")
 
-        st.in_response = True
-        st.response_pending = False
-        st.text_output_complete = False
-        st.await_text_output_complete = True
-
-        st.current_response_params = event.response
-        st.current_response_id = _generate_id("resp")
-        self._start_item(conn_id)
-        st.current_response_is_tool_followup = st.tool_followup_ready
-        if st.current_response_is_tool_followup:
-            st.tool_followup_ready = False
-            st.tool_followup_started = True
-
-        cfg = st.runtime_config
-        queue = self._queue(conn_id)
-        if queue:
-            # Out-of-band responses carry no turn identity: a null turn_id makes every
-            # speculative-turn staleness gate treat them as always-latest, so a new user
-            # turn mid-generation can never silently drop their output.
-            queue.put(
-                GenerateResponseRequest(
-                    runtime_config=cfg,
-                    response=event.response,
-                    turn_id=None if out_of_band else st.speculative_user_turn_id,
-                    turn_revision=None if out_of_band else st.speculative_user_turn_revision,
-                    speech_stopped_at_s=None if out_of_band else st.speculative_user_speech_stopped_at_s,
-                )
-            )
         logger.debug("response.create received, LLM generation triggered")
-        return ResponseCreatedEvent(
-            type="response.created",
-            event_id=self._next_event_id(),
-            response=self._build_response(conn_id, "in_progress"),
-        )
+        return self._start_generation(conn_id, event.response, tool_followup=False)
 
     def handle_response_cancel(self, conn_id: str) -> list[ServerEvent]:
         """Cancel the in-progress response and re-enable listening."""
@@ -277,6 +256,20 @@ class ResponseHandler(RealtimeBaseHandler):
         # is cleared and the generation's own write-back has landed. Done outside
         # the in_response guard so a stray terminal call still drains the buffer.
         events.extend(self._service.conversation.flush_deferred_items(conn_id))
+        if (
+            status == "completed"
+            and st.tool_followup_requested
+            and st.tool_followup_ready
+            and not st.pending_tool_call_ids
+            and not st.tool_followup_started
+        ):
+            events.append(
+                self._start_generation(
+                    conn_id,
+                    st.tool_followup_response,
+                    tool_followup=True,
+                )
+            )
         if events and self._service.context_tokenizer_base_url:
             events.append(self._service.context_metric(conn_id, "committed"))
         return events
@@ -313,7 +306,7 @@ class ResponseHandler(RealtimeBaseHandler):
         # Audio-producing turns are announced by AudioHandler. A tool-only
         # direct-audio turn has no audio, so it must announce its own response
         # lifecycle for the browser to wait for response.done before follow-up.
-        response_was_missing = st.current_response_id is None and bool(event.tools) and not bool(event.text)
+        response_was_missing = st.current_response_id is None
         resp_id, item_id = self._ensure_response(conn_id)
         if response_was_missing:
             events.append(
@@ -361,6 +354,8 @@ class ResponseHandler(RealtimeBaseHandler):
                 st.pending_tool_call_ids.add(tool.call_id)
                 st.tool_followup_ready = False
                 st.tool_followup_started = False
+                st.tool_followup_requested = False
+                st.tool_followup_response = None
                 events.append(
                     ResponseFunctionCallArgumentsDoneEvent(
                         type="response.function_call_arguments.done",
@@ -375,3 +370,42 @@ class ResponseHandler(RealtimeBaseHandler):
                 )
                 output_idx += 1
         return events
+    def _start_generation(
+        self,
+        conn_id: str,
+        response: RealtimeResponseCreateParams | None,
+        *,
+        tool_followup: bool,
+    ) -> ResponseCreatedEvent:
+        st = self._state(conn_id)
+        out_of_band = is_out_of_band(response)
+        st.in_response = True
+        st.response_pending = False
+        st.text_output_complete = False
+        st.await_text_output_complete = True
+        st.current_response_params = response
+        st.current_response_id = _generate_id("resp")
+        self._start_item(conn_id)
+        st.current_response_is_tool_followup = tool_followup
+        if tool_followup:
+            st.tool_followup_ready = False
+            st.tool_followup_started = True
+            st.tool_followup_requested = False
+            st.tool_followup_response = None
+
+        queue = self._queue(conn_id)
+        if queue:
+            queue.put(
+                GenerateResponseRequest(
+                    runtime_config=st.runtime_config,
+                    response=response,
+                    turn_id=None if out_of_band else st.speculative_user_turn_id,
+                    turn_revision=None if out_of_band else st.speculative_user_turn_revision,
+                    speech_stopped_at_s=None if out_of_band else st.speculative_user_speech_stopped_at_s,
+                )
+            )
+        return ResponseCreatedEvent(
+            type="response.created",
+            event_id=self._next_event_id(),
+            response=self._build_response(conn_id, "in_progress"),
+        )

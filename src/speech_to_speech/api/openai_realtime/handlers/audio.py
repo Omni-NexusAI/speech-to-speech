@@ -108,6 +108,8 @@ class AudioHandler(RealtimeBaseHandler):
             st.pending_tool_call_ids.clear()
             st.tool_followup_ready = False
             st.tool_followup_started = False
+            st.tool_followup_requested = False
+            st.tool_followup_response = None
         if st.in_response and event.interrupt_response and st.runtime_config.interrupt_response_enabled:
             events.extend(response.finish_response(conn_id, status="cancelled", reason="turn_detected"))
         is_reopen = bool(event.reopened and event.turn_id is not None and event.turn_id == st.speculative_turn_id)

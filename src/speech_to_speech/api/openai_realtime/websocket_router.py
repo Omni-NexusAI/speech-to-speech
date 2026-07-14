@@ -205,6 +205,13 @@ def _clean_unit(unit: PipelineUnit, preserve: Callable[[Any], bool] | None = Non
     stateful handlers.
     """
     unit.cancel_scope.cancel()
+    for handler in unit.handlers:
+        cancel_active = getattr(handler, "cancel_active", None)
+        if callable(cancel_active):
+            try:
+                cancel_active()
+            except Exception:
+                logger.debug("Handler active-stream cancellation failed", exc_info=True)
     _flush_queue(unit.input_queue)
     _flush_queue(unit.text_prompt_queue)
     _flush_queue(unit.output_queue, preserve=preserve)
@@ -391,12 +398,25 @@ def create_app(
                 except asyncio.TimeoutError:
                     continue
 
-                if raw.get("type") == "local.pipeline.update":
+                if raw.get("type") in {"local.pipeline.update", "pipeline.config.update"}:
                     config = raw.get("config") if isinstance(raw.get("config"), dict) else {}
                     allowed = {"full_buffer_tts", "live_transcription"}
                     rt_cfg = unit.service._state(session_id).runtime_config
                     rt_cfg.local_pipeline.update(
                         {k: bool(v) for k, v in config.items() if k in allowed and isinstance(v, bool)}
+                    )
+                    tts_backend = config.get("tts_backend")
+                    if tts_backend in {"faster", "groxaxo"}:
+                        rt_cfg.local_pipeline["tts_backend"] = tts_backend
+                    await ws.send_json(
+                        {
+                            "type": (
+                                "pipeline.config.updated"
+                                if raw.get("type") == "pipeline.config.update"
+                                else "local.pipeline.updated"
+                            ),
+                            "config": dict(rt_cfg.local_pipeline),
+                        }
                     )
                     continue
 
@@ -442,6 +462,10 @@ def create_app(
                     was_active = unit.service._state(session_id).in_response
                     if was_active:
                         unit.cancel_scope.cancel()
+                        for handler in unit.handlers:
+                            cancel_active = getattr(handler, "cancel_active", None)
+                            if callable(cancel_active):
+                                cancel_active()
                     _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
                     _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
                     events = unit.service.handle_response_cancel(session_id)

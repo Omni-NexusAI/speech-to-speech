@@ -69,10 +69,14 @@ LIMITER_ENABLED = bool(LOAD_BALANCER_URL) and bool(SPACE_ID)
 SERPER_URL = "https://google.serper.dev/search"
 # Cap results so the tool output stays small enough to feed back to the model.
 MAX_RESULTS = 5
-LOCAL_UI_API_VERSION = 3
+LOCAL_UI_API_VERSION = 4
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_QWEN3_VOICE_ID = "16d9bb336799"
 DEFAULT_QWEN3_VOICE = f"clone:{DEFAULT_QWEN3_VOICE_ID}"
+TTS_BACKENDS = {
+    "faster": {"endpoint": "http://127.0.0.1:8881/v1", "requiredModel": "1.7B-Base"},
+    "groxaxo": {"endpoint": "http://127.0.0.1:8882/v1", "requiredModel": None},
+}
 DEFAULT_VOICE_LIBRARY_DIR = Path(
     os.environ.get(
         "VOICE_LIBRARY_DIR",
@@ -218,6 +222,62 @@ async def local_pipeline():
         except Exception:
             status["tts"]["reachable"] = False
     return status
+
+
+async def _probe_tts_backend(name: str, config: dict) -> dict:
+    endpoint = config["endpoint"]
+    result = {
+        "id": name,
+        "endpoint": endpoint,
+        "reachable": False,
+        "streaming": False,
+        "cloneCompatible": False,
+        "currentModel": None,
+        "requiredModel": config.get("requiredModel"),
+        "ready": False,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=1.5) as http:
+            if name == "faster":
+                response = await http.get(f"{endpoint.removesuffix('/v1')}/health")
+                response.raise_for_status()
+                health = response.json()
+                caps = health.get("capabilities") or {}
+                result.update(
+                    reachable=True,
+                    streaming=bool(caps.get("native_pcm_streaming")),
+                    cloneCompatible=bool(caps.get("clone_only")),
+                    currentModel="1.7B-Base",
+                )
+                result["ready"] = bool(
+                    result["streaming"] and result["cloneCompatible"] and health.get("model_loaded")
+                )
+            else:
+                response = await http.get(f"{endpoint}/backend/models")
+                response.raise_for_status()
+                status = response.json()
+                current = str(status.get("current") or "")
+                loaded = status.get("loaded_models") or []
+                result.update(
+                    reachable=True,
+                    streaming=True,
+                    cloneCompatible=current.endswith("B-Base"),
+                    currentModel=current or None,
+                )
+                result["ready"] = bool(
+                    status.get("state") == "loaded" and current in loaded and current.endswith("B-Base")
+                )
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
+
+
+@app.get("/api/tts/backends")
+async def tts_backends():
+    statuses = await asyncio.gather(
+        *(_probe_tts_backend(name, config) for name, config in TTS_BACKENDS.items())
+    )
+    return {"default": "faster", "backends": statuses}
 
 
 @app.get("/api/me")

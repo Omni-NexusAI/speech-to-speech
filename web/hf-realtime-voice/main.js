@@ -32,7 +32,7 @@ const DEFAULT_INSTRUCTIONS =
 const TOOL_USE_HINT =
   " When the user's request calls for one of your tools, do not describe your " +
   "capabilities or say you can do it and wait for another turn. Instead, say " +
-  'a brief acknowledgement like "Let me search for that..." and call the tool ' +
+  "a brief, context-specific acknowledgement when natural, then call the tool " +
   "right away in the same response.";
 
 const STORAGE_KEYS = {
@@ -48,6 +48,7 @@ const STORAGE_KEYS = {
   diagnosticsGeometry: "s2s.ws.diagnosticsGeometry",
   fullBufferTts: "s2s.ws.fullBufferTts",
   liveTranscript: "s2s.ws.liveTranscript",
+  ttsBackend: "s2s.ws.ttsBackend",
 };
 
 // ── Noise gate ──────────────────────────────────────────────────────────────
@@ -108,6 +109,7 @@ function loadSettings() {
     noiseGate: loadGateThreshold(),
     fullBufferTts: localStorage.getItem(STORAGE_KEYS.fullBufferTts) === "1",
     liveTranscript: localStorage.getItem(STORAGE_KEYS.liveTranscript) === "1",
+    ttsBackend: localStorage.getItem(STORAGE_KEYS.ttsBackend) || "faster",
   };
 }
 
@@ -132,6 +134,7 @@ function saveSettings(s) {
   localStorage.setItem(STORAGE_KEYS.noiseGate, String(s.noiseGate));
   localStorage.setItem(STORAGE_KEYS.fullBufferTts, s.fullBufferTts ? "1" : "0");
   localStorage.setItem(STORAGE_KEYS.liveTranscript, s.liveTranscript ? "1" : "0");
+  localStorage.setItem(STORAGE_KEYS.ttsBackend, s.ttsBackend);
 }
 
 /** @returns {{ web_search: boolean, camera_snapshot: boolean }} */
@@ -259,6 +262,8 @@ const connField = $("#conn-field");
 const connHint = $("#conn-hint");
 /** @type {HTMLSelectElement} */
 const inputVoice = $("#voice");
+/** @type {HTMLSelectElement} */
+const inputTtsBackend = $("#tts-backend");
 /** @type {HTMLTextAreaElement} */
 const inputInstructions = $("#instructions");
 /** @type {HTMLInputElement} */
@@ -291,10 +296,12 @@ let settings = loadSettings();
 let voiceProfiles = [];
 let defaultVoice = DEFAULT_VOICE;
 let localPipeline = null;
+/** @type {Record<string, any>} */
+let ttsBackendStatuses = {};
 let diagnosticsOpen = localStorage.getItem(STORAGE_KEYS.diagnostics) === "1";
 /** @type {Array<any>} */
 let pipelineMetrics = [];
-const EXPECTED_UI_API_VERSION = 3;
+const EXPECTED_UI_API_VERSION = 4;
 const EXPECTED_BACKEND_API_VERSION = 2;
 const DIAGNOSTIC_STAGES = ["mic", "vad", "transcription", "gemma", "context", "tool", "tts", "playback"];
 const diagnosticWarnings = new Map();
@@ -439,6 +446,8 @@ function openSettings() {
   syncConnectionUi();
   renderVoiceOptions();
   inputVoice.value = settings.voice;
+  renderTtsBackendOptions();
+  inputTtsBackend.value = settings.ttsBackend;
   inputInstructions.value = settings.instructions;
   inputFullBufferTts.checked = settings.fullBufferTts;
   inputLiveTranscript.checked = settings.liveTranscript;
@@ -870,8 +879,10 @@ async function runTool(name, argsJson, callId) {
   try {
     addPipelineMetric({ stage: "tool", status: "sending_output", detail: { name, callId } });
     const outputAck = client.sendToolOutput(callId, result.output);
-    const responseClosed = client.waitForResponseIdle();
-    await Promise.all([outputAck, responseClosed]);
+    // Hosted ordering: output, optional image, then response.create. The
+    // backend owns the response-ID barrier and starts exactly one follow-up.
+    client.requestToolResponse(result.image ? { image: result.image } : undefined);
+    await outputAck;
     addPipelineMetric({ stage: "tool", status: "output_acknowledged", detail: { name, callId } });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -880,11 +891,21 @@ async function runTool(name, argsJson, callId) {
     return result;
   }
   if (DEBUG) console.debug(`[tool] requesting model response after ${name}`);
-  // Camera: the captured frame rides with the response.create (sent just before
-  // it) so it's in context for the reply. Other tools: a bare create.
-  client.requestResponse(result.image ? { image: result.image } : undefined);
   addPipelineMetric({ stage: "tool", status: "done", elapsed_ms: performance.now() - toolStartedAt, detail: { name } });
   return result;
+}
+
+function renderTtsBackendOptions() {
+  inputTtsBackend.replaceChildren();
+  for (const id of ["faster", "groxaxo"]) {
+    const status = ttsBackendStatuses[id];
+    const option = document.createElement("option");
+    option.value = id;
+    const name = id === "faster" ? "FasterQwen3TTS" : "Groxaxo candidate";
+    const model = status?.currentModel || "no Base model";
+    option.textContent = `${name} - ${model} (${status?.ready ? "ready" : "unavailable"})`;
+    inputTtsBackend.append(option);
+  }
 }
 
 /** @param {string} query @returns {Promise<string>} */
@@ -1046,6 +1067,29 @@ async function refreshLocalPipeline() {
   }
 }
 
+async function refreshTtsBackends() {
+  try {
+    const res = await fetch("api/tts/backends", { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    ttsBackendStatuses = Object.fromEntries((json.backends || []).map((item) => [item.id, item]));
+  } catch (err) {
+    console.warn("[ui] failed to load TTS backend status:", err);
+    ttsBackendStatuses = {};
+  }
+  renderTtsBackendOptions();
+}
+
+async function assertTtsBackendReady() {
+  await refreshTtsBackends();
+  const status = ttsBackendStatuses[settings.ttsBackend];
+  if (status?.ready) return;
+  if (settings.ttsBackend === "groxaxo") {
+    throw new Error("Groxaxo is unavailable or has no 0.6B-Base/1.7B-Base model loaded in Voice Studio.");
+  }
+  throw new Error("FasterQwen3TTS is unavailable or its 1.7B-Base clone model is not ready.");
+}
+
 function renderLocalPipeline() {
   if (!localPipeline) return;
   const set = (id, value) => { const el = document.getElementById(id); if (el) el.textContent = value; };
@@ -1055,12 +1099,17 @@ function renderLocalPipeline() {
     return `${label} (${online ? "online" : "unavailable"})`;
   };
   set("local-provider-gemma", provider(localPipeline.gemma, "Local Gemma via llama.cpp"));
-  set("local-provider-tts", provider(localPipeline.tts, "Local Qwen3-TTS 1.7B Base via FasterQwen3TTS"));
+  const selectedTts = ttsBackendStatuses[settings.ttsBackend];
+  const selectedTtsName = settings.ttsBackend === "groxaxo" ? "Groxaxo candidate" : "FasterQwen3TTS";
+  const selectedTtsLabel = selectedTts
+    ? `${selectedTtsName} ${selectedTts.currentModel || "Base model"} (${selectedTts.ready ? "online" : "unavailable"})`
+    : provider(localPipeline.tts, "Local Qwen3-TTS 1.7B Base via FasterQwen3TTS");
+  set("local-provider-tts", selectedTtsLabel);
   set("about-vad-model", `${localPipeline.vad?.name || "Silero VAD"} (${localPipeline.vad?.device || "CPU"})`);
   set("about-gemma-model", localPipeline.gemma?.model || "Gemma audio model");
   set("about-gemma-url", `${localPipeline.gemma?.baseUrl || ""}${localPipeline.gemma?.reachable ? " (online)" : " (not reached)"}`);
-  set("about-tts-model", localPipeline.tts?.model || "Qwen3 TTS 1.7B Base");
-  set("about-tts-url", `${localPipeline.tts?.baseUrl || ""}${localPipeline.tts?.reachable ? " (online)" : " (not reached)"}`);
+  set("about-tts-model", `${selectedTtsName} ${selectedTts?.currentModel || localPipeline.tts?.model || "Base model"}`);
+  set("about-tts-url", `${selectedTts?.endpoint || localPipeline.tts?.baseUrl || ""}${selectedTts?.ready ? " (online)" : " (not ready)"}`);
   set("about-tools-status", `Serper ${localPipeline.tools?.serper ? "configured" : "needs key"}; camera available`);
 }
 
@@ -1089,6 +1138,7 @@ async function fetchConfig() {
   // Login chip + remaining-budget (no-op / hidden when the limiter is off).
   void account.refresh();
   await fetchVoiceProfiles();
+  await refreshTtsBackends();
   syncToolsUi();
   syncConnectionUi();
 }
@@ -1178,6 +1228,7 @@ function readSettingsFromForm() {
     noiseGate: readGateThreshold(),
     fullBufferTts: inputFullBufferTts.checked,
     liveTranscript: inputLiveTranscript.checked,
+    ttsBackend: inputTtsBackend.value || "faster",
   };
 }
 
@@ -1404,6 +1455,7 @@ async function doStart(audioContext = null) {
   // Resolve the target before touching mic/audio so a misconfiguration (e.g.
   // direct mode with no URL) fails fast with a clear message.
   const target = connectionTarget();
+  await assertTtsBackendReady();
 
   chat.clear();
   chat.reset();
@@ -1529,6 +1581,10 @@ async function doStart(audioContext = null) {
       clearTimeout(backendMetricTimer);
       setDiagnosticWarning("backend-metrics");
     }
+    if (metric.stage === "transcription" && metric.status === "failed") {
+      chat.discardPendingUserTurn();
+      setCaption("Speech could not be transcribed.", "muted");
+    }
     addPipelineMetric(metric);
   });
   c.addEventListener("backend-runtime", (e) => {
@@ -1553,7 +1609,11 @@ async function doStart(audioContext = null) {
 
   try {
     await c.connect();
-    c.updateLocalPipeline({ full_buffer_tts: settings.fullBufferTts, live_transcription: settings.liveTranscript });
+    c.updateLocalPipeline({
+      full_buffer_tts: settings.fullBufferTts,
+      live_transcription: settings.liveTranscript,
+      tts_backend: settings.ttsBackend,
+    });
   } catch (err) {
     // The grant can be refused (402 → limit) or the dial can fail. In LB mode
     // the AudioContext hasn't been adopted by the client yet (the session POST

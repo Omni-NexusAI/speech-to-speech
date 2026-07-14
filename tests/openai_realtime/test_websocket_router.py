@@ -227,6 +227,24 @@ class TestClientEventDispatch:
                 cid = service.connection_ids[0]
                 assert service._state(cid).runtime_config.session.audio.output.voice == "coral"
 
+    def test_pipeline_config_update_is_session_scoped_and_acknowledged(self, setup):
+        app, service, *_ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "pipeline.config.update",
+                        "config": {"tts_backend": "groxaxo", "full_buffer_tts": True},
+                    }
+                )
+                ack = ws.receive_json()
+                assert ack["type"] == "pipeline.config.updated"
+                assert ack["config"]["tts_backend"] == "groxaxo"
+                assert ack["config"]["full_buffer_tts"] is True
+                cid = service.connection_ids[0]
+                assert service._state(cid).runtime_config.local_pipeline["tts_backend"] == "groxaxo"
+
     def test_conversation_item_create_returns_events(self, setup):
         app, *_ = setup
         with TestClient(app) as client:

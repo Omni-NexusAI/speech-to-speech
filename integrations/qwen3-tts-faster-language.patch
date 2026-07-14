@@ -1,0 +1,46 @@
+--- a/server.py
++++ b/server.py
+@@ -143,6 +143,7 @@ class SpeechRequest(BaseModel):
+     response_format: str = "mp3"
+     speed: float = 1.0
+     stream: bool = False
++    language: str = "Auto"
+ 
+ 
+ class VoiceCloneRequest(BaseModel):
+@@ -171,5 +172,6 @@ async def health():
+             "stream_response_format": "pcm",
+             "clone_only": True,
++            "language_override": True,
+         },
+     }
+ 
+@@ -219,12 +221,15 @@ async def create_speech(req: SpeechRequest):
+             if req.response_format != "pcm":
+                 raise HTTPException(400, "Streaming clone requests require response_format='pcm'")
+ 
++            clone_language = req.language if req.language and req.language.lower() != "auto" else profile["language"]
++
+             def _stream_generate():
+                 first = True
+                 total_samples = 0
++                sample_rate = 24000
+                 for audio_chunk, sample_rate, _metadata in model.generate_voice_clone_streaming(
+                     text=text,
+-                    language=profile["language"],
++                    language=clone_language,
+                     ref_audio=profile["ref_audio_path"],
+                     ref_text=profile["ref_text"],
+                     xvec_only=profile["x_vector_only_mode"],
+@@ -250,9 +255,10 @@ async def create_speech(req: SpeechRequest):
+         loop = asyncio.get_event_loop()
+ 
+         def _generate():
++            clone_language = req.language if req.language and req.language.lower() != "auto" else profile["language"]
+             wavs, sr = model.generate_voice_clone(
+                 text=text,
+-                language=profile["language"],
++                language=clone_language,
+                 ref_audio=profile["ref_audio_path"],
+                 ref_text=profile["ref_text"],
+                 xvec_only=profile["x_vector_only_mode"],

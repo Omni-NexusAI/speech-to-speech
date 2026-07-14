@@ -753,6 +753,12 @@ export class S2sWsRealtimeClient extends EventTarget {
         break;
       }
 
+      case "local.pipeline.updated":
+      case "pipeline.config.updated": {
+        this.dispatchEvent(new CustomEvent("local-pipeline-updated", { detail: event.config || {} }));
+        break;
+      }
+
       case "conversation.item.created": {
         const item = event.item || {};
         const pending = item.type === "function_call_output" ? this._toolOutputAcks.get(item.call_id) : null;
@@ -875,7 +881,6 @@ export class S2sWsRealtimeClient extends EventTarget {
         if (err?.type === "conversation_already_has_active_response" ||
             err?.code === "conversation_already_has_active_response") {
           this._createInFlight = false;
-          this._createQueue = [];
           this.dispatchEvent(new CustomEvent("server-error", { detail: { error: new Error(err?.message ?? "Response already active") } }));
           break;
         }
@@ -961,7 +966,7 @@ export class S2sWsRealtimeClient extends EventTarget {
 
   /** @param {{ full_buffer_tts?: boolean }} config */
   updateLocalPipeline(config) {
-    this._send({ type: "local.pipeline.update", config });
+    this._send({ type: "pipeline.config.update", config });
   }
 
   /**
@@ -1062,6 +1067,16 @@ export class S2sWsRealtimeClient extends EventTarget {
       return;
     }
     this._createResponseNow(opts);
+  }
+
+  /** Send a tool follow-up immediately. The backend binds it to the active
+   *  call ID transaction and starts it after the originating response closes.
+   *  @param {{ image?: string }} [opts] */
+  requestToolResponse(opts = {}) {
+    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
+    if (opts.image) this.sendUserImage(opts.image);
+    this._createInFlight = true;
+    this._send({ type: "response.create" });
   }
 
   /** True while a response occupies the single backend slot. */

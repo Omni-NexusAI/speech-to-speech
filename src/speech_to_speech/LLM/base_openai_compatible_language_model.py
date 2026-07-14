@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from threading import Lock
 from typing import Any, Optional
 
 import httpx
@@ -155,6 +156,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
         self.user_role = user_role
         self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self._active_response: Any = None
+        self._active_response_lock = Lock()
         self._extra_body = self._build_extra_body(base_url, disable_thinking, reasoning_effort)
         self.compactor = build_compactor(self._build_compaction_generate_fn()) if compact_history else None
         self.warmup()
@@ -444,6 +447,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         turn: _Turn,
         optional_kwargs: dict[str, Any],
     ) -> Iterator[LLMOut]:
+        if not hasattr(self, "_active_response_lock"):
+            self._active_response_lock = Lock()
+            self._active_response = None
         api_response: Any = None
         state = _GenState()
         error_message: str | None = None
@@ -462,6 +468,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             if error_message is None:
                 api_response = self._request(api_input, optional_kwargs)
             if api_response is not None:
+                with self._active_response_lock:
+                    self._active_response = api_response
                 events = self._iter_events(api_response)
                 if self.stream:
                     yield from self._consume_streaming(events, state, turn)
@@ -492,6 +500,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             if error_message is None:
                 error_message = f"Language model generation failed: {exc}"
         finally:
+            with self._active_response_lock:
+                if self._active_response is api_response:
+                    self._active_response = None
             if api_response is not None and hasattr(api_response, "close"):
                 try:
                     api_response.close()
@@ -522,6 +533,20 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         yield EndOfResponse(
             turn_id=turn.turn_id, turn_revision=turn.turn_revision, cancel_generation=turn.gen, error=error_message
         )
+
+    def cancel_active(self) -> None:
+        """Close the current provider stream so cancellation releases the slot."""
+        lock = getattr(self, "_active_response_lock", None)
+        if lock is None:
+            return
+        with lock:
+            response = self._active_response
+            self._active_response = None
+        if response is not None and hasattr(response, "close"):
+            try:
+                response.close()
+            except Exception:
+                logger.debug("Provider stream was already closed during cancellation")
 
     def process(self, request: LLMIn) -> Iterator[LLMOut]:
         """Process a language model request and yield LLMResponseChunks."""

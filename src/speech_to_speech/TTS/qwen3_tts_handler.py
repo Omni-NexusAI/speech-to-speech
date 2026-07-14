@@ -18,7 +18,7 @@ import unicodedata
 from collections.abc import Callable
 from pathlib import Path
 from sys import platform
-from threading import Event
+from threading import Event, Lock
 from time import perf_counter
 from typing import Any, Iterator, Optional
 
@@ -61,6 +61,7 @@ DEFAULT_QWEN3_TTS_MAX_NEW_TOKENS = 1536
 DEFAULT_OPENAI_API_BASE_URL = "http://127.0.0.1:8881/v1"
 DEFAULT_OPENAI_API_VOICE = "clone:16d9bb336799"
 DEFAULT_OPENAI_API_BACKEND_MODEL = "1.7B-Base"
+DEFAULT_GROXAXO_API_BASE_URL = "http://127.0.0.1:8882/v1"
 DEFAULT_OPENAI_API_VOICE_LIBRARY_DIR = (
     r"C:\Users\yepyy\Documents\Codex\2026-05-24\files-mentioned-by-the-user-i"
     r"\qwen3-tts-candidate\voice_library_from_original"
@@ -97,6 +98,10 @@ QWEN3_LANGUAGE_ALIASES = {
     "es": "spanish",
     "it": "italian",
 }
+
+
+class TTSRunawayError(RuntimeError):
+    pass
 
 
 class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
@@ -179,6 +184,11 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.api_streaming_supported = False
         self.api_sample_rate = int(api_sample_rate)
         self.api_timeout = httpx.Timeout(float(api_timeout_s), connect=10.0)
+        self.groxaxo_api_base_url = (
+            os.getenv("QWEN3_TTS_GROXAXO_BASE_URL") or DEFAULT_GROXAXO_API_BASE_URL
+        ).rstrip("/")
+        self._active_response: httpx.Response | None = None
+        self._active_response_lock = Lock()
 
         if self.faster_backend == "openai-api":
             self.backend = "openai_api"
@@ -714,19 +724,21 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                 return str(output.voice)
         return self.api_voice
 
-    def _openai_api_payload(self, text: str, voice: str) -> dict[str, Any]:
+    def _openai_api_payload(self, text: str, voice: str, language: str = "Auto") -> dict[str, Any]:
         return {
             "model": self.api_model,
             "input": text,
             "voice": voice,
             "response_format": getattr(self, "api_response_format", "pcm"),
             "stream": True,
+            "language": language,
         }
 
     def _openai_api_headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+        api_key = getattr(self, "api_key", None)
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         return headers
 
     def _openai_api_model_status_url(self) -> str:
@@ -826,38 +838,137 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         name = str(data.get("name") or "").strip()
         return f"clone:{name}" if name else voice
 
-    def _process_openai_api(self, text: str, voice: str) -> Iterator[np.ndarray]:
+    def _resolve_api_provider(self, runtime_config: RuntimeConfig | None) -> tuple[str, str, str]:
+        selected = "faster"
+        if runtime_config is not None:
+            selected = str(runtime_config.local_pipeline.get("tts_backend") or "faster").lower()
+        if selected == "faster":
+            return (
+                selected,
+                getattr(self, "api_base_url", DEFAULT_OPENAI_API_BASE_URL),
+                getattr(self, "api_backend_model", DEFAULT_OPENAI_API_BACKEND_MODEL),
+            )
+        if selected != "groxaxo":
+            raise RuntimeError(f"Unsupported TTS backend selection: {selected!r}")
+
+        groxaxo_api_base_url = getattr(self, "groxaxo_api_base_url", DEFAULT_GROXAXO_API_BASE_URL)
+        status_url = f"{groxaxo_api_base_url}/backend/models"
+        try:
+            response = httpx.get(status_url, headers=self._openai_api_headers(), timeout=2.0)
+            response.raise_for_status()
+            status = response.json()
+        except Exception as exc:
+            raise RuntimeError(
+                "Groxaxo TTS is selected but is unreachable on port 8882. "
+                "Start it and load a Base model in Voice Studio before connecting."
+            ) from exc
+        current = str(status.get("current") or "")
+        loaded = status.get("loaded_models") or []
+        if status.get("state") != "loaded" or current not in loaded or not current.endswith("B-Base"):
+            raise RuntimeError(
+                "Groxaxo TTS is selected but no 0.6B-Base or 1.7B-Base model is loaded in Voice Studio."
+            )
+        return selected, groxaxo_api_base_url, current
+
+    @staticmethod
+    def _api_language_name(language: str | None, text: str = "") -> str:
+        if not language or str(language).strip().lower() == "auto":
+            if any("\u0400" <= char <= "\u052f" for char in text):
+                return "Russian"
+            if any("\u3040" <= char <= "\u30ff" for char in text):
+                return "Japanese"
+            if any("\uac00" <= char <= "\ud7af" for char in text):
+                return "Korean"
+            if any("\u4e00" <= char <= "\u9fff" for char in text):
+                return "Chinese"
+            return "Auto"
+        normalized = str(language).strip().replace("_", "-").lower()
+        mapped = QWEN3_LANGUAGE_ALIASES.get(normalized, normalized)
+        supported = {
+            "chinese", "english", "japanese", "korean", "german",
+            "french", "russian", "portuguese", "spanish", "italian",
+        }
+        return mapped.title() if mapped in supported else "Auto"
+
+    @staticmethod
+    def _runaway_budget_s(text: str) -> float:
+        words = len(re.findall(r"\w+", text, flags=re.UNICODE))
+        chars = len(re.sub(r"\s+", "", text))
+        estimated = max(words / 2.6 if words else 0.0, chars / 14.0 if chars else 0.0)
+        return min(60.0, max(12.0, 3.0 * estimated + 5.0))
+
+    def _process_openai_api(
+        self,
+        text: str,
+        voice: str,
+        *,
+        language: str = "Auto",
+        base_url: str | None = None,
+        generation: int | None = None,
+    ) -> Iterator[np.ndarray]:
         voices = [self._api_voice_for_backend(voice)]
         if self.api_fallback_voice and self.api_fallback_voice not in voices:
             voices.append(self._api_voice_for_backend(self.api_fallback_voice))
         last_error: Exception | None = None
         for candidate_voice in voices:
             try:
-                yield from self._stream_openai_api_voice(text, candidate_voice)
+                yield from self._stream_openai_api_voice(
+                    text,
+                    candidate_voice,
+                    language=language,
+                    base_url=base_url,
+                    generation=generation,
+                )
                 return
+            except TTSRunawayError:
+                raise
+            except httpx.ReadTimeout as exc:
+                raise TTSRunawayError("TTS stream produced no data before its latency budget expired") from exc
             except Exception as exc:
                 last_error = exc
                 logger.warning("OpenAI-compatible Qwen3-TTS request failed for voice %s: %s", candidate_voice, exc)
         if last_error is not None:
             raise last_error
 
-    def _stream_openai_api_voice(self, text: str, voice: str) -> Iterator[np.ndarray]:
-        url = f"{self.api_base_url}/audio/speech"
+    def _stream_openai_api_voice(
+        self,
+        text: str,
+        voice: str,
+        *,
+        language: str = "Auto",
+        base_url: str | None = None,
+        generation: int | None = None,
+    ) -> Iterator[np.ndarray]:
+        url = f"{base_url or self.api_base_url}/audio/speech"
         start = perf_counter()
+        runaway_budget_s = self._runaway_budget_s(text)
         total_samples = 0
         pending_bytes = b""
         pending_samples = np.array([], dtype=np.int16)
         first_chunk = True
-        with httpx.Client(timeout=self.api_timeout) as client:
+        request_timeout = httpx.Timeout(runaway_budget_s, connect=min(5.0, runaway_budget_s))
+        with httpx.Client(timeout=request_timeout) as client:
             with client.stream(
                 "POST",
                 url,
                 headers=self._openai_api_headers(),
-                json=self._openai_api_payload(text, voice),
+                json=self._openai_api_payload(text, voice, language),
             ) as response:
+                with self._active_response_lock:
+                    self._active_response = response
                 response.raise_for_status()
                 if getattr(self, "api_response_format", "pcm") != "pcm":
-                    encoded_audio = b"".join(chunk for chunk in response.iter_bytes() if chunk)
+                    encoded_parts: list[bytes] = []
+                    for chunk in response.iter_bytes():
+                        if generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation):
+                            response.close()
+                            return
+                        if perf_counter() - start > runaway_budget_s:
+                            response.close()
+                            raise TTSRunawayError(f"TTS stream exceeded {runaway_budget_s:.1f}s budget")
+                        if chunk:
+                            encoded_parts.append(chunk)
+                    encoded_audio = b"".join(encoded_parts)
                     for out in self._stream_encoded_openai_api_audio(encoded_audio, voice):
                         total_samples += len(out)
                         yield out
@@ -872,6 +983,12 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                     )
                     return
                 for chunk in response.iter_bytes():
+                    if generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation):
+                        response.close()
+                        return
+                    if perf_counter() - start > runaway_budget_s or total_samples / PIPELINE_SR > runaway_budget_s:
+                        response.close()
+                        raise TTSRunawayError(f"TTS stream exceeded {runaway_budget_s:.1f}s budget")
                     if not chunk:
                         continue
                     if first_chunk:
@@ -891,6 +1008,9 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                         total_samples += len(out)
                         yield out
                     pending_samples = pending_samples[n:]
+                with self._active_response_lock:
+                    if self._active_response is response:
+                        self._active_response = None
         if len(pending_samples) > 0:
             out = np.pad(pending_samples, (0, self.blocksize - len(pending_samples)))
             total_samples += len(pending_samples)
@@ -983,12 +1103,23 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         runtime_config = tts_input.runtime_config
         response = tts_input.response
 
-        coalesced_text, _language_code, _saw_end_of_response = self._coalesce_pending_tts_input(tts_input)
+        coalesced_text, language_code, _saw_end_of_response = self._coalesce_pending_tts_input(tts_input)
 
         text = coalesced_text or "Hello."
 
         model_type = self._model_type()
         api_voice = self._resolve_api_voice(runtime_config, response) if self.backend == "openai_api" else None
+        provider_name = self.backend
+        provider_url = getattr(self, "api_base_url", None)
+        provider_model = getattr(self, "api_backend_model", None)
+        if not language_code and runtime_config is not None:
+            language_code = runtime_config.local_pipeline.get("assistant_language")
+        api_language = self._api_language_name(language_code, text)
+        generation = tts_input.cancel_generation
+        if generation is None and self.cancel_scope is not None:
+            generation = self.cancel_scope.generation
+        if self.backend == "openai_api":
+            provider_name, provider_url, provider_model = self._resolve_api_provider(runtime_config)
         if self.backend != "openai_api":
             self._apply_session_voice_override(model_type, runtime_config, response)
 
@@ -1002,8 +1133,10 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             "request_start",
             tts_input,
             detail={
-                "backend": self.backend,
-                "api_base_url": getattr(self, "api_base_url", None) if self.backend == "openai_api" else None,
+                "backend": provider_name,
+                "api_base_url": provider_url if self.backend == "openai_api" else None,
+                "model": provider_model,
+                "language": api_language,
                 "api_response_format": getattr(self, "api_response_format", None),
                 "chars": len(text),
             },
@@ -1011,7 +1144,13 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
 
         try:
             if self.backend == "openai_api":
-                audio_iter = self._process_openai_api(text, api_voice or self.api_voice)
+                audio_iter = self._process_openai_api(
+                    text,
+                    api_voice or self.api_voice,
+                    language=api_language,
+                    base_url=provider_url,
+                    generation=generation,
+                )
             elif self.ref_audio:
                 audio_iter = self._process_voice_clone(text)
             elif model_type == "custom_voice":
@@ -1033,7 +1172,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                 audio_samples += int(np.asarray(audio_chunk).size)
                 yield audio_chunk
             elapsed_s = perf_counter() - start_s
-            audio_s = audio_samples / max(1, self.api_sample_rate if self.backend == "openai_api" else PIPELINE_SR)
+            audio_s = audio_samples / PIPELINE_SR
             self._emit_metric(
                 "tts",
                 "done",
@@ -1041,8 +1180,37 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                 elapsed_ms=elapsed_s * 1000,
                 detail={"audio_s": round(audio_s, 3), "rtf": round(elapsed_s / audio_s, 3) if audio_s else None},
             )
+        except TTSRunawayError as e:
+            logger.error("Qwen3-TTS runaway stream aborted: %s", e)
+            self._emit_metric(
+                "tts",
+                "runaway_aborted",
+                tts_input,
+                elapsed_ms=(perf_counter() - start_s) * 1000,
+                detail={"backend": provider_name, "language": api_language, "error": str(e)},
+            )
         except Exception as e:
             logger.error(f"Error during Qwen3-TTS generation: {e}", exc_info=True)
+            self._emit_metric(
+                "tts",
+                "failed",
+                tts_input,
+                elapsed_ms=(perf_counter() - start_s) * 1000,
+                detail={"backend": provider_name, "language": api_language, "error": str(e)},
+            )
+
+    def cancel_active(self) -> None:
+        lock = getattr(self, "_active_response_lock", None)
+        if lock is None:
+            return
+        with lock:
+            response = getattr(self, "_active_response", None)
+            self._active_response = None
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                logger.debug("TTS stream was already closed during cancellation")
 
     def _emit_metric(
         self,

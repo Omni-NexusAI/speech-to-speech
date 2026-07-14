@@ -18,11 +18,12 @@
 - This fork is used for local speech-to-speech testing with the OpenAI Realtime-compatible server preserved.
 - Keep upstream pipeline behavior intact unless a change is required for the local direct-audio Gemma path.
 - The local fast-test path intentionally skips Parakeet/transcription with `--stt gemma-audio` and sends completed audio turns directly to the local Gemma audio model.
-- Speech output for this machine should use the existing Dockerized FasterQwen3TTS-compatible OpenAI API with `--qwen3_tts_backend openai-api`; do not modify the TTS container/image from this repo.
+- Speech output defaults to the existing Dockerized FasterQwen3TTS-compatible OpenAI API on `8881`; the optional Groxaxo candidate on `8882` is user-managed and must never be started, stopped, or switched by this repo.
 - Local inference only for the custom test path: no cloud fallback should be introduced.
 - For Gemma 4 12B tests, use the settings from `C:\llama.cpp\launch_gemma-4-12B-it-qat-MTP.ps1` with context reduced to 16k; this repo provides `scripts\launch_gemma_4_12b_16k.ps1` for that.
 - The target TTS service is the stable Docker container name `qwen3-tts-faster` on `http://127.0.0.1:8881/v1`; container IDs are transient after authorized rebuilds and must not be used by lifecycle scripts.
 - Qwen3 clone output must use the `1.7B-Base` backend model by default; the `qwen3-tts-faster` API exposes native incremental PCM16 clone streaming while preserving buffered formats for non-streaming requests.
+- Faster clone requests carry an explicit assistant language when known; keep the reproducible local server patch under `integrations/` in sync with the rebuilt image.
 - The realtime UI should expose saved Voice Studio `Base` clone profiles only, with `clone:16d9bb336799` (`J.A.R.V.I.S`) as the default.
 - Do not test Gemma/llama.cpp while the local Gemma server is being rebuilt.
 
@@ -32,6 +33,7 @@
 - `scripts/AGENTS.md` covers local launch/test helper scripts.
 - `tests/AGENTS.md` covers test expectations.
 - `web/AGENTS.md` covers the vendored HF Realtime Voice browser UI.
+- `integrations/AGENTS.md` covers reproducible patches for external local services.
 
 ## Release Rules
 
