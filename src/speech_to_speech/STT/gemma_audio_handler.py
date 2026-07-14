@@ -653,11 +653,48 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
     @staticmethod
     def _tool_calls_from_accum(tool_accum: dict[int, dict[str, str]]) -> list[ResponseFunctionToolCall]:
         tools: list[ResponseFunctionToolCall] = []
+        used_call_ids: set[str] = set()
         for index in sorted(tool_accum):
             entry = tool_accum[index]
             if not entry["name"]:
                 continue
-            tools.append(ResponseFunctionToolCall(type="function_call", name=entry["name"], arguments=entry["args"] or "{}", call_id=entry["id"] or _generate_id("call"), id=_generate_id("fc"), status="completed"))
+            raw_call_id = entry["id"].strip()
+            if not raw_call_id:
+                call_id = _generate_id("call")
+                source = "generated"
+            elif raw_call_id.startswith("call_"):
+                call_id = raw_call_id
+                source = "native"
+            else:
+                # llama.cpp may return opaque tool IDs while the Realtime chat
+                # contract requires call_* IDs. Normalize only at this adapter
+                # boundary, then use the same value for every later transaction.
+                call_id = f"call_{raw_call_id}"
+                source = "normalized"
+            if call_id in used_call_ids:
+                base_call_id = call_id
+                suffix = index
+                while call_id in used_call_ids:
+                    call_id = f"{base_call_id}_{suffix}"
+                    suffix += 1
+                source = f"{source}_deduplicated"
+            used_call_ids.add(call_id)
+            logger.info(
+                "Direct audio tool call prepared (stage=adapter name=%s call_id=%s source=%s)",
+                entry["name"],
+                call_id,
+                source,
+            )
+            tools.append(
+                ResponseFunctionToolCall(
+                    type="function_call",
+                    name=entry["name"],
+                    arguments=entry["args"] or "{}",
+                    call_id=call_id,
+                    id=_generate_id("fc"),
+                    status="completed",
+                )
+            )
         return tools
 
     def cancel_active(self) -> None:

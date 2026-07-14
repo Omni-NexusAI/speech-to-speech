@@ -69,9 +69,14 @@ class ConversationHandler(RealtimeBaseHandler):
             call_id = getattr(item, "call_id", None)
             if call_id in st.pending_tool_call_ids:
                 st.pending_tool_call_ids.remove(call_id)
+                logger.info(
+                    "Tool output accepted (stage=output_ack call_id=%s pending=%d)",
+                    call_id,
+                    len(st.pending_tool_call_ids),
+                )
                 if not st.pending_tool_call_ids:
                     st.tool_followup_ready = True
-                    logger.info("Tool transaction ready for one follow-up response")
+                    logger.info("Tool transaction ready for one follow-up response (call_id=%s)", call_id)
         event = ConversationItemCreatedEvent(
             type="conversation.item.created",
             event_id=self._next_event_id(),

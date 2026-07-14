@@ -392,6 +392,7 @@ class ResponseHandler(RealtimeBaseHandler):
             st.tool_followup_started = True
             st.tool_followup_requested = False
             st.tool_followup_response = None
+            logger.info("Tool follow-up generation started (stage=followup_start)")
 
         queue = self._queue(conn_id)
         if queue:

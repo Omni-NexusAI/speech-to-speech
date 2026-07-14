@@ -226,6 +226,76 @@ def test_direct_tool_call_without_transcript_is_persisted_without_fabricated_use
     assert chat.buffer == []
 
 
+def test_streamed_tool_call_normalizes_opaque_llama_cpp_id_and_commits():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
+    accum = {}
+    handler._accumulate_tool_deltas(
+        {
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "id": "UNM0K7ZOZpEN5uS0vGTo1G1UnSDH8Vki",
+                    "function": {"name": "web_search", "arguments": '{"query":"Control 2"}'},
+                }
+            ]
+        },
+        accum,
+    )
+
+    tools = handler._tool_calls_from_accum(accum)
+
+    assert tools[0].call_id == "call_UNM0K7ZOZpEN5uS0vGTo1G1UnSDH8Vki"
+    chat = Chat(30)
+    vad_audio = SimpleNamespace(runtime_config=SimpleNamespace(chat=chat), turn_id="turn_tool", turn_revision=0)
+    assert handler._commit_context(vad_audio, "Search for Control 2", "", tools) is True
+    assert chat.stats()["pending_tool_calls"] == 1
+
+
+def test_buffered_tool_call_preserves_prefixed_id():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+
+    _, tools = handler._message_text_and_tools(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_camera_1",
+                                "function": {"name": "camera_snapshot", "arguments": "{}"},
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+    )
+
+    assert tools[0].call_id == "call_camera_1"
+
+
+def test_tool_call_without_model_id_generates_realtime_id():
+    tools = GemmaAudioSTTHandler._tool_calls_from_accum(
+        {0: {"name": "web_search", "args": '{"query":"local"}', "id": ""}}
+    )
+
+    assert tools[0].call_id.startswith("call_")
+
+
+def test_parallel_opaque_tool_ids_are_normalized_and_unique():
+    tools = GemmaAudioSTTHandler._tool_calls_from_accum(
+        {
+            0: {"name": "web_search", "args": '{"query":"one"}', "id": "opaque"},
+            1: {"name": "camera_snapshot", "args": "{}", "id": "opaque"},
+        }
+    )
+
+    assert [tool.call_id for tool in tools] == ["call_opaque", "call_opaque_1"]
+
+
 def test_invalid_direct_turn_emits_ui_only_transcript_failure_without_spoken_retry():
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)

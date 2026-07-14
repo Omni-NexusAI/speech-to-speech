@@ -1031,6 +1031,75 @@ class TestDispatchPipelineEvent:
         assert isinstance(events[3], ResponseFunctionCallArgumentsDoneEvent)
         assert events[3].output_index == 2
 
+    @pytest.mark.parametrize("tool_name", ["web_search", "camera_snapshot"])
+    def test_opaque_llama_tool_id_completes_one_followup_and_next_response(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+        tool_name,
+    ):
+        from openai.types.realtime.realtime_conversation_item_function_call import (
+            RealtimeConversationItemFunctionCall,
+        )
+
+        from speech_to_speech.STT.gemma_audio_handler import GemmaAudioSTTHandler
+
+        st = service._state(conn_id)
+        st.runtime_config.chat.add_item(make_user_message(f"Use {tool_name}"))
+        tool = GemmaAudioSTTHandler._tool_calls_from_accum(
+            {0: {"name": tool_name, "args": "{}", "id": "UNM0K7ZOZpEN5uS0vGTo1G1UnSDH8Vki"}}
+        )[0]
+        st.runtime_config.chat.add_item(
+            RealtimeConversationItemFunctionCall(
+                type="function_call",
+                call_id=tool.call_id,
+                id=tool.id,
+                name=tool.name,
+                arguments=tool.arguments,
+                status=tool.status,
+            )
+        )
+
+        tool_events = service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="Let me check.", tools=[tool]),
+        )
+        emitted = next(event for event in tool_events if isinstance(event, ResponseFunctionCallArgumentsDoneEvent))
+        assert emitted.call_id == "call_UNM0K7ZOZpEN5uS0vGTo1G1UnSDH8Vki"
+        assert [item.type for item in st.runtime_config.chat.buffer] == ["message"]
+        assert st.runtime_config.chat.stats()["pending_tool_calls"] == 1
+
+        service.finish_response(conn_id)
+        acknowledgements = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "type": "function_call_output",
+                    "call_id": emitted.call_id,
+                    "output": '{"ok":true}',
+                },
+            ),
+        )
+        assert any(isinstance(event, ConversationItemCreatedEvent) for event in acknowledgements)
+        assert [item.type for item in st.runtime_config.chat.buffer[-2:]] == [
+            "function_call",
+            "function_call_output",
+        ]
+
+        created = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert isinstance(created, ResponseCreatedEvent)
+        request = text_prompt_queue.get_nowait()
+        assert isinstance(request, GenerateResponseRequest)
+        duplicate = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert isinstance(duplicate, RealtimeErrorEvent)
+        assert duplicate.error.type == "duplicate_tool_followup"
+
+        service.finish_response(conn_id)
+        next_response = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert isinstance(next_response, ResponseCreatedEvent)
+
     def test_assistant_text_tools_only(self, service, conn_id):
         events = service.dispatch_pipeline_event(
             conn_id,
