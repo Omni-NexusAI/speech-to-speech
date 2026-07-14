@@ -11,6 +11,7 @@
 - Cover final transcript persistence independently from the optional floating live bubble, transcript-only fallback, Unicode-safe output, tool acknowledgement after response close, and dynamic history-token/context-window diagnostics.
 - Cover immediate tool output/create ordering, session-scoped provider selection, Groxaxo Base-model detection, active-stream cancellation, and bounded TTS runaway handling.
 - Direct-audio tool tests must cover opaque, already-prefixed, missing, duplicate, streaming, and buffered llama.cpp call IDs.
+- Teardown coverage must prove intermediate handler queues are flushed and closed-client events/tool continuations cannot reactivate a stopped conversation.
 
 - Prefer mocked HTTP and monkeypatched model setup for backend-adapter tests.
 - Tests for the local Gemma/FasterQwen3TTS path must not require running local models or Docker containers.

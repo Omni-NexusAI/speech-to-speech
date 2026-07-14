@@ -19,7 +19,7 @@ from starlette.websockets import WebSocketState
 import speech_to_speech.api.openai_realtime.websocket_router as router_module
 from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit
 from speech_to_speech.api.openai_realtime.service import CHUNK_SIZE_BYTES, RealtimeService
-from speech_to_speech.api.openai_realtime.websocket_router import create_app
+from speech_to_speech.api.openai_realtime.websocket_router import _clean_unit, create_app
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.control import SESSION_END, PipelineControlMessage, is_control_message
 from speech_to_speech.pipeline.events import (
@@ -116,6 +116,53 @@ def _simulate_session_end_drain(input_queue: Queue, output_queue: Queue, timeout
 
 def _pcm_bytes(n_samples: int) -> bytes:
     return b"\x00" * (n_samples * 2)
+
+
+def test_clean_unit_flushes_intermediate_handler_queues(setup):
+    (
+        _,
+        _,
+        input_queue,
+        output_queue,
+        text_output_queue,
+        should_listen,
+        _,
+        response_playing,
+        cancel_scope,
+    ) = setup
+    intermediate_in: Queue = Queue()
+    intermediate_out: Queue = Queue()
+
+    class Handler:
+        queue_in = intermediate_in
+        queue_out = intermediate_out
+        cancelled = False
+
+        def cancel_active(self):
+            self.cancelled = True
+
+    handler = Handler()
+    text_prompt_queue: Queue = Queue()
+    unit = PipelineUnit(
+        index=0,
+        service=RealtimeService(text_prompt_queue=text_prompt_queue, should_listen=should_listen),
+        cancel_scope=cancel_scope,
+        should_listen=should_listen,
+        response_playing=response_playing,
+        input_queue=input_queue,
+        output_queue=output_queue,
+        text_output_queue=text_output_queue,
+        text_prompt_queue=text_prompt_queue,
+        handlers=[handler],
+    )
+    queues = (input_queue, intermediate_in, intermediate_out, output_queue, text_output_queue)
+    for queue in queues:
+        queue.put("stale")
+
+    _clean_unit(unit)
+
+    assert handler.cancelled is True
+    assert all(queue.empty() for queue in queues)
 
 
 class _FakeWebSocket:

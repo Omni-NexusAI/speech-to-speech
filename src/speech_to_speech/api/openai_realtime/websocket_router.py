@@ -197,12 +197,10 @@ async def _drain_pending_response_events(
 def _clean_unit(unit: PipelineUnit, preserve: Callable[[Any], bool] | None = None) -> None:
     """Cancel in-flight work and flush queues for a single pipeline unit.
 
-    All four pipeline queues are drained — input audio, transcript-to-LM,
-    LM-to-TTS output, and the text-event side channel — so pending work from
-    a released session cannot be picked up by handlers and leak into the next
-    session that claims this unit. SESSION_END is enqueued by the route
-    handler *after* this returns to serve as the soft reset signal for
-    stateful handlers.
+    Every queue in the handler chain is drained so pending speculative turns
+    cannot sit ahead of SESSION_END and keep the sole pipeline slot occupied.
+    SESSION_END is enqueued by the route handler *after* this returns to serve
+    as the soft reset signal for stateful handlers.
     """
     unit.cancel_scope.cancel()
     for handler in unit.handlers:
@@ -212,10 +210,26 @@ def _clean_unit(unit: PipelineUnit, preserve: Callable[[Any], bool] | None = Non
                 cancel_active()
             except Exception:
                 logger.debug("Handler active-stream cancellation failed", exc_info=True)
-    _flush_queue(unit.input_queue)
-    _flush_queue(unit.text_prompt_queue)
-    _flush_queue(unit.output_queue, preserve=preserve)
-    _flush_queue(unit.text_output_queue, preserve=preserve)
+    queues: list[Queue[Any]] = [
+        unit.input_queue,
+        unit.text_prompt_queue,
+        unit.output_queue,
+        unit.text_output_queue,
+    ]
+    for handler in unit.handlers:
+        for attr in ("queue_in", "queue_out"):
+            queue = getattr(handler, attr, None)
+            if isinstance(queue, Queue):
+                queues.append(queue)
+
+    seen: set[int] = set()
+    edge_queue_ids = {id(unit.output_queue), id(unit.text_output_queue)}
+    for queue in queues:
+        queue_id = id(queue)
+        if queue_id in seen:
+            continue
+        seen.add(queue_id)
+        _flush_queue(queue, preserve=preserve if queue_id in edge_queue_ids else None)
     unit.response_playing.clear()
     unit.cancel_scope.reset()
     unit.should_listen.set()

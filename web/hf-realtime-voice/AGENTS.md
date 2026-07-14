@@ -23,6 +23,7 @@
 - Diagnostics label the always-on final stage `Transcription` and show retained history tokens against the context window detected from llama.cpp.
 - Camera preview and Diagnostics should not occupy the same desktop corner; keep the camera self-view clear when diagnostics are open.
 - Settings list live Faster and Groxaxo status. Provider changes apply to the next conversation, and an unavailable selected provider blocks start without silent fallback.
+- Stop invalidates the active client before asynchronous teardown; closed-client mic, playback, tool, and WebSocket events must never change the idle UI or enter a replacement conversation.
 
 ## Child DOX Index
 

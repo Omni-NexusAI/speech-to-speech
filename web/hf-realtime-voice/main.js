@@ -837,11 +837,12 @@ function flashPreview() {
  * Run the function the model called, return its result to the backend, and ask
  * for a follow-up response. We also hand the result back to the caller so it
  * can be shown in the conversation once the tool has actually run.
+ * @param {S2sWsRealtimeClient} sessionClient
  * @param {string} name @param {string} argsJson @param {string} callId
  * @returns {Promise<{ output: string, image?: string }>}
  */
-async function runTool(name, argsJson, callId) {
-  if (!client) return { output: "" };
+async function runTool(sessionClient, name, argsJson, callId) {
+  if (client !== sessionClient) return { output: "" };
   let args = /** @type {Record<string, unknown>} */ ({});
   try { args = JSON.parse(argsJson || "{}"); } catch { /* keep {} */ }
 
@@ -876,12 +877,13 @@ async function runTool(name, argsJson, callId) {
     const msg = err instanceof Error ? err.message : String(err);
     result.output = `Tool failed: ${msg}`;
   }
+  if (client !== sessionClient) return result;
   try {
     addPipelineMetric({ stage: "tool", status: "sending_output", detail: { name, callId } });
-    const outputAck = client.sendToolOutput(callId, result.output);
+    const outputAck = sessionClient.sendToolOutput(callId, result.output);
     // Hosted ordering: output, optional image, then response.create. The
     // backend owns the response-ID barrier and starts exactly one follow-up.
-    client.requestToolResponse(result.image ? { image: result.image } : undefined);
+    sessionClient.requestToolResponse(result.image ? { image: result.image } : undefined);
     await outputAck;
     addPipelineMetric({ stage: "tool", status: "output_acknowledged", detail: { name, callId } });
   } catch (err) {
@@ -1500,12 +1502,14 @@ async function doStart(audioContext = null) {
   client = c;
 
   c.addEventListener("queue", (e) => {
+    if (client !== c) return;
     const { position, queueId } = /** @type {CustomEvent<{ position: number; queueId: string }>} */ (e).detail;
     if (queueId) queuedTicketId = queueId;
     onQueuePosition(position);
   });
 
   c.addEventListener("ready-to-join", (e) => {
+    if (client !== c) return;
     const { info, expiresSec } = /** @type {CustomEvent<{ info: import("./ws/s2s-ws-client.js").WsSessionInfo; expiresSec: number }>} */ (e).detail;
     // A slot is held for us. We're out of the queue now, so drop the ticket ref.
     // Track the granted session id already so that leaving (or letting the timer
@@ -1519,33 +1523,40 @@ async function doStart(audioContext = null) {
   });
 
   c.addEventListener("status", (e) => {
+    if (client !== c) return;
     const detail = /** @type {CustomEvent<{ status: string }>} */ (e).detail;
     onClientStatus(detail.status);
   });
   c.addEventListener("transcript", (e) => {
+    if (client !== c) return;
     const d = /** @type {CustomEvent<{ role: "user" | "assistant"; text: string; partial: boolean; itemId?: string; responseId?: string }>} */ (e).detail;
     chat.onTranscript(d, { showUserBubble: settings.liveTranscript });
   });
 
   c.addEventListener("response-finished", (e) => {
+    if (client !== c) return;
     const detail = /** @type {CustomEvent<{ responseId: string; status: string; audible?: boolean; transcript?: string }>} */ (e).detail;
     chat.onResponseFinished(detail);
   });
 
   c.addEventListener("toolcall", (e) => {
+    if (client !== c) return;
     const { name, arguments: args, callId } = /** @type {CustomEvent<{ name: string; arguments: string; callId: string }>} */ (e).detail;
     chat.onToolCall(name, args, callId);
     // Execute the tool, then push it to the conversation once the result is in,
     // so the toggle shows both the call input and its output together.
-    void runTool(name, args, callId).then(({ output, image }) => {
+    void runTool(c, name, args, callId).then(({ output, image }) => {
+      if (client !== c) return;
       chat.onToolResult(name, args, output, image, callId);
     });
   });
   c.addEventListener("error", (e) => {
+    if (client !== c) return;
     const detail = /** @type {CustomEvent<{ error: unknown }>} */ (e).detail;
     onFatalError(detail.error);
   });
   c.addEventListener("server-error", (e) => {
+    if (client !== c) return;
     // Non-fatal: the backend reported an error mid-session. Log it, keep the
     // socket and the conversation alive (the model can recover on its own).
     const detail = /** @type {CustomEvent<{ error: unknown }>} */ (e).detail;
@@ -1553,6 +1564,7 @@ async function doStart(audioContext = null) {
     console.warn("[main] server error (non-fatal):", msg);
   });
   c.addEventListener("session", (e) => {
+    if (client !== c) return;
     const info = /** @type {CustomEvent<{ info: import("./ws/s2s-ws-client.js").WsSessionInfo }>} */ (e).detail.info;
     console.log("[ws] session created:", info.sessionId);
     backendRuntimeTimer = window.setTimeout(() => {
@@ -1572,10 +1584,12 @@ async function doStart(audioContext = null) {
     }
   });
   c.addEventListener("input-level", (e) => {
+    if (client !== c) return;
     const { rms } = /** @type {CustomEvent<{ rms: number }>} */ (e).detail;
     paintInputLevel(rms);
   });
   c.addEventListener("pipeline-metric", (e) => {
+    if (client !== c) return;
     const metric = /** @type {CustomEvent<any>} */ (e).detail;
     if (metric.source === "backend") {
       clearTimeout(backendMetricTimer);
@@ -1588,6 +1602,7 @@ async function doStart(audioContext = null) {
     addPipelineMetric(metric);
   });
   c.addEventListener("backend-runtime", (e) => {
+    if (client !== c) return;
     backendRuntime = /** @type {CustomEvent<any>} */ (e).detail;
     clearTimeout(backendRuntimeTimer);
     if (backendRuntime.api_version !== EXPECTED_BACKEND_API_VERSION) {
@@ -1598,6 +1613,7 @@ async function doStart(audioContext = null) {
     addPipelineMetric({ stage: "context", status: "runtime", source: "backend", detail: backendRuntime.context || {} });
   });
   c.addEventListener("turn-state", (e) => {
+    if (client !== c) return;
     const status = /** @type {CustomEvent<any>} */ (e).detail.status;
     if (status !== "speech_stopped") return;
     chat.onUserTurnPending();
@@ -1740,17 +1756,18 @@ async function teardown() {
   endTrackedSession();
   endQueueTicket();
   chat.reset({ dismiss: true });
-  if (client) {
-    try {
-      await client.close();
-    } catch (err) {
-      console.warn("[main] error closing client:", err);
-    }
-    client = null;
-  }
+  const closingClient = client;
+  client = null;
   if (micStream) {
     for (const track of micStream.getTracks()) track.stop();
     micStream = null;
+  }
+  if (closingClient) {
+    try {
+      await closingClient.close();
+    } catch (err) {
+      console.warn("[main] error closing client:", err);
+    }
   }
   // The webcam is independent of the call lifecycle (it runs while the user is
   // on the page), so we leave it on here — only the camera toggle stops it.

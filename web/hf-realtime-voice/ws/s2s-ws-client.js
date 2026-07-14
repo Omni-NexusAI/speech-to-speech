@@ -211,6 +211,7 @@ export class S2sWsRealtimeClient extends EventTarget {
 
   /** @param {WsStatus} status */
   _setStatus(status) {
+    if (this._closed && status !== "closed") return;
     if (this._status === status) return;
     this._status = status;
     this.dispatchEvent(new CustomEvent("status", { detail: { status } }));
@@ -489,6 +490,7 @@ export class S2sWsRealtimeClient extends EventTarget {
       processorOptions: { chunkMs: MIC_CHUNK_MS },
     });
     captureNode.port.onmessage = (e) => {
+      if (this._closed) return;
       const data = e.data;
       if (data instanceof ArrayBuffer) {
         this._onMicChunk(data);
@@ -566,6 +568,7 @@ export class S2sWsRealtimeClient extends EventTarget {
    * @param {{ kind: string; queuedMs?: number; played?: number }} data
    */
   _onPlaybackMessage(data) {
+    if (this._closed) return;
     if (data?.kind === "stats") {
       this.dispatchEvent(new CustomEvent("pipeline-metric", {
         detail: { stage: "playback", status: "queue", source: "browser", detail: { queued_ms: data.queuedMs || 0, played: data.played || 0 } },
@@ -589,6 +592,7 @@ export class S2sWsRealtimeClient extends EventTarget {
    * @param {ArrayBuffer} pcm16Buffer
    */
   _onMicChunk(pcm16Buffer) {
+    if (this._closed) return;
     if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
     if (!this._sessionConfigured) return; // Server rejects audio before session.update.
     if (this._muted) return;
@@ -600,6 +604,7 @@ export class S2sWsRealtimeClient extends EventTarget {
    * @param {string | ArrayBuffer | Blob} raw
    */
   async _onWsMessage(raw) {
+    if (this._closed) return;
     let text;
     if (typeof raw === "string") {
       text = raw;
@@ -610,6 +615,7 @@ export class S2sWsRealtimeClient extends EventTarget {
     } else {
       return;
     }
+    if (this._closed) return;
 
     let event;
     try {
@@ -1128,6 +1134,14 @@ export class S2sWsRealtimeClient extends EventTarget {
     // Abort a queue wait in progress: flag it and wake the poll sleep so
     // `_pollQueue` throws "aborted" and connect() unwinds cleanly.
     this._closed = true;
+    this._sessionConfigured = false;
+    this._muted = true;
+    this._captureNode?.port.postMessage({ kind: "enable", value: false });
+    this._playbackNode?.port.postMessage({ kind: "clear" });
+    for (const track of this.options.micStream?.getTracks?.() ?? []) {
+      track.stop();
+    }
+    this.options.micStream = undefined;
     for (const pending of this._toolOutputAcks.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error("WebSocket closed before tool output was acknowledged"));
