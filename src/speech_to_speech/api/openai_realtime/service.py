@@ -432,6 +432,7 @@ class RealtimeService:
                 model_endpoint=self.default_model_endpoint.model_copy(deep=True),
             )
         )
+        state.runtime_config.local_pipeline["_session_id"] = state.session_id
         self._conns[state.session_id] = state
         self.total_usage.connections += 1
         return state.session_id

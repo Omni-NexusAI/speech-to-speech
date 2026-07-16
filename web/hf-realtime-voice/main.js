@@ -44,6 +44,7 @@ const STORAGE_KEYS = {
   tools: "s2s.ws.tools",
   searchKey: "s2s.ws.searchKey",
   noiseGate: "s2s.ws.noiseGate",
+  echoGuard: "s2s.ws.echoGuard",
   diagnostics: "s2s.ws.diagnostics",
   diagnosticsGeometry: "s2s.ws.diagnosticsGeometry",
   fullBufferTts: "s2s.ws.fullBufferTts",
@@ -106,11 +107,13 @@ const SNAPSHOT_MAX_EDGE = 768;
 const SNAPSHOT_QUALITY = 0.7;
 
 function loadSettings() {
+  const storedEchoGuard = localStorage.getItem(STORAGE_KEYS.echoGuard);
   return {
     directUrl: localStorage.getItem(STORAGE_KEYS.directUrl) || "http://127.0.0.1:8765",
     voice: localStorage.getItem(STORAGE_KEYS.voice) || DEFAULT_VOICE,
     instructions: localStorage.getItem(STORAGE_KEYS.instructions) || DEFAULT_INSTRUCTIONS,
     noiseGate: loadGateThreshold(),
+    echoGuard: ["off", "adaptive", "strict"].includes(storedEchoGuard || "") ? storedEchoGuard : "adaptive",
     fullBufferTts: localStorage.getItem(STORAGE_KEYS.fullBufferTts) === "1",
     liveTranscript: localStorage.getItem(STORAGE_KEYS.liveTranscript) === "1",
     ttsBackend: localStorage.getItem(STORAGE_KEYS.ttsBackend) || "faster",
@@ -140,6 +143,7 @@ function saveSettings(s) {
   localStorage.setItem(STORAGE_KEYS.voice, s.voice);
   localStorage.setItem(STORAGE_KEYS.instructions, s.instructions);
   localStorage.setItem(STORAGE_KEYS.noiseGate, String(s.noiseGate));
+  localStorage.setItem(STORAGE_KEYS.echoGuard, s.echoGuard);
   localStorage.setItem(STORAGE_KEYS.fullBufferTts, s.fullBufferTts ? "1" : "0");
   localStorage.setItem(STORAGE_KEYS.liveTranscript, s.liveTranscript ? "1" : "0");
   localStorage.setItem(STORAGE_KEYS.ttsBackend, s.ttsBackend);
@@ -294,6 +298,8 @@ const modelConnectionStatus = $("#model-connection-status");
 const inputInstructions = $("#instructions");
 /** @type {HTMLInputElement} */
 const inputNoiseGate = $("#noise-gate");
+/** @type {HTMLSelectElement} */
+const inputEchoGuard = $("#echo-guard");
 /** @type {HTMLInputElement} */
 const inputFullBufferTts = $("#full-buffer-tts");
 /** @type {HTMLInputElement} */
@@ -327,9 +333,10 @@ let ttsBackendStatuses = {};
 let diagnosticsOpen = localStorage.getItem(STORAGE_KEYS.diagnostics) === "1";
 /** @type {Array<any>} */
 let pipelineMetrics = [];
-const EXPECTED_UI_API_VERSION = 5;
-const EXPECTED_BACKEND_API_VERSION = 3;
-const DIAGNOSTIC_STAGES = ["mic", "vad", "transcription", "gemma", "context", "tool", "tts", "playback"];
+const EXPECTED_UI_API_VERSION = 6;
+const EXPECTED_BACKEND_API_VERSION = 4;
+const DIAGNOSTIC_STAGES = ["mic", "echo_guard", "vad", "transcription", "gemma", "context", "tool", "tts", "playback"];
+const DIAGNOSTIC_STAGE_LABELS = { echo_guard: "Echo Guard" };
 const diagnosticWarnings = new Map();
 let backendRuntime = null;
 let backendMetricTimer = 0;
@@ -480,6 +487,7 @@ function openSettings() {
   inputModelApiKey.value = settings.modelApiKey;
   syncModelProviderUi();
   inputInstructions.value = settings.instructions;
+  inputEchoGuard.value = settings.echoGuard;
   inputFullBufferTts.checked = settings.fullBufferTts;
   inputLiveTranscript.checked = settings.liveTranscript;
   syncGateUi();
@@ -1057,7 +1065,7 @@ function renderDiagnostics() {
     const node = document.createElement("div");
     node.className = `diag-node ${metric ? "has-data" : ""} ${metric?.status || "idle"}`;
     const name = document.createElement("strong");
-    name.textContent = stage.replace(/^./, (c) => c.toUpperCase());
+    name.textContent = DIAGNOSTIC_STAGE_LABELS[stage] || stage.replace(/^./, (c) => c.toUpperCase());
     const state = document.createElement("span");
     state.textContent = stage === "context" && contextMax
       ? `${contextUsed.toLocaleString()} / ${contextMax.toLocaleString()}`
@@ -1272,6 +1280,7 @@ function readSettingsFromForm() {
     voice: inputVoice.value || defaultVoice,
     instructions: inputInstructions.value.trim() || DEFAULT_INSTRUCTIONS,
     noiseGate: readGateThreshold(),
+    echoGuard: ["off", "adaptive", "strict"].includes(inputEchoGuard.value) ? inputEchoGuard.value : "adaptive",
     fullBufferTts: inputFullBufferTts.checked,
     liveTranscript: inputLiveTranscript.checked,
     ttsBackend: inputTtsBackend.value || "faster",
@@ -1372,6 +1381,7 @@ settingsForm.addEventListener("submit", (event) => {
   if (client && LIVE_STATES.has(currentState)) {
     client.updateSession({ voice: settings.voice, instructions: effectiveInstructions() });
     client.updateLocalPipeline({ full_buffer_tts: settings.fullBufferTts, live_transcription: settings.liveTranscript });
+    client.setEchoGuard(settings.echoGuard);
   }
 });
 
@@ -1585,6 +1595,7 @@ async function doStart(audioContext = null) {
     acquireMic: acquireMicStream,
     tools: activeToolDefs(),
     noiseGate: gateParams(settings.noiseGate),
+    echoGuard: settings.echoGuard,
     pipelineConfig: {
       full_buffer_tts: settings.fullBufferTts,
       live_transcription: settings.liveTranscript,

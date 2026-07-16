@@ -54,6 +54,7 @@ from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.LLM.chat import Chat
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.handler_types import LLMIn, LLMOut, STTIn, STTOut, TTSIn, TTSOut
+from speech_to_speech.pipeline.model_operations import ModelOperationCoordinator
 from speech_to_speech.pipeline.queue_types import (
     AudioInItem,
     AudioOutItem,
@@ -509,6 +510,7 @@ def _build_realtime_pipeline_unit(
     should_listen = Event()
     response_playing = Event()
     cancel_scope = CancelScope()
+    model_operations = ModelOperationCoordinator()
     speculative_turns = SpeculativeTurnTracker()
     recv_audio_chunks_queue: Queue[AudioInItem] = Queue()
     send_audio_chunks_queue: Queue[AudioOutItem] = Queue()
@@ -523,6 +525,9 @@ def _build_realtime_pipeline_unit(
     vars(vad_kw)["speculative_turns"] = speculative_turns
     vars(gemma_audio_kw)["text_output_queue"] = text_output_queue
     vars(gemma_audio_kw)["cancel_scope"] = cancel_scope
+    vars(gemma_audio_kw)["model_operations"] = model_operations
+    vars(responses_api_kw)["model_operations"] = model_operations
+    vars(responses_api_kw)["text_output_queue"] = text_output_queue
     vars(qwen3_tts_kw)["text_output_queue"] = text_output_queue
     for kw in (
         lm_kw,
@@ -596,6 +601,7 @@ def _build_realtime_pipeline_unit(
         index=index,
         service=service,
         cancel_scope=cancel_scope,
+        model_operations=model_operations,
         should_listen=should_listen,
         response_playing=response_playing,
         input_queue=recv_audio_chunks_queue,

@@ -342,6 +342,16 @@
               </small>
             </div>
 
+            <label class="field">
+              <span>Assistant echo guard</span>
+              <select id="echo-guard">
+                <option value="adaptive" selected>Adaptive</option>
+                <option value="strict">Strict</option>
+                <option value="off">Off</option>
+              </select>
+              <small>Adaptive allows deliberate barge-in while rejecting playback echo. Strict pauses microphone upload while the assistant speaks.</small>
+            </label>
+
             <div class="field local-mode-field">
               <label class="inline-check">
                 <input id="full-buffer-tts" type="checkbox" />

@@ -82,6 +82,8 @@ The realtime backend and UI can start while local Gemma is unavailable. Local en
 
 - No separate ASR model is used in `gemma-audio` mode.
 - A VAD soft endpoint waits 250 ms before launching Gemma. Speech that resumes within the seven-second reopen window keeps its captured audio, cancels any obsolete uncommitted generation, and submits one combined latest revision.
+- Direct audio, transcript fallback, optional previews, and post-tool generation share one model-operation coordinator. Only one request can occupy the selected Local or Remote endpoint; optional previews are dropped while it is busy.
+- Post-tool responses use streamed Chat Completions and dispatch the first complete sentence to TTS. A barge-in actively closes the obsolete stream; if transport shutdown exceeds two seconds, that generation is detached and its late output is rejected without ending the conversation.
 - Faster on `8881` is the default. A Settings provider change is conversation-scoped and takes effect on the next conversation.
 - Voice defaults to `clone:16d9bb336799`, displayed as `J.A.R.V.I.S`.
 - The realtime UI lists saved Voice Studio profiles from `profiles/*/meta.json` and only exposes `Base` clone profiles.
@@ -89,6 +91,7 @@ The realtime backend and UI can start while local Gemma is unavailable. Local en
 - Pretrained Qwen voices are intentionally hidden for this local test path.
 - Both providers receive `stream: true`, `response_format: pcm`, the selected clone ID, and an explicit assistant language when Gemma supplies one. Cyrillic, Japanese, Korean, and Chinese script detection is a fallback only.
 - TTS streams are cancelled on Stop/disconnect and aborted when they exceed `min(60s, max(12s, 3x estimated speech duration + 5s))`.
+- Assistant echo guard defaults to **Adaptive**: the browser combines native AEC with the exact playback PCM as a capture-worklet reference, retains a 250 ms tail, and admits sustained uncorrelated human speech. **Strict** suspends microphone upload during playback/tail; **Off** disables the additional reference guard.
 # Managed lifecycle
 
 Use the tracked background launcher for routine local testing:

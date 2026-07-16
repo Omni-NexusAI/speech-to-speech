@@ -26,6 +26,8 @@
 - Settings list live Faster and Groxaxo status. Provider changes apply to the next conversation, and an unavailable selected provider blocks start without silent fallback.
 - Keep model inference controls separate from TTS controls, and place Voice directly beneath TTS Backend in the vertically scrolling settings layout.
 - Stop invalidates the active client before asynchronous teardown; closed-client mic, playback, tool, and WebSocket events must never change the idle UI or enter a replacement conversation.
+- Feed the exact playback worklet PCM into the capture worklet as a non-audible reference. Adaptive suppresses correlated echo but admits sustained double-talk; Strict suspends upload through the echo tail; Off preserves capture.
+- Keep native `echoCancellation`, `noiseSuppression`, and `autoGainControl` enabled and expose echo correlation, suppression, double-talk, and mode in diagnostics.
 
 ## Child DOX Index
 

@@ -45,7 +45,8 @@ MAX_AUDIO_BATCH_BYTES = 6400
 # monkeypatch this to a small value since their fixtures usually skip the
 # real handler chain.
 SESSION_END_DRAIN_TIMEOUT_S = 10.0
-BACKEND_RUNTIME_API_VERSION = 3
+BACKEND_RUNTIME_API_VERSION = 4
+MODEL_CANCEL_TIMEOUT_S = 2.0
 QItem = TypeVar("QItem")
 
 
@@ -203,7 +204,10 @@ def _clean_unit(unit: PipelineUnit, preserve: Callable[[Any], bool] | None = Non
     as the soft reset signal for stateful handlers.
     """
     unit.cancel_scope.cancel()
+    unit.model_operations.cancel_and_wait("session_end", MODEL_CANCEL_TIMEOUT_S)
     for handler in unit.handlers:
+        if getattr(handler, "model_operations", None) is unit.model_operations:
+            continue
         cancel_active = getattr(handler, "cancel_active", None)
         if callable(cancel_active):
             try:
@@ -231,8 +235,44 @@ def _clean_unit(unit: PipelineUnit, preserve: Callable[[Any], bool] | None = Non
         seen.add(queue_id)
         _flush_queue(queue, preserve=preserve if queue_id in edge_queue_ids else None)
     unit.response_playing.clear()
+    unit.model_operations.reset()
     unit.cancel_scope.reset()
     unit.should_listen.set()
+
+
+async def _cancel_active_generation(unit: PipelineUnit, reason: str) -> None:
+    """Cancel one response without ending or poisoning its conversation."""
+    result = await asyncio.to_thread(
+        unit.model_operations.cancel_and_wait,
+        reason,
+        MODEL_CANCEL_TIMEOUT_S,
+    )
+    for handler in unit.handlers:
+        if getattr(handler, "model_operations", None) is unit.model_operations:
+            continue
+        cancel_active = getattr(handler, "cancel_active", None)
+        if callable(cancel_active):
+            try:
+                cancel_active()
+            except Exception:
+                logger.debug("Handler cancellation failed during %s", reason, exc_info=True)
+    operation = result.operation
+    unit.text_output_queue.put(
+        PipelineMetricEvent(
+            stage="gemma",
+            status="detached" if result.detached else "cancelled",
+            at_s=time.time(),
+            elapsed_ms=result.elapsed_ms,
+            turn_id=operation.turn_id if operation else None,
+            turn_revision=operation.turn_revision if operation else None,
+            detail={
+                "reason": reason,
+                "operation": operation.kind if operation else None,
+                "operation_id": operation.operation_id if operation else None,
+                "released": result.released,
+            },
+        )
+    )
 
 
 def _to_audio_bytes(chunk: Any) -> bytes:
@@ -321,6 +361,7 @@ def create_app(
         "mode": "realtime",
         "diagnostic_stages": [
             "mic",
+            "echo_guard",
             "vad",
             "transcription",
             "gemma",
@@ -465,7 +506,7 @@ def create_app(
                                 else "local.pipeline.updated"
                             ),
                             "config": {
-                                **dict(rt_cfg.local_pipeline),
+                                **{k: v for k, v in rt_cfg.local_pipeline.items() if not k.startswith("_")},
                                 "model_endpoint": rt_cfg.model_endpoint.redacted(),
                             },
                         }
@@ -511,13 +552,11 @@ def create_app(
                         await _send_event(ws, result)
 
                 elif isinstance(event, ResponseCancelEvent):
-                    was_active = unit.service._state(session_id).in_response
+                    state = unit.service._state(session_id)
+                    was_active = state.in_response or state.response_pending
                     if was_active:
                         unit.cancel_scope.cancel()
-                        for handler in unit.handlers:
-                            cancel_active = getattr(handler, "cancel_active", None)
-                            if callable(cancel_active):
-                                cancel_active()
+                        await _cancel_active_generation(unit, "response_cancel")
                     _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
                     _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
                     events = unit.service.handle_response_cancel(session_id)
@@ -638,6 +677,7 @@ def create_app(
                             active_cfg is None or active_cfg.interrupt_response_enabled
                         ):
                             unit.cancel_scope.cancel()
+                            await _cancel_active_generation(unit, "barge_in")
                             if session_id:
                                 unit.service._state(session_id).response_pending = False
                             _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)

@@ -134,8 +134,7 @@ def test_new_revision_closes_obsolete_direct_audio_transport():
 
     response = Closable()
     client = Closable()
-    handler._active_response = response
-    handler._active_client = client
+    handler._active_resources = {response, client}
     handler._active_turn = ("turn", 1)
 
     handler._on_revision_observed("turn", 2)

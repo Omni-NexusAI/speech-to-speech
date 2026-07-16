@@ -348,6 +348,9 @@ class TestSDKBargeIn:
             done = next(e for e in events if e.type == RESPONSE_DONE)
             assert done.response.status == "cancelled"
 
+            metric = await asyncio.wait_for(conn.recv(), timeout=0.5)
+            assert metric.type == "pipeline.metric"
+            assert metric.status in {"cancelled", "detached"}
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(conn.recv(), timeout=0.5)
 
@@ -654,10 +657,11 @@ class TestSDKMultiTurn:
             # Barge-in
             server_env.text_output_queue.put(SpeechStartedEvent())
             events = []
-            for _ in range(3):
+            for _ in range(4):
                 events.append(await _recv(conn))
 
             t1_done = next(e for e in events if e.type == RESPONSE_DONE)
+            assert any(e.type == "pipeline.metric" for e in events)
 
             # Simulate pipeline acknowledging cancellation so discard guard clears
             server_env.output_queue.put(AUDIO_RESPONSE_DONE)

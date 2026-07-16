@@ -65,11 +65,14 @@
  *   executes and replies via `sendToolOutput` + `requestResponse`.
  * @property {NoiseGate} [noiseGate] Client-side noise gate applied to the mic
  *   before it's sent. Tunable live via `setNoiseGate`.
+ * @property {EchoGuardMode} [echoGuard] Playback-reference echo suppression.
  * @property {Record<string, any>} [pipelineConfig] Conversation-scoped model and TTS routing.
  *
  * @typedef {Object} NoiseGate
  * @property {boolean} enabled
  * @property {number} thresholdDb Open threshold in dBFS (e.g. -45).
+ *
+ * @typedef {"off" | "adaptive" | "strict"} EchoGuardMode
  *
  * @typedef {Object} ToolDef
  * @property {"function"} type
@@ -148,6 +151,8 @@ export class S2sWsRealtimeClient extends EventTarget {
     this._joinTimer = 0;
     /** @type {NoiseGate} Mic noise gate; off by default. */
     this._noiseGate = options.noiseGate ?? { enabled: false, thresholdDb: -45 };
+    /** @type {EchoGuardMode} */
+    this._echoGuard = options.echoGuard ?? "adaptive";
     /** @type {WebSocket | null} */
     this._ws = null;
     /** @type {AudioContext | null} */
@@ -486,7 +491,7 @@ export class S2sWsRealtimeClient extends EventTarget {
     await ctx.audioWorklet.addModule(new URL("audio-playback.js", base).href);
 
     const captureNode = new AudioWorkletNode(ctx, "mic-capture", {
-      numberOfInputs: 1,
+      numberOfInputs: 2,
       numberOfOutputs: 0,
       processorOptions: { chunkMs: MIC_CHUNK_MS },
     });
@@ -498,10 +503,31 @@ export class S2sWsRealtimeClient extends EventTarget {
       } else if (data?.kind === "level") {
         // Raw pre-gate mic RMS for the Settings meter.
         this.dispatchEvent(new CustomEvent("input-level", { detail: { rms: data.rms } }));
+      } else if (data?.kind === "echo_metric") {
+        this.dispatchEvent(new CustomEvent("pipeline-metric", {
+          detail: {
+            stage: "echo_guard",
+            status: data.suppressing ? "suppressing" : data.doubleTalk ? "double_talk" : "monitoring",
+            source: "browser",
+            detail: {
+              mode: data.mode,
+              native_aec: !!data.nativeAec,
+              correlation: Number(data.correlation || 0),
+              residual: Number(data.residual || 0),
+              lag_ms: Number(data.lagMs || 0),
+              suppressed_ms: Number(data.suppressedMs || 0),
+              double_talk: !!data.doubleTalk,
+              playback_active: !!data.playbackActive,
+            },
+          },
+        }));
       }
     };
     // Push the initial gate config now that the worklet exists.
     captureNode.port.postMessage({ kind: "gate", ...this._noiseGate });
+    const micTrack = this.options.micStream?.getAudioTracks?.()[0];
+    const nativeAec = !!micTrack?.getSettings?.().echoCancellation;
+    captureNode.port.postMessage({ kind: "echo_guard", mode: this._echoGuard, nativeAec });
     this._captureNode = captureNode;
 
     const micSrc = ctx.createMediaStreamSource(this.options.micStream);
@@ -529,6 +555,7 @@ export class S2sWsRealtimeClient extends EventTarget {
     outAnalyser.fftSize = VIS_FFT_SIZE;
     outAnalyser.smoothingTimeConstant = 0.3;
     playbackNode.connect(outAnalyser);
+    playbackNode.connect(captureNode, 0, 1);
     outAnalyser.connect(ctx.destination);
     this._outAnalyser = outAnalyser;
     this._playbackNode = playbackNode;
@@ -1134,6 +1161,14 @@ export class S2sWsRealtimeClient extends EventTarget {
   setNoiseGate(gate) {
     this._noiseGate = gate;
     this._captureNode?.port.postMessage({ kind: "gate", ...gate });
+  }
+
+  /** @param {EchoGuardMode} mode */
+  setEchoGuard(mode) {
+    this._echoGuard = ["off", "adaptive", "strict"].includes(mode) ? mode : "adaptive";
+    const micTrack = this.options.micStream?.getAudioTracks?.()[0];
+    const nativeAec = !!micTrack?.getSettings?.().echoCancellation;
+    this._captureNode?.port.postMessage({ kind: "echo_guard", mode: this._echoGuard, nativeAec });
   }
 
   /** @param {Record<string, unknown>} event */

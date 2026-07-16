@@ -877,6 +877,7 @@ class TestPool:
             assert data["runtime"]["api_version"] == router_module.BACKEND_RUNTIME_API_VERSION
             assert data["runtime"]["diagnostic_stages"] == [
                 "mic",
+                "echo_guard",
                 "vad",
                 "transcription",
                 "gemma",

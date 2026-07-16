@@ -19,6 +19,8 @@ def test_local_realtime_config_disables_compaction_for_chat_completions_backend(
     assert config["llm_backend"] == "chat-completions"
     assert config["responses_api_chat_size"] == 30
     assert config["responses_api_compact_history"] is False
+    assert config["responses_api_stream"] is True
+    assert config["stream_batch_sentences"] == 1
 
 
 def test_setup_openai_api_backend_skips_in_process_model_loading(monkeypatch):

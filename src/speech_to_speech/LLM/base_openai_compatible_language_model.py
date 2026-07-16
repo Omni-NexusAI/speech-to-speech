@@ -4,6 +4,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from threading import Lock
+from time import perf_counter, time
 from typing import Any, Optional
 
 import httpx
@@ -33,6 +34,7 @@ from speech_to_speech.LLM.text_prompt import build_text_system_prompt
 from speech_to_speech.LLM.utils import remove_unspeechable, resolve_auto_language
 from speech_to_speech.LLM.voice_prompt import build_voice_system_prompt
 from speech_to_speech.pipeline.cancel_scope import CancelScope
+from speech_to_speech.pipeline.events import PipelineMetricEvent
 from speech_to_speech.pipeline.handler_types import LLMIn, LLMOut
 from speech_to_speech.pipeline.messages import (
     DirectAssistantRequest,
@@ -40,6 +42,7 @@ from speech_to_speech.pipeline.messages import (
     LLMResponseChunk,
     TokenUsage,
 )
+from speech_to_speech.pipeline.model_operations import ModelOperationCoordinator, ModelOperationToken
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 from speech_to_speech.utils.utils import is_out_of_band, response_wants_audio
 
@@ -140,9 +143,13 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         stream_batch_sentences: int = 3,
         enable_lang_prompt: bool = False,
         compact_history: bool = False,
+        model_operations: ModelOperationCoordinator | None = None,
+        text_output_queue: Any | None = None,
         **_kwargs: Any,
     ) -> None:
         self.cancel_scope = cancel_scope
+        self.model_operations = model_operations
+        self.text_output_queue = text_output_queue
         self.speculative_turns = speculative_turns
         self.model_name = model_name
         self.stream = stream
@@ -494,6 +501,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         state = _GenState()
         error_message: str | None = None
         api_input = self._serialize(active_chat)
+        request_started_s = perf_counter()
+        first_output = True
         # Images the model actually sees this turn; only these are stripped on
         # write-back, so an image a fast client injects mid-generation for the
         # next turn survives (it is not in this serialized snapshot).
@@ -506,16 +515,37 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
         try:
             if error_message is None:
+                self._emit_model_metric(turn, "waiting_headers")
                 api_response = self._request(api_input, optional_kwargs, turn.runtime_config)
             if api_response is not None:
+                self._emit_model_metric(
+                    turn,
+                    "generating",
+                    elapsed_ms=(perf_counter() - request_started_s) * 1000,
+                )
                 with self._active_response_lock:
                     self._active_response = api_response
                 events = self._iter_events(api_response)
-                if self.stream:
-                    yield from self._consume_streaming(events, state, turn)
-                else:
-                    yield from self._consume_nonstreaming(events, state, turn)
+                outputs = (
+                    self._consume_streaming(events, state, turn)
+                    if self.stream
+                    else self._consume_nonstreaming(events, state, turn)
+                )
+                for output in outputs:
+                    if first_output and isinstance(output, LLMResponseChunk) and (output.text or output.tools):
+                        self._emit_model_metric(
+                            turn,
+                            "first_token",
+                            elapsed_ms=(perf_counter() - request_started_s) * 1000,
+                        )
+                        first_output = False
+                    yield output
         except httpx.ReadTimeout:
+            self._emit_model_metric(
+                turn,
+                "timeout",
+                elapsed_ms=(perf_counter() - request_started_s) * 1000,
+            )
             logger.warning(
                 "OpenAI API read timed out after %.1fs; ending the current response",
                 self.request_timeout_s,
@@ -577,6 +607,14 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     turn_id=turn.turn_id,
                     turn_revision=turn.turn_revision,
                 )
+        final_status = "cancelled" if self._generation_is_stale(turn.gen) else "complete"
+        if error_message is not None:
+            final_status = "failed"
+        self._emit_model_metric(
+            turn,
+            final_status,
+            elapsed_ms=(perf_counter() - request_started_s) * 1000,
+        )
         yield EndOfResponse(
             turn_id=turn.turn_id, turn_revision=turn.turn_revision, cancel_generation=turn.gen, error=error_message
         )
@@ -597,6 +635,29 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     resource.close()
                 except Exception:
                     logger.debug("Provider transport was already closed during cancellation")
+
+    def _emit_model_metric(
+        self,
+        turn: _Turn,
+        status: str,
+        *,
+        elapsed_ms: float | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        text_output_queue = getattr(self, "text_output_queue", None)
+        if text_output_queue is None:
+            return
+        text_output_queue.put(
+            PipelineMetricEvent(
+                stage="gemma",
+                status=status,
+                at_s=time(),
+                elapsed_ms=elapsed_ms,
+                turn_id=turn.turn_id,
+                turn_revision=turn.turn_revision,
+                detail={"operation": "post_tool", **(detail or {})},
+            )
+        )
 
     def process(self, request: LLMIn) -> Iterator[LLMOut]:
         """Process a language model request and yield LLMResponseChunks."""
@@ -651,9 +712,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
         optional_kwargs = self._build_optional_kwargs(req_tools, req_tool_choice)
 
-        # CancelScope.is_stale(gen) is checked when the stream iterator advances; a
-        # blocked read inside httpx cannot be aborted by cancel_scope.cancel() from
-        # the websocket router. Mitigations: request_timeout_s / ReadTimeout.
+        # The shared model-operation coordinator closes a blocked provider stream
+        # on barge-in; the generation tag still rejects any late detached output.
         gen = self.cancel_scope.generation if self.cancel_scope else None
 
         turn = _Turn(
@@ -666,7 +726,30 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             speech_stopped_at_s=speech_stopped_at_s,
             wants_audio=wants_audio,
         )
-        yield from self._generate(active_chat, original_chat, turn, optional_kwargs)
+        operation: ModelOperationToken | None = None
+        coordinator = getattr(self, "model_operations", None)
+        if coordinator is not None:
+            session_id = str(runtime_config.local_pipeline.get("_session_id") or "") or None
+            operation = coordinator.acquire(
+                kind="post_tool",
+                session_id=session_id,
+                turn_id=turn_id,
+                turn_revision=turn_revision,
+                cancel_generation=gen,
+                stale=lambda: self._generation_is_stale(gen) or not self._turn_is_latest(turn_id, turn_revision),
+            )
+            if operation is None:
+                yield EndOfResponse(turn_id=turn_id, turn_revision=turn_revision, cancel_generation=gen)
+                return
+            coordinator.bind_cancel(operation, self.cancel_active)
+        try:
+            if operation is not None and coordinator is not None and not coordinator.is_current(operation):
+                yield EndOfResponse(turn_id=turn_id, turn_revision=turn_revision, cancel_generation=gen)
+                return
+            yield from self._generate(active_chat, original_chat, turn, optional_kwargs)
+        finally:
+            if operation is not None and coordinator is not None:
+                coordinator.release(operation)
 
     @property
     def timing_log_level(self) -> int:

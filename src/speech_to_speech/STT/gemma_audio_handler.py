@@ -26,6 +26,7 @@ from speech_to_speech.LLM.chat_completions_language_model import (
 from speech_to_speech.pipeline.events import PipelineMetricEvent
 from speech_to_speech.pipeline.handler_types import STTIn, STTOut
 from speech_to_speech.pipeline.messages import DirectAssistantResponse, PartialTranscription
+from speech_to_speech.pipeline.model_operations import ModelOperationCoordinator, ModelOperationToken
 from speech_to_speech.STT.base_stt_handler import BaseSTTHandler
 from speech_to_speech.utils.utils import _generate_id
 
@@ -71,6 +72,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         gen_kwargs: dict[str, Any] | None = None,
         text_output_queue: Any | None = None,
         cancel_scope: Any | None = None,
+        model_operations: ModelOperationCoordinator | None = None,
     ) -> None:
         self.model_name = model_name
         self.base_url = (os.getenv("GEMMA_AUDIO_BASE_URL") or base_url).rstrip("/")
@@ -87,10 +89,10 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         self.sample_rate = 16000
         self.text_output_queue: Any | None = text_output_queue
         self.cancel_scope = cancel_scope
+        self.model_operations = model_operations
         self._preview_transcripts: dict[tuple[str | None, int | None], str] = {}
         self._committed_user_turns: set[tuple[str | None, int | None]] = set()
-        self._active_response: httpx.Response | None = None
-        self._active_client: httpx.Client | None = None
+        self._active_resources: set[Any] = set()
         self._active_turn: tuple[str | None, int | None] | None = None
         self._active_response_lock = threading.Lock()
         logger.info("Gemma audio direct mode configured for %s at %s", self.model_name, self.base_url)
@@ -110,14 +112,48 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 active[1],
                 revision,
             )
-            self.cancel_active()
+            if self.model_operations is not None:
+                self.model_operations.cancel_and_wait("audio_revision", 2.0)
+            else:
+                self.cancel_active()
 
     def process(self, vad_audio: STTIn) -> Iterator[STTOut]:
-        if vad_audio.mode == "progressive":
-            if not self._live_preview_enabled(getattr(vad_audio, "runtime_config", None)):
-                return
-            yield from self._iter_progressive_transcriptions(vad_audio)
+        generation = self.cancel_scope.generation if self.cancel_scope is not None else None
+        operation: ModelOperationToken | None = None
+        coordinator = self.model_operations
+        runtime_config = getattr(vad_audio, "runtime_config", None)
+        progressive = vad_audio.mode == "progressive"
+        if progressive and not self._live_preview_enabled(runtime_config):
             return
+        if coordinator is not None:
+            local_pipeline = getattr(runtime_config, "local_pipeline", None) or {}
+            session_id = str(local_pipeline.get("_session_id") or "") or None
+            operation = coordinator.acquire(
+                kind="transcription_preview" if progressive else "direct_audio",
+                session_id=session_id,
+                turn_id=vad_audio.turn_id,
+                turn_revision=vad_audio.turn_revision,
+                cancel_generation=generation,
+                drop_if_busy=progressive,
+                stale=lambda: self._request_is_stale(vad_audio, generation),
+            )
+            if operation is None:
+                if progressive:
+                    self._emit_metric(vad_audio, "transcription", "live_dropped", detail={"reason": "model_busy"})
+                return
+            coordinator.bind_cancel(operation, self.cancel_active)
+        try:
+            if operation is not None and coordinator is not None and not coordinator.is_current(operation):
+                return
+            if progressive:
+                yield from self._iter_progressive_transcriptions(vad_audio)
+                return
+            yield from self._process_direct(vad_audio, generation)
+        finally:
+            if operation is not None and coordinator is not None:
+                coordinator.release(operation)
+
+    def _process_direct(self, vad_audio: STTIn, generation: int | None) -> Iterator[STTOut]:
         start_s = perf_counter()
         audio = self._as_float32_mono(vad_audio.audio)
         duration_s = len(audio) / self.sample_rate if self.sample_rate else 0.0
@@ -131,17 +167,30 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         )
         self._emit_metric(vad_audio, "transcription", "active", detail={"mode": "final"})
         first = True
-        generation = self.cancel_scope.generation if self.cancel_scope is not None else None
+        failed_status: str | None = None
         try:
             for response in self._iter_direct_responses(audio, vad_audio, generation=generation):
                 if first and (response.text or response.tools):
                     self._emit_metric(vad_audio, "gemma", "first_token", elapsed_ms=(perf_counter() - start_s) * 1000)
                     first = False
                 yield response
+        except httpx.ReadTimeout:
+            failed_status = "timeout"
+            raise
+        except Exception:
+            failed_status = "failed"
+            raise
         finally:
             total_s = perf_counter() - start_s
             logger.info("Gemma audio direct request done turn=%s rev=%s total=%.3fs", vad_audio.turn_id, vad_audio.turn_revision, total_s)
-            self._emit_metric(vad_audio, "gemma", "done", elapsed_ms=total_s * 1000)
+            status = "cancelled" if self._request_is_stale(vad_audio, generation) else failed_status or "complete"
+            self._emit_metric(vad_audio, "gemma", status, elapsed_ms=total_s * 1000)
+
+    def _request_is_stale(self, vad_audio: STTIn, generation: int | None) -> bool:
+        if generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation):
+            return True
+        tracker = getattr(self, "speculative_turns", None)
+        return tracker is not None and not tracker.is_latest(vad_audio.turn_id, vad_audio.turn_revision)
 
     def _emit_metric(self, vad_audio: STTIn, stage: str, status: str, *, elapsed_ms: float | None = None, detail: dict[str, Any] | None = None) -> None:
         if self.text_output_queue is not None:
@@ -270,43 +319,51 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         try:
             base_url, _, api_key = self._model_endpoint(vad_audio)
             with httpx.Client(timeout=self.timeout) as client:
-                with client.stream(
-                    "POST",
-                    f"{base_url}/chat/completions",
-                    headers=self._headers(api_key),
-                    json=self._transcription_payload(audio, vad_audio),
-                ) as response:
-                    response.raise_for_status()
-                    for line in response.iter_lines():
-                        if not line:
-                            continue
-                        if line.startswith("data:"):
-                            line = line[len("data:") :].strip()
-                        if line == "[DONE]":
-                            break
+                self._track_active(client, vad_audio)
+                try:
+                    with client.stream(
+                        "POST",
+                        f"{base_url}/chat/completions",
+                        headers=self._headers(api_key),
+                        json=self._transcription_payload(audio, vad_audio),
+                    ) as response:
+                        self._track_active(response, vad_audio)
                         try:
-                            data = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        choices = data.get("choices") or []
-                        if not choices:
-                            continue
-                        delta = choices[0].get("delta") or {}
-                        content = delta.get("content") or choices[0].get("text")
-                        if not content:
-                            continue
-                        if first:
-                            self._emit_metric(vad_audio, "transcription", "live_first_text", elapsed_ms=(perf_counter() - start_s) * 1000)
-                            first = False
-                        raw += str(content)
-                        transcript = self._extract_preview_transcript(raw)
-                        if transcript and transcript != self._preview_transcripts.get(key):
-                            self._preview_transcripts[key] = transcript
-                            yield PartialTranscription(
-                                text=transcript,
-                                turn_id=vad_audio.turn_id,
-                                turn_revision=vad_audio.turn_revision,
-                            )
+                            response.raise_for_status()
+                            for line in response.iter_lines():
+                                if not line:
+                                    continue
+                                if line.startswith("data:"):
+                                    line = line[len("data:") :].strip()
+                                if line == "[DONE]":
+                                    break
+                                try:
+                                    data = json.loads(line)
+                                except json.JSONDecodeError:
+                                    continue
+                                choices = data.get("choices") or []
+                                if not choices:
+                                    continue
+                                delta = choices[0].get("delta") or {}
+                                content = delta.get("content") or choices[0].get("text")
+                                if not content:
+                                    continue
+                                if first:
+                                    self._emit_metric(vad_audio, "transcription", "live_first_text", elapsed_ms=(perf_counter() - start_s) * 1000)
+                                    first = False
+                                raw += str(content)
+                                transcript = self._extract_preview_transcript(raw)
+                                if transcript and transcript != self._preview_transcripts.get(key):
+                                    self._preview_transcripts[key] = transcript
+                                    yield PartialTranscription(
+                                        text=transcript,
+                                        turn_id=vad_audio.turn_id,
+                                        turn_revision=vad_audio.turn_revision,
+                                    )
+                        finally:
+                            self._untrack_active(response)
+                finally:
+                    self._untrack_active(client)
         except Exception:
             logger.exception("Gemma progressive transcription failed for turn=%s", vad_audio.turn_id)
         finally:
@@ -316,19 +373,28 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         base_url, _, api_key = self._model_endpoint(vad_audio)
         payload = self._transcription_payload(self._as_float32_mono(vad_audio.audio), vad_audio)
         payload["stream"] = False
+        client = httpx.Client(timeout=self.timeout)
+        response: httpx.Response | None = None
+        self._track_active(client, vad_audio)
         try:
-            with httpx.Client(timeout=self.timeout) as client:
-                response = client.post(
-                    f"{base_url}/chat/completions",
-                    headers=self._headers(api_key),
-                    json=payload,
-                )
-                response.raise_for_status()
+            response = client.post(
+                f"{base_url}/chat/completions",
+                headers=self._headers(api_key),
+                json=payload,
+            )
+            self._track_active(response, vad_audio)
+            response.raise_for_status()
             text, _ = self._message_text_and_tools(response.json())
             return self._extract_preview_transcript(text)
         except Exception:
             logger.exception("Gemma final transcription fallback failed for turn=%s", vad_audio.turn_id)
             return None
+        finally:
+            if response is not None:
+                self._untrack_active(response)
+                response.close()
+            self._untrack_active(client)
+            client.close()
 
     def _final_transcript(self, vad_audio: STTIn, transcript: str | None) -> str | None:
         """Resolve the mandatory final transcript without trusting assistant text.
@@ -391,21 +457,18 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         url = f"{base_url}/chat/completions"
         payload = self._payload(audio, vad_audio)
         client = httpx.Client(timeout=self.timeout)
-        with self._active_response_lock:
-            self._active_client = client
-            self._active_turn = (vad_audio.turn_id, vad_audio.turn_revision)
+        self._track_active(client, vad_audio)
         try:
             if payload.get("stream", self.stream):
+                self._emit_metric(vad_audio, "gemma", "waiting_headers", detail={"operation": "direct_audio"})
                 with client.stream("POST", url, headers=self._headers(api_key), json=payload) as response:
-                    with self._active_response_lock:
-                        self._active_response = response
+                    self._track_active(response, vad_audio)
                     response.raise_for_status()
+                    self._emit_metric(vad_audio, "gemma", "generating", detail={"operation": "direct_audio"})
                     try:
                         yield from self._consume_stream(response, vad_audio, generation=generation)
                     finally:
-                        with self._active_response_lock:
-                            if self._active_response is response:
-                                self._active_response = None
+                        self._untrack_active(response)
                     return
             response = client.post(url, headers=self._headers(api_key), json=payload)
             response.raise_for_status()
@@ -419,6 +482,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             )
             cancelled = generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation)
             if superseded or cancelled:
+                self._emit_metric(vad_audio, "gemma", "cancelled", detail={"operation": "direct_audio"})
                 logger.info(
                     "Gemma audio transport closed for superseded request turn=%s rev=%s",
                     vad_audio.turn_id,
@@ -427,10 +491,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 return
             raise
         finally:
-            with self._active_response_lock:
-                if self._active_client is client:
-                    self._active_client = None
-                    self._active_turn = None
+            self._untrack_active(client)
             client.close()
 
     def _consume_stream(
@@ -757,17 +818,25 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
 
     def cancel_active(self) -> None:
         with self._active_response_lock:
-            response = self._active_response
-            client = self._active_client
-            self._active_response = None
-            self._active_client = None
+            resources = tuple(self._active_resources)
+            self._active_resources.clear()
             self._active_turn = None
-        for resource in (response, client):
-            if resource is not None:
-                try:
-                    resource.close()
-                except Exception:
-                    logger.debug("Gemma audio transport was already closed during cancellation")
+        for resource in resources:
+            try:
+                resource.close()
+            except Exception:
+                logger.debug("Gemma audio transport was already closed during cancellation")
+
+    def _track_active(self, resource: Any, vad_audio: STTIn) -> None:
+        with self._active_response_lock:
+            self._active_resources.add(resource)
+            self._active_turn = (vad_audio.turn_id, vad_audio.turn_revision)
+
+    def _untrack_active(self, resource: Any) -> None:
+        with self._active_response_lock:
+            self._active_resources.discard(resource)
+            if not self._active_resources:
+                self._active_turn = None
 
     def _message_text_and_tools(self, data: dict[str, Any]) -> tuple[str, list[ResponseFunctionToolCall]]:
         choices = data.get("choices") or []

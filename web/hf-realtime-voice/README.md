@@ -51,7 +51,7 @@ mode); the LB pins the session via a signed `session_token`.
 | NAT traversal | needs STUN, can fail on corporate / cellular | none, works everywhere TCP is allowed |
 | Audio quality | excellent (Opus, jitter buffer, FEC) | good (raw PCM, simple ring buffer) |
 | Latency | lowest (~50-150 ms) | low (~150-300 ms typical) |
-| Echo cancellation | browser AEC active on the WebRTC track | browser AEC active via `getUserMedia` constraints |
+| Echo cancellation | browser AEC active on the WebRTC track | browser AEC plus playback-reference Adaptive/Strict guard |
 | Debuggability | needs `chrome://webrtc-internals` | `wscat` / DevTools network tab |
 | Mobile data | sometimes blocked (UDP) | always works (HTTPS+WSS) |
 
@@ -172,6 +172,10 @@ NOT collide with the WebRTC variant.
   feeds the `mic-capture` worklet at the `AudioContext` rate. The worklet
   resamples to 16 kHz (boxcar lowpass + decimation on the 48 -> 16 fast
   path, linear interpolation fallback for odd rates) and packs Int16 LE.
+- **Echo guard**: the playback worklet also feeds an inaudible reference input
+  on `mic-capture`. Adaptive mode rejects correlated assistant playback while
+  allowing sustained uncorrelated double-talk; Strict blocks capture through a
+  250 ms playback tail; Off leaves only browser-native AEC.
 - **Output**: `response.output_audio.delta` decodes to Int16 -> Float32
   and is posted to the `audio-playback` worklet. The worklet maintains a
   per-context ring buffer, linearly interpolates 24 -> 48, and applies

@@ -30,6 +30,14 @@ const DEFAULT_CHUNK_MS = 40;
 const GATE_ATTACK_MS = 5; // open almost instantly so word onsets survive
 const GATE_HOLD_MS = 250; // stay open this long after the level drops back under
 const GATE_RELEASE_MS = 80; // then fade closed over this long (no click)
+const ECHO_HISTORY_MS = 400;
+const ECHO_MAX_LAG_MS = 250;
+const ECHO_TAIL_MS = 250;
+const DOUBLE_TALK_MS = 160;
+const ECHO_CORRELATION_MIN = 0.65;
+const ECHO_RESIDUAL_MAX = 0.65;
+const REFERENCE_ACTIVE_RMS = 0.001;
+const HUMAN_ACTIVE_RMS = 0.004;
 
 class MicCaptureProcessor extends AudioWorkletProcessor {
   constructor(options) {
@@ -39,8 +47,18 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
     this._ratio = this._inputRate / TARGET_RATE;
     this._chunkSamples16k = Math.round((TARGET_RATE * chunkMs) / 1000);
     this._scratch = new Float32Array(0);
+    this._referenceScratch = new Float32Array(0);
     this._decimated = new Float32Array(this._chunkSamples16k);
+    this._referenceDecimated = new Float32Array(this._chunkSamples16k);
     this._enabled = true;
+
+    this._echoMode = "adaptive";
+    this._nativeAec = false;
+    this._referenceHistory = new Float32Array(0);
+    this._echoTailRemaining = 0;
+    this._doubleTalkSamples = 0;
+    this._suppressedMs = 0;
+    this._echoMetricCounter = 0;
 
     // Noise gate state. Disabled by default (pure passthrough).
     this._gateEnabled = false;
@@ -58,6 +76,9 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
         this._gateEnabled = !!data.enabled;
         // dB -> linear amplitude. When off, threshold 0 keeps the gate open.
         this._thresholdLin = data.enabled ? Math.pow(10, data.thresholdDb / 20) : 0;
+      } else if (data?.kind === "echo_guard") {
+        this._echoMode = ["off", "adaptive", "strict"].includes(data.mode) ? data.mode : "adaptive";
+        this._nativeAec = !!data.nativeAec;
       }
     };
   }
@@ -66,14 +87,70 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
    * Append `incoming` to the internal scratch buffer, then emit as many
    * full output chunks as we have material for.
    * @param {Float32Array} incoming
+   * @param {Float32Array | null} reference
    */
-  _ingest(incoming) {
+  _ingest(incoming, reference) {
     if (incoming.length === 0) return;
     const next = new Float32Array(this._scratch.length + incoming.length);
     next.set(this._scratch, 0);
     next.set(incoming, this._scratch.length);
     this._scratch = next;
+    const referenceNext = new Float32Array(this._referenceScratch.length + incoming.length);
+    referenceNext.set(this._referenceScratch, 0);
+    if (reference) referenceNext.set(reference.subarray(0, incoming.length), this._referenceScratch.length);
+    this._referenceScratch = referenceNext;
     this._maybeEmit();
+  }
+
+  _appendReference(chunk) {
+    const maxSamples = Math.round((ECHO_HISTORY_MS / 1000) * TARGET_RATE);
+    const next = new Float32Array(Math.min(maxSamples, this._referenceHistory.length + chunk.length));
+    const keep = Math.max(0, next.length - chunk.length);
+    if (keep > 0) next.set(this._referenceHistory.subarray(this._referenceHistory.length - keep), 0);
+    next.set(chunk.subarray(Math.max(0, chunk.length - next.length)), keep);
+    this._referenceHistory = next;
+  }
+
+  _echoMatch(mic, micEnergy) {
+    const history = this._referenceHistory;
+    const n = mic.length;
+    const maxLag = Math.min(Math.round((ECHO_MAX_LAG_MS / 1000) * TARGET_RATE), history.length - n);
+    if (micEnergy <= 1e-9 || maxLag < 0) return { correlation: 0, residual: 1, lagMs: 0 };
+    let bestCorrelation = 0;
+    let bestStart = -1;
+    let bestRefEnergy = 0;
+    for (let lag = 0; lag <= maxLag; lag += 16) {
+      const start = history.length - n - lag;
+      let dot = 0;
+      let refEnergy = 0;
+      for (let i = 0; i < n; i++) {
+        const ref = history[start + i];
+        dot += mic[i] * ref;
+        refEnergy += ref * ref;
+      }
+      if (refEnergy <= 1e-9) continue;
+      const correlation = Math.abs(dot) / Math.sqrt(micEnergy * refEnergy);
+      if (correlation > bestCorrelation) {
+        bestCorrelation = correlation;
+        bestStart = start;
+        bestRefEnergy = refEnergy;
+      }
+    }
+    if (bestStart < 0) return { correlation: 0, residual: 1, lagMs: 0 };
+    let dot = 0;
+    for (let i = 0; i < n; i++) dot += mic[i] * history[bestStart + i];
+    const gain = dot / bestRefEnergy;
+    let residualEnergy = 0;
+    for (let i = 0; i < n; i++) {
+      const residual = mic[i] - gain * history[bestStart + i];
+      residualEnergy += residual * residual;
+    }
+    const lagSamples = history.length - n - bestStart;
+    return {
+      correlation: bestCorrelation,
+      residual: Math.sqrt(residualEnergy / micEnergy),
+      lagMs: (lagSamples / TARGET_RATE) * 1000,
+    };
   }
 
   _maybeEmit() {
@@ -81,6 +158,7 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
     const n = this._chunkSamples16k;
     const needIn = Math.ceil(n * r);
     const dec = this._decimated;
+    const refDec = this._referenceDecimated;
     while (this._scratch.length >= needIn) {
       // 1. Decimate to 16 kHz floats and accumulate energy for the gate/meter.
       let sumSq = 0;
@@ -90,6 +168,7 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
           const idx = i * 3;
           const s = (this._scratch[idx] + this._scratch[idx + 1] + this._scratch[idx + 2]) / 3;
           dec[i] = s;
+          refDec[i] = (this._referenceScratch[idx] + this._referenceScratch[idx + 1] + this._referenceScratch[idx + 2]) / 3;
           sumSq += s * s;
         }
       } else {
@@ -103,10 +182,35 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
           const b = this._scratch[idx + 1] ?? a;
           const s = a + (b - a) * frac;
           dec[i] = s;
+          const refA = this._referenceScratch[idx] || 0;
+          const refB = this._referenceScratch[idx + 1] ?? refA;
+          refDec[i] = refA + (refB - refA) * frac;
           sumSq += s * s;
         }
       }
       const rms = Math.sqrt(sumSq / n);
+      let refSumSq = 0;
+      for (let i = 0; i < n; i++) refSumSq += refDec[i] * refDec[i];
+      const referenceRms = Math.sqrt(refSumSq / n);
+      this._appendReference(refDec);
+      if (referenceRms >= REFERENCE_ACTIVE_RMS) {
+        this._echoTailRemaining = Math.round((ECHO_TAIL_MS / 1000) * TARGET_RATE);
+      } else {
+        this._echoTailRemaining = Math.max(0, this._echoTailRemaining - n);
+      }
+      const playbackActive = referenceRms >= REFERENCE_ACTIVE_RMS || this._echoTailRemaining > 0;
+      const match = this._echoMatch(dec, sumSq);
+      const echoDominant = match.correlation >= ECHO_CORRELATION_MIN && match.residual <= ECHO_RESIDUAL_MAX;
+      if (playbackActive && rms >= HUMAN_ACTIVE_RMS && !echoDominant) {
+        this._doubleTalkSamples += n;
+      } else {
+        this._doubleTalkSamples = 0;
+      }
+      const doubleTalk = this._doubleTalkSamples >= Math.round((DOUBLE_TALK_MS / 1000) * TARGET_RATE);
+      const suppressEcho = this._echoMode === "strict"
+        ? playbackActive
+        : this._echoMode === "adaptive" && playbackActive && (echoDominant || !doubleTalk);
+      if (suppressEcho) this._suppressedMs += (n / TARGET_RATE) * 1000;
 
       // 2. Decide the gate target for this chunk, then ramp sample-by-sample.
       let target = 1;
@@ -126,7 +230,7 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
       for (let i = 0; i < n; i++) {
         const coef = target > gain ? this._attackCoef : this._releaseCoef;
         gain = target + (gain - target) * coef;
-        const s = dec[i] * gain;
+        const s = dec[i] * gain * (suppressEcho ? 0 : 1);
         const clamped = s < -1 ? -1 : s > 1 ? 1 : s;
         out[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
       }
@@ -135,9 +239,26 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
       // Shift the scratch buffer to keep only the trailing unused samples.
       const consumed = Math.floor(n * r);
       this._scratch = this._scratch.slice(consumed);
+      this._referenceScratch = this._referenceScratch.slice(consumed);
 
       // Live input level for the Settings meter (raw RMS, pre-gate).
       this.port.postMessage({ kind: "level", rms });
+      this._echoMetricCounter += 1;
+      if (this._echoMetricCounter >= 5) {
+        this._echoMetricCounter = 0;
+        this.port.postMessage({
+          kind: "echo_metric",
+          mode: this._echoMode,
+          nativeAec: this._nativeAec,
+          correlation: match.correlation,
+          residual: match.residual,
+          lagMs: match.lagMs,
+          suppressedMs: this._suppressedMs,
+          suppressing: suppressEcho,
+          doubleTalk,
+          playbackActive,
+        });
+      }
 
       if (this._enabled) {
         this.port.postMessage(out.buffer, [out.buffer]);
@@ -151,7 +272,8 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
     const input = inputs[0];
     if (!input || input.length === 0 || !input[0]) return true;
     const mono = input[0];
-    if (mono.length > 0) this._ingest(mono);
+    const reference = inputs[1]?.[0] || null;
+    if (mono.length > 0) this._ingest(mono, reference);
     return true;
   }
 }
