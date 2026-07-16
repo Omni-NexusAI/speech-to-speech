@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 
 from openai.types.realtime import RealtimeSessionCreateRequest
 from openai.types.realtime.realtime_audio_config import RealtimeAudioConfig
@@ -7,6 +7,27 @@ from openai.types.realtime.realtime_audio_config_output import RealtimeAudioConf
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from speech_to_speech.LLM.chat import Chat
+
+
+class ModelEndpointConfig(BaseModel):
+    """Conversation-scoped OpenAI-compatible multimodal model endpoint."""
+
+    provider: Literal["local", "remote"] = "local"
+    base_url: str = "http://127.0.0.1:8818/v1"
+    model: str = "gemma-4-12b-it-qat"
+    api_key: str | None = None
+    advertised_model: str | None = None
+    context_window: int | None = None
+
+    def redacted(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "model": self.model,
+            "advertised_model": self.advertised_model,
+            "context_window": self.context_window,
+            "api_key_set": bool(self.api_key),
+        }
 
 
 def _apply_update(current: BaseModel, update: BaseModel) -> None:
@@ -45,6 +66,7 @@ class RuntimeConfig(BaseModel):
         validate_default=True,
     )
     local_pipeline: dict[str, Any] = Field(default_factory=dict)
+    model_endpoint: ModelEndpointConfig = Field(default_factory=ModelEndpointConfig)
 
     @field_validator("session", mode="after")
     @classmethod

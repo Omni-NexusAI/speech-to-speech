@@ -41,7 +41,7 @@ from speech_to_speech.api.openai_realtime.handlers import (
     ResponseHandler,
     SessionHandler,
 )
-from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
+from speech_to_speech.api.openai_realtime.runtime_config import ModelEndpointConfig, RuntimeConfig
 from speech_to_speech.LLM.chat import Chat, make_user_message
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
@@ -238,13 +238,20 @@ class RealtimeService:
         chat_size: int = 10,
         speculative_turns: SpeculativeTurnTracker | None = None,
         context_tokenizer_base_url: str | None = None,
+        default_model_name: str = "gemma-4-12b-it-qat",
+        default_model_api_key: str | None = None,
     ) -> None:
         self.text_prompt_queue = text_prompt_queue
         self.should_listen = should_listen
         self._chat_size = chat_size
         self.speculative_turns = speculative_turns
         self.context_tokenizer_base_url = context_tokenizer_base_url.rstrip("/") if context_tokenizer_base_url else None
-        self.context_window = self._probe_context_window()
+        self.default_model_endpoint = ModelEndpointConfig(
+            provider="local",
+            base_url=self.context_tokenizer_base_url or "http://127.0.0.1:8818/v1",
+            model=default_model_name,
+            api_key=default_model_api_key,
+        )
         self._conns: dict[str, ConnState] = {}
         self.total_usage = GlobalUsageMetrics()
 
@@ -264,12 +271,63 @@ class RealtimeService:
             PipelineMetricEvent: self._on_pipeline_metric,
         }
 
-    def _probe_context_window(self) -> int | None:
-        if not self.context_tokenizer_base_url:
-            return None
+    @staticmethod
+    def _headers(api_key: str | None) -> dict[str, str]:
+        return {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+    @staticmethod
+    def _normalize_model_base_url(base_url: str) -> str:
+        normalized = base_url.strip().rstrip("/")
+        if not normalized:
+            raise ValueError("Model endpoint URL is required")
+        return normalized if normalized.endswith("/v1") else f"{normalized}/v1"
+
+    def validate_model_endpoint(
+        self,
+        *,
+        provider: Literal["local", "remote"],
+        base_url: str | None = None,
+        model: str | None = None,
+        api_key: str | None = None,
+    ) -> ModelEndpointConfig:
+        if provider == "local":
+            source = self.default_model_endpoint
+            base_url = source.base_url
+            model = source.model
+            api_key = source.api_key
+        elif not model or not model.strip():
+            raise ValueError("Remote model name is required")
+
+        normalized = self._normalize_model_base_url(base_url or "")
+        headers = self._headers(api_key)
+        timeout = httpx.Timeout(5.0, connect=5.0)
+        with httpx.Client(timeout=timeout, headers=headers) as client:
+            response = client.get(f"{normalized}/models")
+            response.raise_for_status()
+            models = response.json().get("data") or []
+            advertised = next((str(item.get("id")) for item in models if item.get("id")), None)
+            context_window = None
+            try:
+                props = client.get(f"{normalized.removesuffix('/v1')}/props")
+                props.raise_for_status()
+                value = props.json().get("default_generation_settings", {}).get("n_ctx")
+                context_window = int(value) if value else None
+            except Exception:
+                logger.debug("Selected model endpoint does not expose llama.cpp /props")
+        return ModelEndpointConfig(
+            provider=provider,
+            base_url=normalized,
+            model=str(model),
+            api_key=api_key,
+            advertised_model=advertised,
+            context_window=context_window,
+        )
+
+    def _probe_context_window(self, endpoint: ModelEndpointConfig) -> int | None:
         try:
             response = httpx.get(
-                f"{self.context_tokenizer_base_url.removesuffix('/v1')}/props",
+                f"{endpoint.base_url.removesuffix('/v1')}/props",
+                headers=self._headers(endpoint.api_key),
                 timeout=1.0,
             )
             response.raise_for_status()
@@ -279,11 +337,18 @@ class RealtimeService:
             logger.warning("Could not detect llama.cpp context window", exc_info=True)
             return None
 
-    def _refresh_history_tokens(self, conn_id: str, content: str, fingerprint: str) -> None:
+    def _refresh_history_tokens(
+        self,
+        conn_id: str,
+        content: str,
+        fingerprint: str,
+        endpoint: ModelEndpointConfig,
+    ) -> None:
         """Refresh llama.cpp token counts off the websocket/send-loop thread."""
         try:
             response = httpx.post(
-                f"{self.context_tokenizer_base_url.removesuffix('/v1')}/tokenize",
+                f"{endpoint.base_url.removesuffix('/v1')}/tokenize",
+                headers=self._headers(endpoint.api_key),
                 json={"content": content, "add_special": False, "with_pieces": False},
                 timeout=2.0,
             )
@@ -317,15 +382,16 @@ class RealtimeService:
             estimate = max(1, len(content) // 4)
             st.history_tokens = max(st.history_tokens, estimate)
             st.history_token_source = "estimated" if st.history_token_source == "empty" else "cached"
-            if self.context_tokenizer_base_url and not st.history_token_pending:
+            endpoint = st.runtime_config.model_endpoint
+            if endpoint.base_url and not st.history_token_pending:
                 st.history_token_pending = True
                 threading.Thread(
                     target=self._refresh_history_tokens,
-                    args=(conn_id, content, fingerprint),
+                    args=(conn_id, content, fingerprint, endpoint.model_copy(deep=True)),
                     name=f"context-tokenizer-{conn_id[-8:]}",
                     daemon=True,
                 ).start()
-            elif not self.context_tokenizer_base_url:
+            elif not endpoint.base_url:
                 st.history_token_fingerprint = fingerprint
         return st.history_tokens, st.history_token_source
 
@@ -337,9 +403,10 @@ class RealtimeService:
             "history_tokens": history_tokens,
             "token_source": token_source,
         }
-        detail["max_tokens"] = self.context_window
+        context_window = self._state(conn_id).runtime_config.model_endpoint.context_window
+        detail["max_tokens"] = context_window
         detail["percent"] = (
-            round(100 * detail["history_tokens"] / self.context_window, 2) if self.context_window else None
+            round(100 * detail["history_tokens"] / context_window, 2) if context_window else None
         )
         detail["policy"] = "visible_trim"
         return detail
@@ -359,7 +426,12 @@ class RealtimeService:
         """Register a new connection and return its session_id."""
         if self.speculative_turns:
             self.speculative_turns.reset()
-        state = ConnState(runtime_config=RuntimeConfig(chat=Chat(self._chat_size)))
+        state = ConnState(
+            runtime_config=RuntimeConfig(
+                chat=Chat(self._chat_size),
+                model_endpoint=self.default_model_endpoint.model_copy(deep=True),
+            )
+        )
         self._conns[state.session_id] = state
         self.total_usage.connections += 1
         return state.session_id
@@ -571,7 +643,7 @@ class RealtimeService:
         # Direct Gemma commits complete user/assistant/tool history itself.
         # Publish the authoritative tokenized value from the service rather
         # than a partial stats-only metric from a pipeline handler.
-        if self.context_tokenizer_base_url:
+        if self._state(conn_id).runtime_config.model_endpoint.context_window is not None:
             events.append(self.context_metric(conn_id, "committed" if event.context_committed else "updated"))
 
         queue = self.text_prompt_queue
@@ -641,7 +713,7 @@ class RealtimeService:
         self, conn_id: str, event: ResponseOutputCompleteEvent
     ) -> list[ServerEvent]:
         self._state(conn_id).text_output_complete = True
-        if self.context_tokenizer_base_url:
+        if self._state(conn_id).runtime_config.model_endpoint.context_window is not None:
             return [self.context_metric(conn_id, "committed")]
         return []
 

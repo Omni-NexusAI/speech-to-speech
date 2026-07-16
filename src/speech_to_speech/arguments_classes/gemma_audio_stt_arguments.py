@@ -21,8 +21,12 @@ class GemmaAudioSTTHandlerArguments:
         metadata={"help": "Stream Gemma chat completion deltas where supported. Default is true."},
     )
     gemma_audio_timeout_s: float = field(
-        default=120.0,
+        default=30.0,
         metadata={"help": "HTTP timeout for direct audio-to-Gemma requests."},
+    )
+    gemma_audio_revision_settle_s: float = field(
+        default=0.25,
+        metadata={"help": "Delay after a soft VAD endpoint before launching Gemma."},
     )
     gemma_audio_format: str = field(
         default="wav",

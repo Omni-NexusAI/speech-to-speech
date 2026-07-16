@@ -270,22 +270,48 @@
               </small>
             </label>
 
-            <div class="field-row">
+            <label class="field">
+              <span>Model provider</span>
+              <select id="model-provider">
+                <option value="local" selected>Local llama.cpp</option>
+                <option value="remote">Remote OpenAI-compatible endpoint</option>
+              </select>
+              <small>Changes apply to the next conversation.</small>
+            </label>
+
+            <div id="remote-model-fields" class="field-stack" hidden>
               <label class="field">
-                <span>TTS backend</span>
-                <select id="tts-backend">
-                  <option value="faster" selected>FasterQwen3TTS (checking)</option>
-                  <option value="groxaxo">Groxaxo candidate (checking)</option>
-                </select>
-                <small>Changes apply to the next conversation.</small>
+                <span>Remote model URL</span>
+                <input id="model-url" type="url" autocomplete="off" spellcheck="false" placeholder="http://192.168.1.20:8080/v1" />
               </label>
               <label class="field">
-                <span>Voice</span>
-                <select id="voice">
-                  <option value="clone:16d9bb336799" selected>J.A.R.V.I.S (clone:16d9bb336799)</option>
-                </select>
+                <span>Model name</span>
+                <input id="model-name" type="text" autocomplete="off" spellcheck="false" placeholder="loaded-model-id" />
+              </label>
+              <label class="field">
+                <span>API key</span>
+                <input id="model-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Optional bearer key" />
               </label>
             </div>
+            <div class="field">
+              <button id="test-model-connection" type="button" class="btn">Test model connection</button>
+              <small id="model-connection-status">Local is selected.</small>
+            </div>
+
+            <label class="field">
+              <span>TTS backend</span>
+              <select id="tts-backend">
+                <option value="faster" selected>FasterQwen3TTS (checking)</option>
+                <option value="groxaxo">Groxaxo candidate (checking)</option>
+              </select>
+              <small>Changes apply to the next conversation.</small>
+            </label>
+            <label class="field">
+              <span>Voice</span>
+              <select id="voice">
+                <option value="clone:16d9bb336799" selected>J.A.R.V.I.S (clone:16d9bb336799)</option>
+              </select>
+            </label>
 
             <div class="field">
               <span class="field-head">

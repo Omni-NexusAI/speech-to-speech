@@ -165,3 +165,63 @@ def test_diagnostics_use_transcription_and_dynamic_context_tokens():
     assert '"gemma_preview"' not in main_js
     assert "history_tokens" in main_js
     assert "contextWindow" in main_js
+
+
+def test_remote_model_connection_test_redacts_key(monkeypatch):
+    server = _load_ui_server_module()
+    calls = []
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class Client:
+        def __init__(self, **kwargs):
+            calls.append(("client", kwargs))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url):
+            calls.append(("get", url))
+            if url.endswith("/models"):
+                return Response({"data": [{"id": "remote-audio-model"}]})
+            return Response({"default_generation_settings": {"n_ctx": 32768}})
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", Client)
+    result = asyncio.run(
+        server.test_model_endpoint(
+            server.ModelTestRequest(
+                provider="remote",
+                base_url="http://10.0.0.60:8080",
+                model="configured-model",
+                api_key="secret",
+            )
+        )
+    )
+
+    assert result["model"] == "remote-audio-model"
+    assert result["context_window"] == 32768
+    assert result["api_key_set"] is True
+    assert "api_key" not in result
+    assert calls[0][1]["headers"] == {"Authorization": "Bearer secret"}
+    assert all("127.0.0.1:8818" not in str(call) for call in calls)
+
+
+def test_settings_show_model_provider_before_stacked_tts_and_voice():
+    ui_dir = Path(__file__).resolve().parents[1] / "web" / "hf-realtime-voice"
+    html = (ui_dir / "index.html").read_text(encoding="utf-8")
+    client_js = (ui_dir / "ws" / "s2s-ws-client.js").read_text(encoding="utf-8")
+
+    assert html.index('id="model-provider"') < html.index('id="tts-backend"') < html.index('id="voice"')
+    assert 'id="model-api-key" type="password"' in html
+    assert client_js.index("this.updateLocalPipeline") < client_js.index("this._sendSessionUpdate")

@@ -7,6 +7,7 @@
 ## Local Contracts
 
 - `/api/config` exposes `apiVersion`; the browser warns when its expected API contract differs from the running Python UI server.
+- Model provider settings are persisted locally, validated before mic activation, and applied to the next conversation. Never render or return a stored bearer key; only expose `api_key_set`.
 - Diagnostics consume backend `pipeline.metric` and `pipeline.runtime` events plus browser mic/playback telemetry; missing runtime identity or turn metrics is a stale-backend warning.
 - Camera remains tool-triggered: only a `camera_snapshot` call captures and attaches one frame.
 
@@ -23,6 +24,7 @@
 - Diagnostics label the always-on final stage `Transcription` and show retained history tokens against the context window detected from llama.cpp.
 - Camera preview and Diagnostics should not occupy the same desktop corner; keep the camera self-view clear when diagnostics are open.
 - Settings list live Faster and Groxaxo status. Provider changes apply to the next conversation, and an unavailable selected provider blocks start without silent fallback.
+- Keep model inference controls separate from TTS controls, and place Voice directly beneath TTS Backend in the vertically scrolling settings layout.
 - Stop invalidates the active client before asynchronous teardown; closed-client mic, playback, tool, and WebSocket events must never change the idle UI or enter a replacement conversation.
 
 ## Child DOX Index

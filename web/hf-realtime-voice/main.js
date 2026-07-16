@@ -49,6 +49,10 @@ const STORAGE_KEYS = {
   fullBufferTts: "s2s.ws.fullBufferTts",
   liveTranscript: "s2s.ws.liveTranscript",
   ttsBackend: "s2s.ws.ttsBackend",
+  modelProvider: "s2s.ws.modelProvider",
+  modelUrl: "s2s.ws.modelUrl",
+  modelName: "s2s.ws.modelName",
+  modelApiKey: "s2s.ws.modelApiKey",
 };
 
 // ── Noise gate ──────────────────────────────────────────────────────────────
@@ -110,6 +114,10 @@ function loadSettings() {
     fullBufferTts: localStorage.getItem(STORAGE_KEYS.fullBufferTts) === "1",
     liveTranscript: localStorage.getItem(STORAGE_KEYS.liveTranscript) === "1",
     ttsBackend: localStorage.getItem(STORAGE_KEYS.ttsBackend) || "faster",
+    modelProvider: localStorage.getItem(STORAGE_KEYS.modelProvider) || "local",
+    modelUrl: localStorage.getItem(STORAGE_KEYS.modelUrl) || "",
+    modelName: localStorage.getItem(STORAGE_KEYS.modelName) || "",
+    modelApiKey: localStorage.getItem(STORAGE_KEYS.modelApiKey) || "",
   };
 }
 
@@ -135,6 +143,10 @@ function saveSettings(s) {
   localStorage.setItem(STORAGE_KEYS.fullBufferTts, s.fullBufferTts ? "1" : "0");
   localStorage.setItem(STORAGE_KEYS.liveTranscript, s.liveTranscript ? "1" : "0");
   localStorage.setItem(STORAGE_KEYS.ttsBackend, s.ttsBackend);
+  localStorage.setItem(STORAGE_KEYS.modelProvider, s.modelProvider);
+  localStorage.setItem(STORAGE_KEYS.modelUrl, s.modelUrl);
+  localStorage.setItem(STORAGE_KEYS.modelName, s.modelName);
+  localStorage.setItem(STORAGE_KEYS.modelApiKey, s.modelApiKey);
 }
 
 /** @returns {{ web_search: boolean, camera_snapshot: boolean }} */
@@ -264,6 +276,20 @@ const connHint = $("#conn-hint");
 const inputVoice = $("#voice");
 /** @type {HTMLSelectElement} */
 const inputTtsBackend = $("#tts-backend");
+/** @type {HTMLSelectElement} */
+const inputModelProvider = $("#model-provider");
+/** @type {HTMLInputElement} */
+const inputModelUrl = $("#model-url");
+/** @type {HTMLInputElement} */
+const inputModelName = $("#model-name");
+/** @type {HTMLInputElement} */
+const inputModelApiKey = $("#model-api-key");
+/** @type {HTMLElement} */
+const remoteModelFields = $("#remote-model-fields");
+/** @type {HTMLButtonElement} */
+const testModelConnectionBtn = $("#test-model-connection");
+/** @type {HTMLElement} */
+const modelConnectionStatus = $("#model-connection-status");
 /** @type {HTMLTextAreaElement} */
 const inputInstructions = $("#instructions");
 /** @type {HTMLInputElement} */
@@ -301,8 +327,8 @@ let ttsBackendStatuses = {};
 let diagnosticsOpen = localStorage.getItem(STORAGE_KEYS.diagnostics) === "1";
 /** @type {Array<any>} */
 let pipelineMetrics = [];
-const EXPECTED_UI_API_VERSION = 4;
-const EXPECTED_BACKEND_API_VERSION = 2;
+const EXPECTED_UI_API_VERSION = 5;
+const EXPECTED_BACKEND_API_VERSION = 3;
 const DIAGNOSTIC_STAGES = ["mic", "vad", "transcription", "gemma", "context", "tool", "tts", "playback"];
 const diagnosticWarnings = new Map();
 let backendRuntime = null;
@@ -448,6 +474,11 @@ function openSettings() {
   inputVoice.value = settings.voice;
   renderTtsBackendOptions();
   inputTtsBackend.value = settings.ttsBackend;
+  inputModelProvider.value = settings.modelProvider;
+  inputModelUrl.value = settings.modelUrl;
+  inputModelName.value = settings.modelName;
+  inputModelApiKey.value = settings.modelApiKey;
+  syncModelProviderUi();
   inputInstructions.value = settings.instructions;
   inputFullBufferTts.checked = settings.fullBufferTts;
   inputLiveTranscript.checked = settings.liveTranscript;
@@ -621,9 +652,9 @@ initDiagnosticsGeometry();
 
 // About panel: native <dialog>, Esc closes for free; also close on the X and
 // on a click in the backdrop (a click whose target is the dialog itself).
-aboutBtn.addEventListener("click", () => { void refreshLocalPipeline(); aboutModal.showModal(); });
+aboutBtn.addEventListener("click", () => { if (settings.modelProvider === "local") void refreshLocalPipeline(); aboutModal.showModal(); });
 // Mobile twin of the (i), living in the right-hand control cluster.
-$("#about-btn-m").addEventListener("click", () => { void refreshLocalPipeline(); aboutModal.showModal(); });
+$("#about-btn-m").addEventListener("click", () => { if (settings.modelProvider === "local") void refreshLocalPipeline(); aboutModal.showModal(); });
 aboutClose.addEventListener("click", () => aboutModal.close());
 aboutModal.addEventListener("click", (e) => {
   if (e.target === aboutModal) aboutModal.close();
@@ -1011,12 +1042,15 @@ function renderDiagnostics() {
   const contextMax = context?.detail?.max_tokens ?? localPipeline?.gemma?.contextWindow;
   const contextUsed = context?.detail?.history_tokens ?? 0;
   const contextText = contextMax ? `Context ${contextUsed.toLocaleString()} / ${contextMax.toLocaleString()}` : "";
+  const modelText = localPipeline?.gemma
+    ? `${localPipeline.gemma.provider === "remote" ? "Remote" : "Local"} model ${localPipeline.gemma.model || "unknown"} @ ${localPipeline.gemma.baseUrl || "unknown"}`
+    : "";
   const runtimeText = backendRuntime
     ? `Backend API ${backendRuntime.api_version} | PID ${backendRuntime.pid} | started ${backendRuntime.started_at_utc}`
     : "Backend identity pending";
   diagnosticsSummary.textContent = bottleneck
-    ? `${runtimeText} | ${contextText}${contextText ? " | " : ""}Likely bottleneck: ${bottleneck.stage} ${Math.round(bottleneck.elapsed_ms)} ms`
-    : `${runtimeText}${contextText ? ` | ${contextText}` : ""}`;
+    ? `${runtimeText}${modelText ? ` | ${modelText}` : ""} | ${contextText}${contextText ? " | " : ""}Likely bottleneck: ${bottleneck.stage} ${Math.round(bottleneck.elapsed_ms)} ms`
+    : `${runtimeText}${modelText ? ` | ${modelText}` : ""}${contextText ? ` | ${contextText}` : ""}`;
   diagnosticsGraph.replaceChildren();
   for (const stage of DIAGNOSTIC_STAGES) {
     const metric = latestByStage.get(stage);
@@ -1090,6 +1124,16 @@ async function assertTtsBackendReady() {
     throw new Error("Groxaxo is unavailable or has no 0.6B-Base/1.7B-Base model loaded in Voice Studio.");
   }
   throw new Error("FasterQwen3TTS is unavailable or its 1.7B-Base clone model is not ready.");
+}
+
+async function assertModelEndpointReady() {
+  const response = await fetch("api/model/test", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(modelEndpointConfig(settings)),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.detail || "The selected model endpoint is unavailable.");
 }
 
 function renderLocalPipeline() {
@@ -1231,8 +1275,51 @@ function readSettingsFromForm() {
     fullBufferTts: inputFullBufferTts.checked,
     liveTranscript: inputLiveTranscript.checked,
     ttsBackend: inputTtsBackend.value || "faster",
+    modelProvider: inputModelProvider.value === "remote" ? "remote" : "local",
+    modelUrl: inputModelUrl.value.trim(),
+    modelName: inputModelName.value.trim(),
+    modelApiKey: inputModelApiKey.value,
   };
 }
+
+function syncModelProviderUi() {
+  const remote = inputModelProvider.value === "remote";
+  remoteModelFields.hidden = !remote;
+  modelConnectionStatus.textContent = remote
+    ? "Test this endpoint before starting a conversation."
+    : "Local llama.cpp is selected.";
+}
+
+function modelEndpointConfig(s = settings) {
+  if (s.modelProvider !== "remote") return { provider: "local" };
+  return {
+    provider: "remote",
+    base_url: s.modelUrl,
+    model: s.modelName,
+    api_key: s.modelApiKey,
+  };
+}
+
+inputModelProvider.addEventListener("change", syncModelProviderUi);
+testModelConnectionBtn.addEventListener("click", async () => {
+  const candidate = readSettingsFromForm();
+  testModelConnectionBtn.disabled = true;
+  modelConnectionStatus.textContent = "Checking model endpoint...";
+  try {
+    const response = await fetch("api/model/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(modelEndpointConfig(candidate)),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.detail || `HTTP ${response.status}`);
+    modelConnectionStatus.textContent = `${body.model || candidate.modelName || "Model"} online${body.context_window ? `; context ${body.context_window.toLocaleString()}` : ""}.`;
+  } catch (err) {
+    modelConnectionStatus.textContent = `Connection failed: ${err instanceof Error ? err.message : String(err)}`;
+  } finally {
+    testModelConnectionBtn.disabled = false;
+  }
+});
 
 /** Gate threshold (dBFS) currently shown on the slider, clamped to range. */
 function readGateThreshold() {
@@ -1458,6 +1545,7 @@ async function doStart(audioContext = null) {
   // direct mode with no URL) fails fast with a clear message.
   const target = connectionTarget();
   await assertTtsBackendReady();
+  await assertModelEndpointReady();
 
   chat.clear();
   chat.reset();
@@ -1497,6 +1585,12 @@ async function doStart(audioContext = null) {
     acquireMic: acquireMicStream,
     tools: activeToolDefs(),
     noiseGate: gateParams(settings.noiseGate),
+    pipelineConfig: {
+      full_buffer_tts: settings.fullBufferTts,
+      live_transcription: settings.liveTranscript,
+      tts_backend: settings.ttsBackend,
+      model_endpoint: modelEndpointConfig(settings),
+    },
     ...(audioContext ? { audioContext } : {}),
   });
   client = c;
@@ -1612,6 +1706,22 @@ async function doStart(audioContext = null) {
     }
     addPipelineMetric({ stage: "context", status: "runtime", source: "backend", detail: backendRuntime.context || {} });
   });
+  c.addEventListener("local-pipeline-updated", (e) => {
+    if (client !== c) return;
+    const config = /** @type {CustomEvent<any>} */ (e).detail;
+    if (config?.model_endpoint) {
+      const endpoint = config.model_endpoint;
+      localPipeline = localPipeline || {};
+      localPipeline.gemma = {
+        reachable: true,
+        model: endpoint.advertised_model || endpoint.model,
+        baseUrl: endpoint.base_url,
+        provider: endpoint.provider,
+        contextWindow: endpoint.context_window,
+      };
+      renderLocalPipeline();
+    }
+  });
   c.addEventListener("turn-state", (e) => {
     if (client !== c) return;
     const status = /** @type {CustomEvent<any>} */ (e).detail.status;
@@ -1625,11 +1735,6 @@ async function doStart(audioContext = null) {
 
   try {
     await c.connect();
-    c.updateLocalPipeline({
-      full_buffer_tts: settings.fullBufferTts,
-      live_transcription: settings.liveTranscript,
-      tts_backend: settings.ttsBackend,
-    });
   } catch (err) {
     // The grant can be refused (402 → limit) or the dial can fail. In LB mode
     // the AudioContext hasn't been adopted by the client yet (the session POST
@@ -1794,7 +1899,7 @@ setState("idle");
 chat.renderEmptyState();
 initGateArc();
 void fetchConfig();
-void refreshLocalPipeline();
+if (settings.modelProvider === "local") void refreshLocalPipeline();
 // React to later permission changes, but do not auto-request camera access on page load.
 // The camera starts from the explicit Tools toggle so browser permission prompts stay user-driven.
 void watchCameraPermission();

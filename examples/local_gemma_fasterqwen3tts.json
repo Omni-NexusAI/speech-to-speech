@@ -14,7 +14,8 @@
   "compact_history": false,
   "responses_api_chat_size": 30,
   "responses_api_compact_history": false,
-  "responses_api_request_timeout_s": 120.0,
+  "responses_api_request_timeout_s": 30.0,
+  "responses_api_warmup": false,
   "tts": "qwen3",
   "qwen3_tts_backend": "openai-api",
   "qwen3_tts_api_base_url": "http://127.0.0.1:8881/v1",
@@ -27,7 +28,8 @@
   "gemma_audio_model_name": "gemma-4-12b-it-qat",
   "gemma_audio_base_url": "http://127.0.0.1:8818/v1",
   "gemma_audio_stream": true,
-  "gemma_audio_timeout_s": 120.0,
+  "gemma_audio_timeout_s": 30.0,
+  "gemma_audio_revision_settle_s": 0.25,
   "gemma_audio_prompt": "Listen to the attached user audio and respond directly as a concise voice assistant. Do not include a transcript unless the user asks for one.",
   "gemma_audio_system_prompt": "You are a local low-latency voice assistant. Answer naturally for speech synthesis."
 }

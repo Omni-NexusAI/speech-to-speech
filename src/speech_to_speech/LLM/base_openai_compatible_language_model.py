@@ -135,7 +135,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         speculative_turns: SpeculativeTurnTracker | None = None,
         disable_thinking: bool = True,
         reasoning_effort: Optional[str] = None,
-        request_timeout_s: float = 20.0,
+        request_timeout_s: float = 30.0,
+        warmup: bool = False,
         stream_batch_sentences: int = 3,
         enable_lang_prompt: bool = False,
         compact_history: bool = False,
@@ -151,16 +152,54 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         self.request_timeout_s = float(request_timeout_s)
         self.request_timeout = httpx.Timeout(
             self.request_timeout_s,
-            connect=min(10.0, self.request_timeout_s),
+            connect=min(5.0, self.request_timeout_s),
         )
 
         self.user_role = user_role
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.base_url = base_url
+        self.api_key = api_key
+        self.disable_thinking = disable_thinking
+        self.reasoning_effort = reasoning_effort
+        self.client = OpenAI(
+            api_key=api_key or "not-needed",
+            base_url=base_url,
+            max_retries=0,
+            timeout=self.request_timeout,
+        )
         self._active_response: Any = None
+        self._active_client: Any = None
         self._active_response_lock = Lock()
         self._extra_body = self._build_extra_body(base_url, disable_thinking, reasoning_effort)
         self.compactor = build_compactor(self._build_compaction_generate_fn()) if compact_history else None
-        self.warmup()
+        if warmup:
+            self.warmup()
+
+    def _client_for(self, runtime_config: Any) -> tuple[OpenAI, str, Optional[dict[str, Any]]]:
+        endpoint = getattr(runtime_config, "model_endpoint", None)
+        if endpoint is None or endpoint.provider == "local":
+            if getattr(self.client, "is_closed", False):
+                self.client = OpenAI(
+                    api_key=self.api_key or "not-needed",
+                    base_url=self.base_url,
+                    max_retries=0,
+                    timeout=self.request_timeout,
+                )
+            return self.client, self.model_name, self._extra_body
+        base_url = endpoint.base_url
+        api_key = endpoint.api_key
+        model_name = endpoint.model
+        client = OpenAI(
+            api_key=api_key or "not-needed",
+            base_url=base_url,
+            max_retries=0,
+            timeout=self.request_timeout,
+        )
+        extra_body = self._build_extra_body(base_url, self.disable_thinking, self.reasoning_effort)
+        return client, model_name, extra_body
+
+    def _set_active_client(self, client: OpenAI) -> None:
+        with self._active_response_lock:
+            self._active_client = client
 
     @staticmethod
     def _is_official_openai(base_url: Optional[str]) -> bool:
@@ -216,7 +255,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         ...
 
     @abstractmethod
-    def _request(self, api_input: Any, optional_kwargs: dict[str, Any]) -> Any:
+    def _request(self, api_input: Any, optional_kwargs: dict[str, Any], runtime_config: Any) -> Any:
         """Issue the create() call and return the response or stream."""
         ...
 
@@ -450,6 +489,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         if not hasattr(self, "_active_response_lock"):
             self._active_response_lock = Lock()
             self._active_response = None
+            self._active_client = None
         api_response: Any = None
         state = _GenState()
         error_message: str | None = None
@@ -466,7 +506,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
         try:
             if error_message is None:
-                api_response = self._request(api_input, optional_kwargs)
+                api_response = self._request(api_input, optional_kwargs, turn.runtime_config)
             if api_response is not None:
                 with self._active_response_lock:
                     self._active_response = api_response
@@ -503,9 +543,16 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             with self._active_response_lock:
                 if self._active_response is api_response:
                     self._active_response = None
+                active_client = getattr(self, "_active_client", None)
+                self._active_client = None
             if api_response is not None and hasattr(api_response, "close"):
                 try:
                     api_response.close()
+                except Exception:
+                    pass
+            if active_client is not None and active_client is not getattr(self, "client", None):
+                try:
+                    active_client.close()
                 except Exception:
                     pass
 
@@ -541,12 +588,15 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             return
         with lock:
             response = self._active_response
+            client = self._active_client
             self._active_response = None
-        if response is not None and hasattr(response, "close"):
-            try:
-                response.close()
-            except Exception:
-                logger.debug("Provider stream was already closed during cancellation")
+            self._active_client = None
+        for resource in (response, client):
+            if resource is not None and hasattr(resource, "close"):
+                try:
+                    resource.close()
+                except Exception:
+                    logger.debug("Provider transport was already closed during cancellation")
 
     def process(self, request: LLMIn) -> Iterator[LLMOut]:
         """Process a language model request and yield LLMResponseChunks."""

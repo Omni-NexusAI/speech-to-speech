@@ -45,7 +45,7 @@ MAX_AUDIO_BATCH_BYTES = 6400
 # monkeypatch this to a small value since their fixtures usually skip the
 # real handler chain.
 SESSION_END_DRAIN_TIMEOUT_S = 10.0
-BACKEND_RUNTIME_API_VERSION = 2
+BACKEND_RUNTIME_API_VERSION = 3
 QItem = TypeVar("QItem")
 
 
@@ -422,6 +422,41 @@ def create_app(
                     tts_backend = config.get("tts_backend")
                     if tts_backend in {"faster", "groxaxo"}:
                         rt_cfg.local_pipeline["tts_backend"] = tts_backend
+                    model_config = config.get("model_endpoint")
+                    if isinstance(model_config, dict):
+                        provider = model_config.get("provider", "local")
+                        if provider not in {"local", "remote"}:
+                            await _send_event(
+                                ws,
+                                unit.service.make_error(
+                                    "Model provider must be local or remote",
+                                    "invalid_model_provider",
+                                ),
+                            )
+                            continue
+                        try:
+                            endpoint = await asyncio.to_thread(
+                                unit.service.validate_model_endpoint,
+                                provider=provider,
+                                base_url=model_config.get("base_url"),
+                                model=model_config.get("model"),
+                                api_key=model_config.get("api_key") or None,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Model endpoint validation failed provider=%s error=%s",
+                                provider,
+                                type(exc).__name__,
+                            )
+                            await _send_event(
+                                ws,
+                                unit.service.make_error(
+                                    f"Selected model endpoint is unavailable: {exc}",
+                                    "model_endpoint_unavailable",
+                                ),
+                            )
+                            continue
+                        rt_cfg.model_endpoint = endpoint
                     await ws.send_json(
                         {
                             "type": (
@@ -429,7 +464,10 @@ def create_app(
                                 if raw.get("type") == "pipeline.config.update"
                                 else "local.pipeline.updated"
                             ),
-                            "config": dict(rt_cfg.local_pipeline),
+                            "config": {
+                                **dict(rt_cfg.local_pipeline),
+                                "model_endpoint": rt_cfg.model_endpoint.redacted(),
+                            },
                         }
                     )
                     continue

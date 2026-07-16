@@ -64,9 +64,24 @@ Start the integrated UI with:
 
 The UI runs on `http://127.0.0.1:7862` and should point Settings to `http://127.0.0.1:8765`.
 
+## Remote multimodal model
+
+Settings can switch model inference from **Local** to a conversation-scoped **Remote** OpenAI-compatible endpoint. Enter its `/v1` URL, model name, and optional bearer key, then use **Test model connection** before restarting the conversation. Remote selection replaces local Gemma for direct audio, transcription fallback and preview, camera/tool selection, post-tool generation, model identity, tokenization, and context discovery. It never silently falls back to Local; FasterQwen3TTS remains separately selected.
+
+On the model machine, expose llama.cpp to the LAN and enable the tool-compatible chat template, for example:
+
+```powershell
+llama-server.exe --host 0.0.0.0 --port 8080 --jinja --api-key '<private-lan-key>' <your model and multimodal projector arguments>
+```
+
+Allow that TCP port through the model machine's firewall only for the trusted private network. The selected model must support audio input, camera images, OpenAI-compatible chat completions, and native function tools. Use `http://<model-machine-ip>:8080/v1` in Settings. The browser stores the optional key in localStorage by explicit design; the backend keeps it in connection-scoped memory and exposes only `api_key_set` in status events. Prefer a trusted wired LAN and do not expose an unauthenticated llama-server to untrusted networks.
+
+The realtime backend and UI can start while local Gemma is unavailable. Local endpoint readiness is checked only when a Local conversation starts; Remote is validated before microphone activation.
+
 ## Notes
 
 - No separate ASR model is used in `gemma-audio` mode.
+- A VAD soft endpoint waits 250 ms before launching Gemma. Speech that resumes within the seven-second reopen window keeps its captured audio, cancels any obsolete uncommitted generation, and submits one combined latest revision.
 - Faster on `8881` is the default. A Settings provider change is conversation-scoped and takes effect on the next conversation.
 - Voice defaults to `clone:16d9bb336799`, displayed as `J.A.R.V.I.S`.
 - The realtime UI lists saved Voice Studio profiles from `profiles/*/meta.json` and only exposes `Base` clone profiles.

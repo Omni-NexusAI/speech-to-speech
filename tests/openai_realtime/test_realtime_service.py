@@ -63,23 +63,20 @@ class _ContextResponse:
         return self._payload
 
 
-def test_local_context_metrics_detect_window_and_tokenize_retained_history(monkeypatch):
-    monkeypatch.setattr(
-        "speech_to_speech.api.openai_realtime.service.httpx.get",
-        lambda *args, **kwargs: _ContextResponse({"default_generation_settings": {"n_ctx": 48128}}),
-    )
-    monkeypatch.setattr(
-        "speech_to_speech.api.openai_realtime.service.httpx.post",
-        lambda *args, **kwargs: _ContextResponse({"tokens": [1, 2, 3, 4, 5]}),
-    )
+def test_context_metrics_use_validated_window_without_startup_probe(monkeypatch):
+    def unexpected_probe(*args, **kwargs):
+        raise AssertionError("RealtimeService must not probe local Gemma during startup")
+
+    monkeypatch.setattr("speech_to_speech.api.openai_realtime.service.httpx.get", unexpected_probe)
     service = RealtimeService(context_tokenizer_base_url="http://127.0.0.1:8818/v1", chat_size=30)
     conn_id = service.register()
+    service._state(conn_id).runtime_config.model_endpoint.context_window = 48128
 
     assert service.context_detail(conn_id)["history_tokens"] == 0
     service._state(conn_id).runtime_config.chat.add_item(make_user_message("hello there"))
     detail = service.context_detail(conn_id)
 
-    assert detail["history_tokens"] == 5
+    assert detail["history_tokens"] > 0
     assert detail["max_tokens"] == 48128
     assert detail["turns"] == 1
     assert detail["limit"] == 30

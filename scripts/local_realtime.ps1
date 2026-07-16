@@ -174,7 +174,9 @@ function Verify-Dependencies {
     if (-not (Test-Path $ConfigPath)) { throw "Config file not found: $ConfigPath" }
     $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
     $gemmaBase = ([string]$config.gemma_audio_base_url).TrimEnd("/")
-    if (-not (Endpoint-Ok "$gemmaBase/models")) { throw "Gemma is not reachable at $gemmaBase" }
+    if (-not (Endpoint-Ok "$gemmaBase/models")) {
+        Write-Warning "Local Gemma is not reachable at $gemmaBase. The stack will still start for Remote model sessions."
+    }
 
     $containerState = docker inspect $TtsContainer --format "{{.State.Status}}" 2>$null
     if ($LASTEXITCODE -ne 0) { throw "FasterQwen3TTS container not found: $TtsContainer" }

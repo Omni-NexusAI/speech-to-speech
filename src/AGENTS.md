@@ -10,6 +10,8 @@
 - Progressive Gemma transcript previews are opt-in and ephemeral; final transcription is mandatory regardless of preview mode. Missing primary transcripts use one transcript-only fallback, and assistant text must never become user history.
 - Local history retains 30 complete turns without automatic summarization and emits content-free context metrics when committed or trimmed.
 - The realtime backend publishes runtime identity through `/v1/pool` and `pipeline.runtime`; local UI diagnostics use it to detect stale backend code.
+- A Remote model endpoint must own every model operation for its conversation, including audio/transcription, vision/tools, follow-ups, tokenization, context discovery, and identity. Never probe or fall back to Local for that session.
+- Soft VAD endpoints settle for 250 ms. A newer uncommitted audio revision cancels the obsolete transport while retaining and resubmitting combined captured audio.
 
 - Preserve the OpenAI Realtime-compatible `/v1/realtime` protocol shape.
 - Keep `--stt gemma-audio` as the local direct-audio bypass mode; it must not load Parakeet or another ASR model.
@@ -27,7 +29,7 @@
 - Client tool outputs, optional camera images, and one `response.create` are accepted immediately and bound to their `call_id`; the backend starts that follow-up only after the originating response closes.
 - Normalize opaque llama.cpp function-call IDs to the Realtime `call_*` contract at the direct-audio Gemma adapter boundary; keep the global chat validator strict.
 - Full-buffer Gemma mode keeps a cancellable streaming HTTP transport and buffers text locally so session Stop can abort in-flight generation.
-- Local-only realtime config uses `pipeline.config.update` for `full_buffer_tts`, live-preview state, and the conversation-scoped TTS provider; retain `local.pipeline.update` only as a compatibility alias.
+- Realtime config uses `pipeline.config.update` for model endpoint, `full_buffer_tts`, live-preview state, and the conversation-scoped TTS provider; retain `local.pipeline.update` only as a compatibility alias.
 - Stop, disconnect, barge-in, and replacement sessions close active direct and post-tool Gemma streams plus active TTS HTTP streams before releasing the pipeline slot.
 - Disconnect cleanup flushes every intermediate handler queue before propagating `SESSION_END`, so abandoned speculative turns cannot delay a new session.
 - TTS provider selection is session-scoped: Faster on `8881` remains the default, while Groxaxo on `8882` is accepted only when Voice Studio already has a Base model loaded.

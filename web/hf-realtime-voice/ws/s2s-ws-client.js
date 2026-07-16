@@ -65,6 +65,7 @@
  *   executes and replies via `sendToolOutput` + `requestResponse`.
  * @property {NoiseGate} [noiseGate] Client-side noise gate applied to the mic
  *   before it's sent. Tunable live via `setNoiseGate`.
+ * @property {Record<string, any>} [pipelineConfig] Conversation-scoped model and TTS routing.
  *
  * @typedef {Object} NoiseGate
  * @property {boolean} enabled
@@ -639,12 +640,8 @@ export class S2sWsRealtimeClient extends EventTarget {
 
     switch (type) {
       case "session.created":
-        // Server-side defaults for the s2s pipeline are already what we
-        // want (server_vad, whisper-1 transcription, PCM16 16k in / 24k
-        // out). We only push the user-tunable bits: voice + instructions.
-        this._sendSessionUpdate();
-        this._sessionConfigured = true;
-        if (this._status === "connecting") this._setStatus("connected");
+        // Endpoint validation must finish before session.update enables mic audio.
+        this.updateLocalPipeline(this.options.pipelineConfig || {});
         break;
 
       case "session.updated":
@@ -759,8 +756,17 @@ export class S2sWsRealtimeClient extends EventTarget {
         break;
       }
 
-      case "local.pipeline.updated":
       case "pipeline.config.updated": {
+        this.dispatchEvent(new CustomEvent("local-pipeline-updated", { detail: event.config || {} }));
+        if (!this._sessionConfigured) {
+          this._sendSessionUpdate();
+          this._sessionConfigured = true;
+          if (this._status === "connecting") this._setStatus("connected");
+        }
+        break;
+      }
+
+      case "local.pipeline.updated": {
         this.dispatchEvent(new CustomEvent("local-pipeline-updated", { detail: event.config || {} }));
         break;
       }
@@ -879,6 +885,12 @@ export class S2sWsRealtimeClient extends EventTarget {
       case "error": {
         const err = event.error;
         console.error("[ws] server error:", err);
+        if (!this._sessionConfigured && err?.code === "model_endpoint_unavailable") {
+          const failure = new Error(err?.message ?? "Selected model endpoint is unavailable");
+          this.dispatchEvent(new CustomEvent("error", { detail: { error: failure } }));
+          await this.close();
+          break;
+        }
         // The "another response is already active" race: our optimistic create
         // collided with a still-running response. Don't surface it — clear the
         // in-flight guard and re-queue, so the create replays on the next

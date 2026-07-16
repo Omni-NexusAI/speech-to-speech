@@ -63,7 +63,8 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         base_url: str = "http://127.0.0.1:8818/v1",
         api_key: str | None = None,
         stream: bool = True,
-        timeout_s: float = 120.0,
+        timeout_s: float = 30.0,
+        revision_settle_s: float = 0.25,
         format: str = "wav",
         prompt: str = "",
         system_prompt: str = "You are a local low-latency voice assistant. Answer naturally for speech synthesis.",
@@ -75,7 +76,8 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         self.base_url = (os.getenv("GEMMA_AUDIO_BASE_URL") or base_url).rstrip("/")
         self.api_key = api_key or os.getenv("GEMMA_API_KEY") or os.getenv("LLAMA_CPP_API_KEY")
         self.stream = stream
-        self.timeout = httpx.Timeout(float(timeout_s), connect=10.0)
+        self.timeout = httpx.Timeout(float(timeout_s), connect=min(5.0, float(timeout_s)))
+        self.final_revision_settle_s = max(0.0, float(revision_settle_s))
         self.audio_format = format
         # Compatibility option for older configs. It must never be included in
         # user multimodal content, where Gemma can mistake it for user speech.
@@ -88,8 +90,27 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         self._preview_transcripts: dict[tuple[str | None, int | None], str] = {}
         self._committed_user_turns: set[tuple[str | None, int | None]] = set()
         self._active_response: httpx.Response | None = None
+        self._active_client: httpx.Client | None = None
+        self._active_turn: tuple[str | None, int | None] | None = None
         self._active_response_lock = threading.Lock()
         logger.info("Gemma audio direct mode configured for %s at %s", self.model_name, self.base_url)
+
+    def on_speculative_turns_attached(self) -> None:
+        tracker = getattr(self, "speculative_turns", None)
+        if tracker is not None:
+            tracker.add_revision_listener(self._on_revision_observed)
+
+    def _on_revision_observed(self, turn_id: str, revision: int) -> None:
+        with self._active_response_lock:
+            active = self._active_turn
+        if active is not None and active[0] == turn_id and active[1] is not None and revision > active[1]:
+            logger.info(
+                "Cancelling superseded Gemma audio request turn=%s old_rev=%s new_rev=%s",
+                turn_id,
+                active[1],
+                revision,
+            )
+            self.cancel_active()
 
     def process(self, vad_audio: STTIn) -> Iterator[STTOut]:
         if vad_audio.mode == "progressive":
@@ -144,6 +165,13 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             wav.writeframes(pcm16.tobytes())
         return out.getvalue()
 
+    def _model_endpoint(self, vad_audio: STTIn | None) -> tuple[str, str, str | None]:
+        runtime_config = getattr(vad_audio, "runtime_config", None) if vad_audio is not None else None
+        endpoint = getattr(runtime_config, "model_endpoint", None)
+        if endpoint is None:
+            return self.base_url, self.model_name, self.api_key
+        return endpoint.base_url.rstrip("/"), endpoint.model, endpoint.api_key
+
     def _payload(self, audio: np.ndarray, vad_audio: STTIn | None = None) -> dict[str, Any]:
         encoded = base64.b64encode(self._wav_bytes(audio)).decode("ascii")
         if vad_audio is None:
@@ -179,8 +207,9 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 if message.get("role") != "system"
             ]
 
+        _, model_name, _ = self._model_endpoint(vad_audio)
         payload: dict[str, Any] = {
-            "model": self.model_name,
+            "model": model_name,
             "messages": [
                 {"role": "system", "content": "\n\n".join(system_parts)},
                 *history,
@@ -204,10 +233,11 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                     payload["tool_choice"] = _to_chat_tool_choice(tool_choice)
         return payload
 
-    def _transcription_payload(self, audio: np.ndarray) -> dict[str, Any]:
+    def _transcription_payload(self, audio: np.ndarray, vad_audio: STTIn | None = None) -> dict[str, Any]:
         encoded = base64.b64encode(self._wav_bytes(audio)).decode("ascii")
+        _, model_name, _ = self._model_endpoint(vad_audio)
         return {
-            "model": self.model_name,
+            "model": model_name,
             "messages": [
                 {
                     "role": "system",
@@ -238,12 +268,13 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         raw = ""
         first = True
         try:
+            base_url, _, api_key = self._model_endpoint(vad_audio)
             with httpx.Client(timeout=self.timeout) as client:
                 with client.stream(
                     "POST",
-                    f"{self.base_url}/chat/completions",
-                    headers=self._headers(),
-                    json=self._transcription_payload(audio),
+                    f"{base_url}/chat/completions",
+                    headers=self._headers(api_key),
+                    json=self._transcription_payload(audio, vad_audio),
                 ) as response:
                     response.raise_for_status()
                     for line in response.iter_lines():
@@ -282,13 +313,14 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             self._emit_metric(vad_audio, "transcription", "live_done", elapsed_ms=(perf_counter() - start_s) * 1000)
 
     def _transcribe_once(self, vad_audio: STTIn) -> str | None:
-        payload = self._transcription_payload(self._as_float32_mono(vad_audio.audio))
+        base_url, _, api_key = self._model_endpoint(vad_audio)
+        payload = self._transcription_payload(self._as_float32_mono(vad_audio.audio), vad_audio)
         payload["stream"] = False
         try:
             with httpx.Client(timeout=self.timeout) as client:
                 response = client.post(
-                    f"{self.base_url}/chat/completions",
-                    headers=self._headers(),
+                    f"{base_url}/chat/completions",
+                    headers=self._headers(api_key),
                     json=payload,
                 )
                 response.raise_for_status()
@@ -346,20 +378,25 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 if image_url:
                     urls.append(str(image_url))
         return urls[-2:]
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, api_key: str | None = None) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         return headers
 
     def _iter_direct_responses(
         self, audio: np.ndarray, vad_audio: STTIn, *, generation: int | None = None
     ) -> Iterator[DirectAssistantResponse]:
-        url = f"{self.base_url}/chat/completions"
+        base_url, _, api_key = self._model_endpoint(vad_audio)
+        url = f"{base_url}/chat/completions"
         payload = self._payload(audio, vad_audio)
-        with httpx.Client(timeout=self.timeout) as client:
+        client = httpx.Client(timeout=self.timeout)
+        with self._active_response_lock:
+            self._active_client = client
+            self._active_turn = (vad_audio.turn_id, vad_audio.turn_revision)
+        try:
             if payload.get("stream", self.stream):
-                with client.stream("POST", url, headers=self._headers(), json=payload) as response:
+                with client.stream("POST", url, headers=self._headers(api_key), json=payload) as response:
                     with self._active_response_lock:
                         self._active_response = response
                     response.raise_for_status()
@@ -370,10 +407,31 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                             if self._active_response is response:
                                 self._active_response = None
                     return
-            response = client.post(url, headers=self._headers(), json=payload)
+            response = client.post(url, headers=self._headers(api_key), json=payload)
             response.raise_for_status()
             text, tools = self._message_text_and_tools(response.json())
             yield from self._responses_from_text(text, vad_audio, tools=tools)
+        except (httpx.HTTPError, RuntimeError):
+            tracker = getattr(self, "speculative_turns", None)
+            superseded = tracker is not None and not tracker.is_latest(
+                vad_audio.turn_id,
+                vad_audio.turn_revision,
+            )
+            cancelled = generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation)
+            if superseded or cancelled:
+                logger.info(
+                    "Gemma audio transport closed for superseded request turn=%s rev=%s",
+                    vad_audio.turn_id,
+                    vad_audio.turn_revision,
+                )
+                return
+            raise
+        finally:
+            with self._active_response_lock:
+                if self._active_client is client:
+                    self._active_client = None
+                    self._active_turn = None
+            client.close()
 
     def _consume_stream(
         self, response: httpx.Response, vad_audio: STTIn, *, generation: int | None = None
@@ -700,9 +758,16 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
     def cancel_active(self) -> None:
         with self._active_response_lock:
             response = self._active_response
+            client = self._active_client
             self._active_response = None
-        if response is not None:
-            response.close()
+            self._active_client = None
+            self._active_turn = None
+        for resource in (response, client):
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception:
+                    logger.debug("Gemma audio transport was already closed during cancellation")
 
     def _message_text_and_tools(self, data: dict[str, Any]) -> tuple[str, list[ResponseFunctionToolCall]]:
         choices = data.get("choices") or []

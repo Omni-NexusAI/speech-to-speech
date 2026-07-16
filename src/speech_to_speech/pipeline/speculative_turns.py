@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Condition
 
@@ -34,6 +35,10 @@ class SpeculativeTurnTracker:
         self._committed_revision: dict[str, int] = {}
         self._pending_reopen: dict[str, _PendingReopen] = {}
         self._reopen_grace: dict[str, _ReopenGrace] = {}
+        self._revision_listeners: list[Callable[[str, int], None]] = []
+
+    def add_revision_listener(self, listener: Callable[[str, int], None]) -> None:
+        self._revision_listeners.append(listener)
 
     def observe(self, turn_id: str | None, revision: int | None) -> None:
         if turn_id is None or revision is None:
@@ -46,6 +51,9 @@ class SpeculativeTurnTracker:
                 self._prune_tracked_turns()
                 logger.debug("Observed speculative turn %s revision %d", turn_id, revision)
                 self._condition.notify_all()
+            else:
+                return
+        self._notify_revision_listeners(turn_id, revision)
 
     def is_latest(self, turn_id: str | None, revision: int | None) -> bool:
         if turn_id is None or revision is None:
@@ -284,6 +292,7 @@ class SpeculativeTurnTracker:
     ) -> bool:
         if turn_id is None or base_revision is None or candidate_revision is None:
             return False
+        confirmed = False
         with self._condition:
             pending = self._pending_reopen.get(turn_id)
             if (
@@ -313,7 +322,21 @@ class SpeculativeTurnTracker:
                 candidate_revision,
             )
             self._condition.notify_all()
-            return True
+            confirmed = True
+        if confirmed:
+            self._notify_revision_listeners(turn_id, candidate_revision)
+        return confirmed
+
+    def _notify_revision_listeners(self, turn_id: str, revision: int) -> None:
+        for listener in tuple(self._revision_listeners):
+            try:
+                listener(turn_id, revision)
+            except Exception:
+                logger.exception(
+                    "Speculative revision listener failed turn=%s revision=%d",
+                    turn_id,
+                    revision,
+                )
 
     def cancel_reopen_candidate(self, turn_id: str | None, candidate_revision: int | None = None) -> None:
         if turn_id is None:

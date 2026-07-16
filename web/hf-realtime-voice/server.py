@@ -69,7 +69,7 @@ LIMITER_ENABLED = bool(LOAD_BALANCER_URL) and bool(SPACE_ID)
 SERPER_URL = "https://google.serper.dev/search"
 # Cap results so the tool output stays small enough to feed back to the model.
 MAX_RESULTS = 5
-LOCAL_UI_API_VERSION = 4
+LOCAL_UI_API_VERSION = 5
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_QWEN3_VOICE_ID = "16d9bb336799"
 DEFAULT_QWEN3_VOICE = f"clone:{DEFAULT_QWEN3_VOICE_ID}"
@@ -114,6 +114,56 @@ class SearchRequest(BaseModel):
     # Optional user-supplied key (fallback when the deploy has no server key).
     # Used for this request only; never stored.
     key: str | None = None
+
+
+class ModelTestRequest(BaseModel):
+    provider: str = "local"
+    base_url: str | None = None
+    model: str | None = None
+    api_key: str | None = None
+
+
+@app.post("/api/model/test")
+async def test_model_endpoint(req: ModelTestRequest):
+    if req.provider == "local":
+        base_url = os.environ.get("GEMMA_AUDIO_BASE_URL", "http://127.0.0.1:8818/v1")
+        model = os.environ.get("GEMMA_AUDIO_MODEL", "gemma-4-12b-it-qat")
+        api_key = os.environ.get("GEMMA_API_KEY") or os.environ.get("LLAMA_CPP_API_KEY")
+    elif req.provider == "remote":
+        base_url = (req.base_url or "").strip()
+        model = (req.model or "").strip()
+        api_key = req.api_key or None
+        if not base_url or not model:
+            raise HTTPException(status_code=400, detail="Remote URL and model name are required.")
+    else:
+        raise HTTPException(status_code=400, detail="Unknown model provider.")
+
+    base_url = base_url.rstrip("/")
+    if not base_url.endswith("/v1"):
+        base_url = f"{base_url}/v1"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=5.0), headers=headers) as http:
+            response = await http.get(f"{base_url}/models")
+            response.raise_for_status()
+            models = response.json().get("data") or []
+            advertised = next((str(item.get("id")) for item in models if item.get("id")), None)
+            context_window = None
+            try:
+                props = await http.get(f"{base_url.removesuffix('/v1')}/props")
+                props.raise_for_status()
+                context_window = props.json().get("default_generation_settings", {}).get("n_ctx")
+            except Exception:
+                pass
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Model endpoint unavailable: {type(exc).__name__}") from exc
+    return {
+        "provider": req.provider,
+        "model": advertised or model,
+        "configured_model": model,
+        "context_window": int(context_window) if context_window else None,
+        "api_key_set": bool(api_key),
+    }
 
 
 @app.get("/api/config")

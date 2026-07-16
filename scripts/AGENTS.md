@@ -12,6 +12,7 @@
 - Use `start_hf_realtime_frontend.ps1` for the local HF Realtime Voice UI on `http://127.0.0.1:7862`.
 - Use `start_local_gemma_realtime_backend.ps1` for the local realtime backend on `ws://127.0.0.1:8765/v1/realtime`.
 - Use `local_realtime.ps1 -Action start|stop|restart|status` for tracked background operation. It records launcher and listening child identities, adopts exact matching legacy repo processes, falls back to `netstat` when non-elevated PowerShell cannot query `Get-NetTCPConnection`, and never stops Gemma or FasterQwen3TTS.
+- Managed startup requires FasterQwen3TTS but treats unavailable local Gemma as a warning so Remote model sessions can start.
 - Managed runtime state and split logs live under the gitignored `.runtime/` directory.
 
 ## Child DOX Index

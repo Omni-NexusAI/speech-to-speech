@@ -549,6 +549,8 @@ def _build_realtime_pipeline_unit(
         context_tokenizer_base_url=(
             gemma_audio_kw.base_url if module_kwargs.stt == "gemma-audio" else None
         ),
+        default_model_name=gemma_audio_kw.model_name,
+        default_model_api_key=gemma_audio_kw.api_key,
     )
 
     if module_kwargs.enable_live_transcription or module_kwargs.stt == "gemma-audio":
@@ -709,7 +711,7 @@ def build_pipeline(
                     "limit": runtime_lm_kwargs.chat_size,
                     "turn_limit": runtime_lm_kwargs.chat_size,
                     "history_tokens": 0,
-                    "max_tokens": pool[0].service.context_window,
+                    "max_tokens": pool[0].service.default_model_endpoint.context_window,
                     "compact_history": runtime_lm_kwargs.compact_history,
                     "policy": "visible_trim" if not runtime_lm_kwargs.compact_history else "compact",
                 },
@@ -813,6 +815,9 @@ def get_stt_handler(
     def with_speculative_turns(handler: BaseSTTHandler) -> BaseSTTHandler:
         if speculative_turns is not None:
             handler.speculative_turns = speculative_turns
+            attached = getattr(handler, "on_speculative_turns_attached", None)
+            if callable(attached):
+                attached()
         return handler
 
     if module_kwargs.stt == "whisper":
