@@ -13,6 +13,7 @@
 - A Remote model endpoint must own every model operation for its conversation, including audio/transcription, vision/tools, follow-ups, tokenization, context discovery, and identity. Never probe or fall back to Local for that session.
 - Soft VAD endpoints settle for 250 ms. A newer uncommitted audio revision cancels the obsolete transport while retaining and resubmitting combined captured audio.
 - Direct audio, transcript fallback, optional preview, and post-tool generation share one conversation-scoped model-operation coordinator. Optional previews drop while occupied; required operations serialize.
+- Cancellable model streams use async-task cancellation behind the synchronous handlers. Do not replace this with cross-thread `httpx.Client.close()`: on Windows it can return locally while llama.cpp keeps the inference slot busy.
 
 - Preserve the OpenAI Realtime-compatible `/v1/realtime` protocol shape.
 - Keep `--stt gemma-audio` as the local direct-audio bypass mode; it must not load Parakeet or another ASR model.

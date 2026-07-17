@@ -14,6 +14,7 @@
 - Teardown coverage must prove intermediate handler queues are flushed and closed-client events/tool continuations cannot reactivate a stopped conversation.
 - Remote-provider coverage must prove authenticated endpoint routing, no local probe/fallback, key redaction, zero OpenAI retries, dynamic context discovery, and superseded-revision transport cancellation.
 - Model-operation tests must prove serialization, busy-preview dropping, active transport closure, two-second-style detachment, and stale-release isolation. Browser DSP tests must cover Adaptive, Strict, Off, correlated echo, and double-talk.
+- Transport cancellation tests must prove a stream blocked before or during model output exits promptly when closed, including cancellation requested before its worker starts.
 
 - Prefer mocked HTTP and monkeypatched model setup for backend-adapter tests.
 - Tests for the local Gemma/FasterQwen3TTS path must not require running local models or Docker containers.

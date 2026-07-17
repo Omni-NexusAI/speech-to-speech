@@ -4,6 +4,7 @@ import json
 import logging
 import time
 from collections.abc import Iterator
+from inspect import ismethod
 from typing import Any, cast
 
 from openai import Stream
@@ -34,6 +35,7 @@ from speech_to_speech.LLM.base_openai_compatible_language_model import (
 )
 from speech_to_speech.LLM.chat import Chat
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn
+from speech_to_speech.pipeline.cancellable_http import CancellableAsyncSSEStream, ChatCompletionSSEStream
 from speech_to_speech.utils.utils import _generate_id
 
 logger = logging.getLogger(__name__)
@@ -198,6 +200,46 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
         create_kwargs: dict[str, Any] = dict(optional_kwargs)
         if self.stream:
             create_kwargs["stream_options"] = {"include_usage": True}
+        sdk_create = self.client.chat.completions.create
+        if self.stream and ismethod(sdk_create):
+            endpoint = getattr(runtime_config, "model_endpoint", None)
+            if endpoint is not None and endpoint.provider != "local":
+                base_url = endpoint.base_url.rstrip("/")
+                api_key = endpoint.api_key
+                model_name = endpoint.model
+                extra_body = self._build_extra_body(
+                    base_url,
+                    self.disable_thinking,
+                    self.reasoning_effort,
+                )
+            else:
+                base_url = (self.base_url or "https://api.openai.com/v1").rstrip("/")
+                api_key = self.api_key
+                model_name = self.model_name
+                extra_body = self._extra_body
+            payload: dict[str, Any] = {
+                "model": model_name,
+                "messages": api_input,
+                "stream": True,
+                **self.gen_kwargs,
+                **create_kwargs,
+            }
+            if extra_body:
+                payload.update(extra_body)
+            headers = {"Content-Type": "application/json"}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            transport = CancellableAsyncSSEStream(
+                "POST",
+                f"{base_url}/chat/completions",
+                headers=headers,
+                json_body=payload,
+                timeout=self.request_timeout,
+            )
+            stream = ChatCompletionSSEStream(transport, ChatCompletionChunk)
+            self._set_active_client(stream)
+            stream.wait_for_headers()
+            return stream
         client, model_name, extra_body = self._client_for(runtime_config)
         self._set_active_client(client)
         return client.chat.completions.create(
