@@ -49,6 +49,7 @@ const STORAGE_KEYS = {
   diagnosticsGeometry: "s2s.ws.diagnosticsGeometry",
   fullBufferTts: "s2s.ws.fullBufferTts",
   liveTranscript: "s2s.ws.liveTranscript",
+  maxResponseTokens: "s2s.ws.maxResponseTokens",
   ttsBackend: "s2s.ws.ttsBackend",
   modelProvider: "s2s.ws.modelProvider",
   modelUrl: "s2s.ws.modelUrl",
@@ -116,6 +117,7 @@ function loadSettings() {
     echoGuard: ["off", "adaptive", "strict"].includes(storedEchoGuard || "") ? storedEchoGuard : "adaptive",
     fullBufferTts: localStorage.getItem(STORAGE_KEYS.fullBufferTts) === "1",
     liveTranscript: localStorage.getItem(STORAGE_KEYS.liveTranscript) === "1",
+    maxResponseTokens: Math.min(1024, Math.max(64, Number(localStorage.getItem(STORAGE_KEYS.maxResponseTokens)) || 384)),
     ttsBackend: localStorage.getItem(STORAGE_KEYS.ttsBackend) || "faster",
     modelProvider: localStorage.getItem(STORAGE_KEYS.modelProvider) || "local",
     modelUrl: localStorage.getItem(STORAGE_KEYS.modelUrl) || "",
@@ -146,6 +148,7 @@ function saveSettings(s) {
   localStorage.setItem(STORAGE_KEYS.echoGuard, s.echoGuard);
   localStorage.setItem(STORAGE_KEYS.fullBufferTts, s.fullBufferTts ? "1" : "0");
   localStorage.setItem(STORAGE_KEYS.liveTranscript, s.liveTranscript ? "1" : "0");
+  localStorage.setItem(STORAGE_KEYS.maxResponseTokens, String(s.maxResponseTokens));
   localStorage.setItem(STORAGE_KEYS.ttsBackend, s.ttsBackend);
   localStorage.setItem(STORAGE_KEYS.modelProvider, s.modelProvider);
   localStorage.setItem(STORAGE_KEYS.modelUrl, s.modelUrl);
@@ -304,6 +307,8 @@ const inputEchoGuard = $("#echo-guard");
 const inputFullBufferTts = $("#full-buffer-tts");
 /** @type {HTMLInputElement} */
 const inputLiveTranscript = $("#live-transcript");
+/** @type {HTMLInputElement} */
+const inputMaxResponseTokens = $("#max-response-tokens");
 /** @type {HTMLElement} */
 const gateValue = $("#gate-value");
 /** @type {HTMLElement} */
@@ -490,6 +495,7 @@ function openSettings() {
   inputEchoGuard.value = settings.echoGuard;
   inputFullBufferTts.checked = settings.fullBufferTts;
   inputLiveTranscript.checked = settings.liveTranscript;
+  inputMaxResponseTokens.value = String(settings.maxResponseTokens);
   syncGateUi();
   updateRestartAvailability();
   settingsModal.showModal();
@@ -1283,6 +1289,7 @@ function readSettingsFromForm() {
     echoGuard: ["off", "adaptive", "strict"].includes(inputEchoGuard.value) ? inputEchoGuard.value : "adaptive",
     fullBufferTts: inputFullBufferTts.checked,
     liveTranscript: inputLiveTranscript.checked,
+    maxResponseTokens: Math.min(1024, Math.max(64, Number(inputMaxResponseTokens.value) || 384)),
     ttsBackend: inputTtsBackend.value || "faster",
     modelProvider: inputModelProvider.value === "remote" ? "remote" : "local",
     modelUrl: inputModelUrl.value.trim(),
@@ -1380,7 +1387,11 @@ settingsForm.addEventListener("submit", (event) => {
   // changed connection URL only takes effect on the next restart.
   if (client && LIVE_STATES.has(currentState)) {
     client.updateSession({ voice: settings.voice, instructions: effectiveInstructions() });
-    client.updateLocalPipeline({ full_buffer_tts: settings.fullBufferTts, live_transcription: settings.liveTranscript });
+    client.updateLocalPipeline({
+      full_buffer_tts: settings.fullBufferTts,
+      live_transcription: settings.liveTranscript,
+      max_response_tokens: settings.maxResponseTokens,
+    });
     client.setEchoGuard(settings.echoGuard);
   }
 });
@@ -1599,6 +1610,7 @@ async function doStart(audioContext = null) {
     pipelineConfig: {
       full_buffer_tts: settings.fullBufferTts,
       live_transcription: settings.liveTranscript,
+      max_response_tokens: settings.maxResponseTokens,
       tts_backend: settings.ttsBackend,
       model_endpoint: modelEndpointConfig(settings),
     },

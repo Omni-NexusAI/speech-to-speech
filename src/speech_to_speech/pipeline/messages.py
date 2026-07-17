@@ -93,6 +93,10 @@ class DirectAssistantResponse(PipelineMessage):
     # A validated user transcript may be finalized before the direct Gemma
     # answer is complete so persistent history precedes streamed assistant text.
     transcript_finalized: bool = False
+    # Direct-audio responses bypass the normal LLM request object, but must
+    # still carry the request generation through LM output and TTS so a
+    # barge-in cannot synthesize abandoned assistant text later.
+    cancel_generation: int | None = None
 
 
 class DirectAssistantRequest(DirectAssistantResponse):

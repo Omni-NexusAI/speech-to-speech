@@ -460,6 +460,20 @@ def create_app(
                     rt_cfg.local_pipeline.update(
                         {k: bool(v) for k, v in config.items() if k in allowed and isinstance(v, bool)}
                     )
+                    if "max_response_tokens" in config:
+                        try:
+                            rt_cfg.local_pipeline["max_response_tokens"] = min(
+                                1024, max(64, int(config["max_response_tokens"]))
+                            )
+                        except (TypeError, ValueError):
+                            await _send_event(
+                                ws,
+                                unit.service.make_error(
+                                    "Response limit must be between 64 and 1024 tokens",
+                                    "invalid_max_response_tokens",
+                                ),
+                            )
+                            continue
                     tts_backend = config.get("tts_backend")
                     if tts_backend in {"faster", "groxaxo"}:
                         rt_cfg.local_pipeline["tts_backend"] = tts_backend

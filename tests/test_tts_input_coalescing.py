@@ -3,7 +3,7 @@ from threading import Event
 
 from speech_to_speech.pipeline.control import SESSION_END
 from speech_to_speech.pipeline.messages import EndOfResponse, TTSInput
-from speech_to_speech.TTS.qwen3_tts_handler import Qwen3TTSHandler
+from speech_to_speech.TTS.qwen3_tts_handler import MAX_COALESCED_TTS_CHARS, Qwen3TTSHandler
 
 
 def _make_handler():
@@ -40,3 +40,19 @@ def test_coalesce_pending_tts_input_stops_before_control_messages():
     assert lang == "en"
     assert saw_end is False
     assert handler.queue_in.get_nowait() == SESSION_END
+
+
+def test_coalesce_pending_tts_input_keeps_long_remainder_queued():
+    handler = _make_handler()
+    first = "A" * (MAX_COALESCED_TTS_CHARS - 10)
+    second = "B" * 40
+    handler.queue_in.put(TTSInput(text=second, language_code="en", turn_id="turn", turn_revision=0))
+
+    text, lang, saw_end = handler._coalesce_pending_tts_input(
+        TTSInput(text=first, language_code="en", turn_id="turn", turn_revision=0)
+    )
+
+    assert text == first
+    assert lang == "en"
+    assert saw_end is False
+    assert handler.queue_in.get_nowait().text == second

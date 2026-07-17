@@ -171,6 +171,24 @@ def test_unicode_assistant_text_is_preserved_without_console_output():
     assert chat.stats()["turns"] == 1
 
 
+def test_direct_audio_generation_reaches_tts_pass_through_messages():
+    notifier = object.__new__(TranscriptionNotifier)
+    notifier.setup(text_output_queue=None, runtime_config=None)
+    response = DirectAssistantResponse(
+        text="Hello.",
+        transcript="Hello",
+        is_final=True,
+        cancel_generation=17,
+    )
+    request = next(notifier.process(response))
+    handler = object.__new__(_PassThroughHandler)
+    outputs = list(handler.process(request))
+
+    assert request.cancel_generation == 17
+    assert outputs[0].cancel_generation == 17
+    assert outputs[1].cancel_generation == 17
+
+
 def test_direct_tool_call_is_committed_before_browser_output():
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)

@@ -30,6 +30,7 @@ from openai.types.realtime.realtime_response_create_params import RealtimeRespon
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline.cancel_scope import CancelScope
+from speech_to_speech.pipeline.cancellable_http import CancellableAsyncByteStream, StreamCancelled
 from speech_to_speech.pipeline.control import SESSION_END, is_control_message
 from speech_to_speech.pipeline.events import PipelineMetricEvent
 from speech_to_speech.pipeline.handler_types import TTSIn, TTSOut
@@ -56,6 +57,7 @@ DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 DEFAULT_MLX_MODEL = "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit"
 DEFAULT_REF_TEXT = "I'm confused why some people have super short timelines, yet at the same time are bullish on scaling up reinforcement learning atop LLMs. If we're actually close to a human-like learner, then this whole approach of training on verifiable outcomes."
 DEFAULT_FASTER_STREAMING_CHUNK_SIZE = 8
+MAX_COALESCED_TTS_CHARS = 420
 DEFAULT_MLX_STREAMING_CHUNK_SIZE = 4
 DEFAULT_QWEN3_TTS_MAX_NEW_TOKENS = 1536
 DEFAULT_OPENAI_API_BASE_URL = "http://127.0.0.1:8881/v1"
@@ -947,70 +949,65 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         pending_samples = np.array([], dtype=np.int16)
         first_chunk = True
         request_timeout = httpx.Timeout(runaway_budget_s, connect=min(5.0, runaway_budget_s))
-        with httpx.Client(timeout=request_timeout) as client:
-            with client.stream(
-                "POST",
-                url,
-                headers=self._openai_api_headers(),
-                json=self._openai_api_payload(text, voice, language),
-            ) as response:
-                with self._active_response_lock:
-                    self._active_response = response
-                response.raise_for_status()
-                if getattr(self, "api_response_format", "pcm") != "pcm":
-                    encoded_parts: list[bytes] = []
-                    for chunk in response.iter_bytes():
-                        if generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation):
-                            response.close()
-                            return
-                        if perf_counter() - start > runaway_budget_s:
-                            response.close()
-                            raise TTSRunawayError(f"TTS stream exceeded {runaway_budget_s:.1f}s budget")
-                        if chunk:
-                            encoded_parts.append(chunk)
-                    encoded_audio = b"".join(encoded_parts)
-                    for out in self._stream_encoded_openai_api_audio(encoded_audio, voice):
-                        total_samples += len(out)
-                        yield out
-                    generation_time = perf_counter() - start
-                    audio_duration = total_samples / PIPELINE_SR
-                    rtf = audio_duration / generation_time if generation_time > 0 else 0
-                    logger.info(
-                        "Qwen3-TTS API generated %.2fs audio in %.2fs (RTF: %.2f)",
-                        audio_duration,
-                        generation_time,
-                        rtf,
-                    )
-                    return
+        response = CancellableAsyncByteStream(
+            "POST",
+            url,
+            headers=self._openai_api_headers(),
+            json_body=self._openai_api_payload(text, voice, language),
+            timeout=request_timeout,
+        )
+        with self._active_response_lock:
+            self._active_response = response
+        try:
+            response.wait_for_headers()
+            if getattr(self, "api_response_format", "pcm") != "pcm":
+                encoded_parts: list[bytes] = []
                 for chunk in response.iter_bytes():
                     if generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation):
                         response.close()
                         return
-                    if perf_counter() - start > runaway_budget_s or total_samples / PIPELINE_SR > runaway_budget_s:
+                    if perf_counter() - start > runaway_budget_s:
                         response.close()
                         raise TTSRunawayError(f"TTS stream exceeded {runaway_budget_s:.1f}s budget")
-                    if not chunk:
-                        continue
-                    if first_chunk:
-                        logger.info("Qwen3-TTS API TTFA: %.2fs (voice=%s)", perf_counter() - start, voice)
-                        first_chunk = False
-                    pending_bytes += chunk
-                    even = len(pending_bytes) - (len(pending_bytes) % 2)
-                    if even <= 0:
-                        continue
-                    pcm24 = np.frombuffer(pending_bytes[:even], dtype="<i2")
-                    pending_bytes = pending_bytes[even:]
-                    pcm16 = self._resample_to_pipeline_sr(pcm24, self.api_sample_rate).astype(np.int16)
-                    pending_samples = np.concatenate([pending_samples, pcm16])
-                    n = (len(pending_samples) // self.blocksize) * self.blocksize
-                    for i in range(0, n, self.blocksize):
-                        out = pending_samples[i : i + self.blocksize]
-                        total_samples += len(out)
-                        yield out
-                    pending_samples = pending_samples[n:]
-                with self._active_response_lock:
-                    if self._active_response is response:
-                        self._active_response = None
+                    encoded_parts.append(chunk)
+                encoded_audio = b"".join(encoded_parts)
+                for out in self._stream_encoded_openai_api_audio(encoded_audio, voice):
+                    total_samples += len(out)
+                    yield out
+                return
+            for chunk in response.iter_bytes():
+                if generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation):
+                    response.close()
+                    return
+                if perf_counter() - start > runaway_budget_s or total_samples / PIPELINE_SR > runaway_budget_s:
+                    response.close()
+                    raise TTSRunawayError(f"TTS stream exceeded {runaway_budget_s:.1f}s budget")
+                if not chunk:
+                    continue
+                if first_chunk:
+                    logger.info("Qwen3-TTS API TTFA: %.2fs (voice=%s)", perf_counter() - start, voice)
+                    first_chunk = False
+                pending_bytes += chunk
+                even = len(pending_bytes) - (len(pending_bytes) % 2)
+                if even <= 0:
+                    continue
+                pcm24 = np.frombuffer(pending_bytes[:even], dtype="<i2")
+                pending_bytes = pending_bytes[even:]
+                pcm16 = self._resample_to_pipeline_sr(pcm24, self.api_sample_rate).astype(np.int16)
+                pending_samples = np.concatenate([pending_samples, pcm16])
+                n = (len(pending_samples) // self.blocksize) * self.blocksize
+                for i in range(0, n, self.blocksize):
+                    out = pending_samples[i : i + self.blocksize]
+                    total_samples += len(out)
+                    yield out
+                pending_samples = pending_samples[n:]
+        except StreamCancelled:
+            return
+        finally:
+            response.close()
+            with self._active_response_lock:
+                if self._active_response is response:
+                    self._active_response = None
         if len(pending_samples) > 0:
             out = np.pad(pending_samples, (0, self.blocksize - len(pending_samples)))
             total_samples += len(pending_samples)
@@ -1071,9 +1068,15 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                 ):
                     break
 
+                candidate = next_item.text.strip()
+                # The Faster HTTP backend is serialized.  Keep phrase dispatch
+                # responsive and leave remaining chunks queued instead of turning
+                # an interrupted long answer into one huge TTS request.
+                if parts and len(" ".join(parts)) + len(candidate) + 1 > MAX_COALESCED_TTS_CHARS:
+                    break
                 self.queue_in.queue.popleft()
-                if next_item.text.strip():
-                    parts.append(next_item.text.strip())
+                if candidate:
+                    parts.append(candidate)
                 if language_code is None:
                     language_code = next_item.language_code
 

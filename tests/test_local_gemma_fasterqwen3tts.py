@@ -215,13 +215,7 @@ def test_streaming_tts_runaway_is_aborted_and_closed(monkeypatch):
     class Response:
         closed = False
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            self.close()
-
-        def raise_for_status(self):
+        def wait_for_headers(self):
             return None
 
         def iter_bytes(self):
@@ -232,22 +226,9 @@ def test_streaming_tts_runaway_is_aborted_and_closed(monkeypatch):
 
     response = Response()
 
-    class Client:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return None
-
-        def stream(self, *args, **kwargs):
-            return response
-
     times = iter([0.0, 13.0])
     monkeypatch.setattr(qwen3_tts_module, "perf_counter", lambda: next(times))
-    monkeypatch.setattr(qwen3_tts_module.httpx, "Client", Client)
+    monkeypatch.setattr(qwen3_tts_module, "CancellableAsyncByteStream", lambda *_args, **_kwargs: response)
 
     with pytest.raises(qwen3_tts_module.TTSRunawayError):
         list(handler._stream_openai_api_voice("short reply", "clone:16d9bb336799"))

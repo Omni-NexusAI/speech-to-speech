@@ -98,6 +98,7 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
                 runtime_config=runtime_config,
                 response=transcription.response,
                 context_committed=transcription.context_committed,
+                cancel_generation=transcription.cancel_generation,
             )
             return
         if isinstance(transcription, PartialTranscription):

@@ -360,6 +360,12 @@
               <small>Disables phrase dispatch. Qwen3TTS audio streaming remains controlled by the local backend.</small>
             </div>
 
+            <label class="field">
+              <span>Response length</span>
+              <input id="max-response-tokens" type="number" min="64" max="1024" step="32" value="384" />
+              <small>Maximum assistant response tokens. Lower values keep accidental long replies from holding the voice pipeline.</small>
+            </label>
+
             <div class="field local-mode-field">
               <label class="inline-check">
                 <input id="live-transcript" type="checkbox" />

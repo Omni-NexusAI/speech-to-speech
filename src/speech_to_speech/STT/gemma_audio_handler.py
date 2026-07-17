@@ -32,6 +32,14 @@ from speech_to_speech.STT.base_stt_handler import BaseSTTHandler
 from speech_to_speech.utils.utils import _generate_id
 
 logger = logging.getLogger(__name__)
+
+
+def _response_max_tokens(value: Any, fallback: Any = 384) -> int:
+    """Return a bounded spoken-response limit without affecting ASR fallbacks."""
+    try:
+        return min(1024, max(64, int(value if value is not None else fallback)))
+    except (TypeError, ValueError):
+        return 384
 _TRANSCRIPT_MARKER = "USER_TRANSCRIPT:"
 _RESPONSE_MARKER = "ASSISTANT_RESPONSE:"
 _LANGUAGE_MARKER = "ASSISTANT_LANGUAGE:"
@@ -296,6 +304,8 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             "stream": self.stream,
             **self.gen_kwargs,
         }
+        local_pipeline = getattr(runtime_config, "local_pipeline", None) or {}
+        payload["max_tokens"] = _response_max_tokens(local_pipeline.get("max_response_tokens"), payload.get("max_tokens"))
         chat_template_kwargs = dict(payload.get("chat_template_kwargs") or {})
         chat_template_kwargs.setdefault("enable_thinking", False)
         payload["chat_template_kwargs"] = chat_template_kwargs
@@ -549,7 +559,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 response.close()
             tools = self._tool_calls_from_accum(tool_accum)
             text = raw
-            yield from self._responses_from_text(text, vad_audio, tools=tools)
+            yield from self._responses_from_text(text, vad_audio, tools=tools, generation=generation)
         except (httpx.HTTPError, RuntimeError):
             tracker = getattr(self, "speculative_turns", None)
             superseded = tracker is not None and not tracker.is_latest(
@@ -625,6 +635,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                         is_final=False,
                         context_committed=user_committed,
                         transcript_finalized=True,
+                        generation=generation,
                     )
                 assistant_started = True
                 pending_response = after
@@ -633,7 +644,13 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             if assistant_started and not full_buffer_tts:
                 chunks, pending_response = self._pop_sentence_chunks(pending_response)
                 for chunk in chunks:
-                    yield self._direct(vad_audio, chunk, is_final=False, language_code=language_code)
+                    yield self._direct(
+                        vad_audio,
+                        chunk,
+                        is_final=False,
+                        language_code=language_code,
+                        generation=generation,
+                    )
         tools = self._tool_calls_from_accum(tool_accum)
         if generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation):
             return
@@ -656,6 +673,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 is_final=True,
                 context_committed=committed,
                 language_code=language_code,
+                generation=generation,
             )
             self._preview_transcripts.pop((vad_audio.turn_id, vad_audio.turn_revision), None)
             return
@@ -679,10 +697,16 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             is_final=True,
             context_committed=committed,
             language_code=language_code,
+            generation=generation,
         )
 
     def _responses_from_text(
-        self, text: str, vad_audio: STTIn, *, tools: list[ResponseFunctionToolCall] | None = None
+        self,
+        text: str,
+        vad_audio: STTIn,
+        *,
+        tools: list[ResponseFunctionToolCall] | None = None,
+        generation: int | None = None,
     ) -> Iterator[DirectAssistantResponse]:
         transcript = self._final_transcript(vad_audio, self._extract_transcript(text))
         tools = tools or []
@@ -698,6 +722,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 is_final=True,
                 context_committed=committed,
                 language_code=language_code,
+                generation=generation,
             )
             self._preview_transcripts.pop((vad_audio.turn_id, vad_audio.turn_revision), None)
             return
@@ -714,6 +739,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             is_final=True,
             context_committed=committed,
             language_code=language_code,
+            generation=generation,
         )
 
     def _direct(
@@ -727,6 +753,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         context_committed: bool = False,
         transcript_finalized: bool = False,
         language_code: str | None = None,
+        generation: int | None = None,
     ) -> DirectAssistantResponse:
         runtime_config = getattr(vad_audio, "runtime_config", None)
         if language_code and runtime_config is not None:
@@ -743,6 +770,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             runtime_config=getattr(vad_audio, "runtime_config", None),
             context_committed=context_committed,
             transcript_finalized=transcript_finalized,
+            cancel_generation=generation,
         )
 
     def _commit_context(

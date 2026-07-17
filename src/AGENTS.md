@@ -14,6 +14,9 @@
 - Soft VAD endpoints settle for 250 ms. A newer uncommitted audio revision cancels the obsolete transport while retaining and resubmitting combined captured audio.
 - Direct audio, transcript fallback, optional preview, and post-tool generation share one conversation-scoped model-operation coordinator. Optional previews drop while occupied; required operations serialize.
 - Cancellable model streams use async-task cancellation behind the synchronous handlers. Do not replace this with cross-thread `httpx.Client.close()`: on Windows it can return locally while llama.cpp keeps the inference slot busy.
+- Direct-audio cancellation identity must propagate through `DirectAssistantResponse`, `DirectAssistantRequest`, LLM chunks, response end, TTS input, and PCM output. A stale generation must be discarded before it can occupy external TTS.
+- The external FasterQwen3TTS PCM stream also uses the async-task-owned cancellation transport. Keep phrase coalescing bounded so a delayed long response cannot become one oversized blocking request.
+- `max_response_tokens` is conversation-scoped through `pipeline.config.update`, defaults to 384, and constrains assistant generation only. It must not alter the 30-turn exact-history policy or the 96-token transcript fallback.
 
 - Preserve the OpenAI Realtime-compatible `/v1/realtime` protocol shape.
 - Keep `--stt gemma-audio` as the local direct-audio bypass mode; it must not load Parakeet or another ASR model.

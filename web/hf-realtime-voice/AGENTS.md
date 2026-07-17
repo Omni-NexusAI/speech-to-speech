@@ -28,6 +28,7 @@
 - Stop invalidates the active client before asynchronous teardown; closed-client mic, playback, tool, and WebSocket events must never change the idle UI or enter a replacement conversation.
 - Feed the exact playback worklet PCM into the capture worklet as a non-audible reference. Adaptive suppresses correlated echo but admits sustained double-talk; Strict suspends upload through the echo tail; Off preserves capture.
 - Keep native `echoCancellation`, `noiseSuppression`, and `autoGainControl` enabled and expose echo correlation, suppression, double-talk, and mode in diagnostics.
+- Adaptive echo guard may briefly confirm uncorrelated double-talk, but it must buffer and replay the accepted onset in order. The response-length setting is stored locally and sent as `max_response_tokens` with the next/local pipeline update; it does not change transcript or history behavior.
 
 ## Child DOX Index
 

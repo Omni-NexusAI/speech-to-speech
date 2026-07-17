@@ -7,7 +7,11 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from speech_to_speech.pipeline.cancellable_http import CancellableAsyncSSEStream, StreamCancelled
+from speech_to_speech.pipeline.cancellable_http import (
+    CancellableAsyncByteStream,
+    CancellableAsyncSSEStream,
+    StreamCancelled,
+)
 
 
 class _BlockingResponse:
@@ -23,6 +27,10 @@ class _BlockingResponse:
     async def aiter_lines(self):
         await asyncio.Event().wait()
         yield "unreachable"
+
+    async def aiter_bytes(self):
+        await asyncio.Event().wait()
+        yield b"unreachable"
 
 
 class _BlockingClient:
@@ -79,3 +87,34 @@ def test_close_before_worker_start_is_honored():
 
     with pytest.raises(StreamCancelled):
         stream.wait_for_headers()
+
+
+def test_close_cancels_async_binary_transport_waiting_for_pcm(monkeypatch):
+    monkeypatch.setattr(httpx, "AsyncClient", _BlockingClient)
+    stream = CancellableAsyncByteStream(
+        "POST",
+        "http://tts.invalid/v1/audio/speech",
+        json_body={"stream": True},
+    )
+    observed = SimpleNamespace(error=None)
+    started = threading.Event()
+
+    def consume() -> None:
+        try:
+            stream.wait_for_headers()
+            started.set()
+            list(stream.iter_bytes())
+        except BaseException as exc:
+            observed.error = exc
+
+    thread = threading.Thread(target=consume)
+    thread.start()
+    assert started.wait(1.0)
+    stream.close()
+    thread.join(1.0)
+
+    assert not thread.is_alive()
+    assert stream.closed
+    # The consumer exits immediately after a deliberate cancellation. It does
+    # not surface a transport error that would poison the next TTS request.
+    assert observed.error is None

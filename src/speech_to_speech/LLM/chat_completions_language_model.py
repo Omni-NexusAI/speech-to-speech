@@ -224,6 +224,11 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
                 **self.gen_kwargs,
                 **create_kwargs,
             }
+            local_pipeline = getattr(runtime_config, "local_pipeline", None) or {}
+            try:
+                payload["max_tokens"] = min(1024, max(64, int(local_pipeline.get("max_response_tokens", payload.get("max_tokens", 384)))))
+            except (TypeError, ValueError):
+                payload["max_tokens"] = 384
             if extra_body:
                 payload.update(extra_body)
             headers = {"Content-Type": "application/json"}

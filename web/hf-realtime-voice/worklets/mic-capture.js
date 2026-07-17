@@ -33,7 +33,9 @@ const GATE_RELEASE_MS = 80; // then fade closed over this long (no click)
 const ECHO_HISTORY_MS = 400;
 const ECHO_MAX_LAG_MS = 250;
 const ECHO_TAIL_MS = 250;
-const DOUBLE_TALK_MS = 160;
+// Adaptive mode waits briefly to distinguish real speech from room playback,
+// but preserves the onset in a short local buffer.
+const DOUBLE_TALK_MS = 80;
 const ECHO_CORRELATION_MIN = 0.65;
 const ECHO_RESIDUAL_MAX = 0.65;
 const REFERENCE_ACTIVE_RMS = 0.001;
@@ -57,6 +59,7 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
     this._referenceHistory = new Float32Array(0);
     this._echoTailRemaining = 0;
     this._doubleTalkSamples = 0;
+    this._pendingHumanChunks = [];
     this._suppressedMs = 0;
     this._echoMetricCounter = 0;
 
@@ -207,9 +210,25 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
         this._doubleTalkSamples = 0;
       }
       const doubleTalk = this._doubleTalkSamples >= Math.round((DOUBLE_TALK_MS / 1000) * TARGET_RATE);
-      const suppressEcho = this._echoMode === "strict"
-        ? playbackActive
-        : this._echoMode === "adaptive" && playbackActive && (echoDominant || !doubleTalk);
+      let framesToSend = [dec];
+      let suppressEcho = this._echoMode === "strict" ? playbackActive : false;
+      if (this._echoMode === "adaptive" && playbackActive) {
+        if (echoDominant) {
+          this._pendingHumanChunks = [];
+          suppressEcho = true;
+        } else if (rms >= HUMAN_ACTIVE_RMS && !doubleTalk) {
+          this._pendingHumanChunks.push(dec.slice());
+          if (this._pendingHumanChunks.length > 3) this._pendingHumanChunks.shift();
+          framesToSend = [];
+          suppressEcho = true;
+        } else if (doubleTalk) {
+          framesToSend = [...this._pendingHumanChunks, dec];
+          this._pendingHumanChunks = [];
+        }
+      } else if (this._pendingHumanChunks.length) {
+        framesToSend = [...this._pendingHumanChunks, dec];
+        this._pendingHumanChunks = [];
+      }
       if (suppressEcho) this._suppressedMs += (n / TARGET_RATE) * 1000;
 
       // 2. Decide the gate target for this chunk, then ramp sample-by-sample.
@@ -224,15 +243,19 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
         }
       }
 
-      // 3. Apply the (smoothed) gain and pack to Int16.
-      const out = new Int16Array(n);
+      // 3. Pack any confirmation-buffered human onset before this frame.
       let gain = this._gateGain;
-      for (let i = 0; i < n; i++) {
-        const coef = target > gain ? this._attackCoef : this._releaseCoef;
-        gain = target + (gain - target) * coef;
-        const s = dec[i] * gain * (suppressEcho ? 0 : 1);
-        const clamped = s < -1 ? -1 : s > 1 ? 1 : s;
-        out[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+      const packedFrames = [];
+      for (const frame of framesToSend) {
+        const out = new Int16Array(n);
+        for (let i = 0; i < n; i++) {
+          const coef = target > gain ? this._attackCoef : this._releaseCoef;
+          gain = target + (gain - target) * coef;
+          const s = frame[i] * gain * (suppressEcho ? 0 : 1);
+          const clamped = s < -1 ? -1 : s > 1 ? 1 : s;
+          out[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+        }
+        packedFrames.push(out);
       }
       this._gateGain = gain;
 
@@ -261,7 +284,9 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
       }
 
       if (this._enabled) {
-        this.port.postMessage(out.buffer, [out.buffer]);
+        for (const out of packedFrames) {
+          this.port.postMessage(out.buffer, [out.buffer]);
+        }
       }
       // When disabled (mic muted) we silently consume input so the worklet
       // stays alive and the buffer never grows unbounded.

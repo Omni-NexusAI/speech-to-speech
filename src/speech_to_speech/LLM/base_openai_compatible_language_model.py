@@ -672,9 +672,14 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     turn_revision=request.turn_revision,
                     speech_stopped_at_s=request.speech_stopped_at_s,
                     tools=request.tools,
+                    cancel_generation=request.cancel_generation,
                 )
             if request.is_final:
-                yield EndOfResponse(turn_id=request.turn_id, turn_revision=request.turn_revision)
+                yield EndOfResponse(
+                    turn_id=request.turn_id,
+                    turn_revision=request.turn_revision,
+                    cancel_generation=request.cancel_generation,
+                )
             return
         runtime_config = request.runtime_config
         response = request.response

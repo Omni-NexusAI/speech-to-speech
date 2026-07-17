@@ -65,7 +65,7 @@ class RuntimeConfig(BaseModel):
         default_factory=lambda: RealtimeSessionCreateRequest(type="realtime"),
         validate_default=True,
     )
-    local_pipeline: dict[str, Any] = Field(default_factory=dict)
+    local_pipeline: dict[str, Any] = Field(default_factory=lambda: {"max_response_tokens": 384})
     model_endpoint: ModelEndpointConfig = Field(default_factory=ModelEndpointConfig)
 
     @field_validator("session", mode="after")
