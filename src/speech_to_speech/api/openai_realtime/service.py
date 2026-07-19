@@ -621,14 +621,15 @@ class RealtimeService:
 
         cfg = st.runtime_config
         transcript = event.transcript
-        if transcript and not event.context_committed:
+        context_transcript = None if event.display_only else transcript
+        if context_transcript and not event.context_committed:
             if same_speculative_turn and st.speculative_user_item_id:
-                replaced = cfg.chat.replace_user_message_text(st.speculative_user_item_id, transcript)
+                replaced = cfg.chat.replace_user_message_text(st.speculative_user_item_id, context_transcript)
                 if not replaced:
-                    item = cfg.chat.add_item(make_user_message(transcript))
+                    item = cfg.chat.add_item(make_user_message(context_transcript))
                     st.speculative_user_item_id = item.id
             else:
-                item = cfg.chat.add_item(make_user_message(transcript))
+                item = cfg.chat.add_item(make_user_message(context_transcript))
                 st.speculative_user_item_id = item.id
         elif not event.context_committed and same_speculative_turn and st.speculative_user_item_id:
             cfg.chat.remove_user_message(st.speculative_user_item_id)
@@ -657,7 +658,7 @@ class RealtimeService:
                 event.turn_id,
                 event.turn_revision,
             )
-        elif queue and transcript:
+        elif queue and context_transcript:
             st.response_pending = True
             queue.put(
                 GenerateResponseRequest(

@@ -129,8 +129,10 @@ def test_live_transcript_toggle_only_controls_the_floating_user_bubble():
     chat_js = (ui_dir / "ui" / "chat.js").read_text(encoding="utf-8")
 
     assert "showUserBubble: settings.liveTranscript" in main_js
-    assert "if (options.showUserBubble)" in chat_js
+    assert "if (options.showUserBubble && (d.partial" in chat_js
     assert "this._pendingUserHist || this._appendHistMsg" in chat_js
+    assert "Speech could not be transcribed." not in main_js
+    assert "discardPendingUserTurn" not in chat_js
 
 
 def test_tool_output_is_acknowledged_before_one_post_tool_response():

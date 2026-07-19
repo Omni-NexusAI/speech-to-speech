@@ -1,3 +1,5 @@
+import json
+from queue import Queue
 from threading import Event
 from types import SimpleNamespace
 
@@ -142,15 +144,9 @@ def test_final_transcript_accepts_narrow_equivalent_labels():
     ) is None
 
 
-def test_missing_primary_transcript_uses_one_transcript_only_fallback():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
-    calls = []
-    handler._transcribe_once = lambda vad: calls.append(vad.turn_id) or "What did the search find?"
-    vad_audio = SimpleNamespace(turn_id="turn_2", turn_revision=0)
-
-    assert handler._final_transcript(vad_audio, None) == "What did the search find?"
-    assert calls == ["turn_2"]
+def test_final_transcript_has_no_second_request_fallback():
+    assert not hasattr(GemmaAudioSTTHandler, "_transcribe_once")
+    assert not hasattr(GemmaAudioSTTHandler, "_final_transcript")
 
 
 def test_unicode_assistant_text_is_preserved_without_console_output():
@@ -314,10 +310,9 @@ def test_parallel_opaque_tool_ids_are_normalized_and_unique():
     assert [tool.call_id for tool in tools] == ["call_opaque", "call_opaque_1"]
 
 
-def test_invalid_direct_turn_emits_ui_only_transcript_failure_without_spoken_retry():
+def test_missing_transcript_preserves_assistant_output_without_polluting_context():
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    handler._transcribe_once = lambda _vad: None
     chat = Chat(30)
     vad_audio = SimpleNamespace(
         runtime_config=RuntimeConfig(chat=chat),
@@ -326,12 +321,126 @@ def test_invalid_direct_turn_emits_ui_only_transcript_failure_without_spoken_ret
         created_at_s=0.0,
     )
 
-    outputs = list(handler._responses_from_text("ASSISTANT_RESPONSE: fabricated response", vad_audio))
+    outputs = list(handler._responses_from_text("ASSISTANT_RESPONSE: I heard you.", vad_audio))
 
     assert outputs[0].transcript is None
-    assert outputs[0].text == ""
+    assert outputs[0].text == "I heard you."
     assert outputs[0].tools == []
     assert chat.buffer == []
+
+
+def test_missing_transcript_emits_display_only_user_audio_and_one_tts_sequence():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    chat = Chat(30)
+    vad_audio = SimpleNamespace(
+        runtime_config=RuntimeConfig(chat=chat),
+        turn_id="turn_audio",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+    direct = list(handler._responses_from_text("ASSISTANT_RESPONSE: Ready.", vad_audio))[0]
+    queue = Queue()
+    notifier = object.__new__(TranscriptionNotifier)
+    notifier.setup(text_output_queue=queue, runtime_config=None, should_listen=Event())
+
+    requests = list(notifier.process(direct))
+    completed = queue.get_nowait()
+    outputs = list(object.__new__(_PassThroughHandler).process(requests[0]))
+
+    assert completed.transcript == "[User audio]"
+    assert completed.display_only is True
+    assert completed.direct_audio_completed is True
+    assert [item.text for item in outputs if isinstance(item, LLMResponseChunk)] == ["Ready."]
+    assert outputs[-1].tag == "end_of_response"
+    assert chat.buffer == []
+
+
+class _FakeSSEStream:
+    def __init__(self, lines):
+        self._lines = lines
+        self.closed = False
+
+    def wait_for_headers(self):
+        return None
+
+    def iter_lines(self):
+        yield from self._lines
+
+    def close(self):
+        self.closed = True
+
+
+def _sse_text(text: str) -> list[str]:
+    return [f"data: {json.dumps({'choices': [{'delta': {'content': text}}]})}", "data: [DONE]"]
+
+
+def test_twelve_accepted_turns_make_one_primary_request_each_when_turn_nine_has_no_transcript():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
+    chat = Chat(30)
+    calls = []
+
+    def stream_request(_url, payload, *, api_key):
+        turn = len(calls) + 1
+        calls.append(payload)
+        prefix = "" if turn == 9 else f"USER_TRANSCRIPT: request {turn}\n"
+        return _FakeSSEStream(
+            _sse_text(f"{prefix}ASSISTANT_LANGUAGE: English\nASSISTANT_RESPONSE: answer {turn}.")
+        )
+
+    handler._stream_request = stream_request
+    all_outputs = []
+    for turn in range(1, 13):
+        vad_audio = SimpleNamespace(
+            audio=np.zeros(1600, dtype=np.float32),
+            mode="final",
+            runtime_config=RuntimeConfig(chat=chat),
+            turn_id=f"turn_{turn}",
+            turn_revision=0,
+            created_at_s=0.0,
+        )
+        outputs = list(handler.process(vad_audio))
+        all_outputs.append(outputs)
+        assert "".join(output.text for output in outputs) == f"answer {turn}."
+
+    turn_nine_final = all_outputs[8][-1]
+    assert len(calls) == 12
+    assert turn_nine_final.transcript is None
+    assert all_outputs[9][-1].is_final is True
+    assert chat.stats()["turns"] == 11
+
+
+@pytest.mark.parametrize(
+    "audio",
+    [
+        np.zeros(1600, dtype=np.float32),
+        np.tile(np.array([0.01, -0.01], dtype=np.float32), 800),
+    ],
+)
+def test_every_vad_accepted_audio_fixture_reaches_gemma_and_empty_output_closes(audio):
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
+    requests = []
+    handler._stream_request = lambda _url, payload, *, api_key: (
+        requests.append(payload) or _FakeSSEStream(["data: [DONE]"])
+    )
+    vad_audio = SimpleNamespace(
+        audio=audio,
+        mode="final",
+        runtime_config=RuntimeConfig(chat=Chat(30)),
+        turn_id="turn_accepted",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+
+    outputs = list(handler.process(vad_audio))
+
+    assert len(requests) == 1
+    assert len(outputs) == 1
+    assert outputs[0].text == ""
+    assert outputs[0].tools == []
+    assert outputs[0].is_final is True
 
 def test_direct_response_records_language_for_post_tool_tts():
     handler = object.__new__(GemmaAudioSTTHandler)

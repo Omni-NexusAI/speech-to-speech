@@ -11,7 +11,7 @@
 ## Local Voice-Agent Testing Contract
 
 - Local realtime defaults retain 30 complete turns with compaction disabled; context is session-scoped and resets with the WebSocket/backend.
-- Every completed direct-audio turn produces a validated final user transcript for history and context. The live-transcription toggle controls only the temporary speaking bubble.
+- VAD is the only direct-audio admission boundary. A completed accepted turn always reaches Gemma once; transcript metadata is optional and must never gate assistant text, tools, or response completion. The live-transcription toggle controls only the temporary speaking bubble.
 - Context diagnostics report retained history tokens against the live llama.cpp context window; turn retention remains a separate 30-turn policy.
 - `scripts/local_realtime.ps1` is the managed background entry point; foreground launchers remain available for raw-console debugging.
 - Model provider selection is conversation-scoped. Remote completely replaces local Gemma operations without fallback; TTS selection remains independent.

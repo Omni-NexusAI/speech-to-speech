@@ -355,7 +355,7 @@ export class ChatView {
       // refreshed on every delta, so it stays while the user keeps talking and
       // fades a few seconds after they stop — no dependency on a response ever
       // arriving, so it can never get stuck.
-      if (options.showUserBubble) {
+      if (options.showUserBubble && (d.partial || (this._activeUserItemId === id && this._activeUserBubble))) {
         if (this._activeUserItemId !== id || !this._activeUserBubble) {
           this._activeUserBubble = this._spawnBubble("user", text);
           this._activeUserItemId = id;
@@ -391,11 +391,6 @@ export class ChatView {
     this._markUnread();
   }
 
-  discardPendingUserTurn() {
-    if (this._pendingUserHist) this._pendingUserHist.remove();
-    this._pendingUserHist = null;
-  }
-
   /**
    * A response closed (completed or cancelled).
    * @param {{ responseId: string; status: string; audible?: boolean; transcript?: string }} detail
@@ -406,13 +401,6 @@ export class ChatView {
     // Without an id we can't target a specific response; the bubble will
     // auto-dismiss on its own timer regardless.
     if (!responseId) return;
-    if (this._pendingUserHist && status !== "cancelled") {
-      // A missing validated transcript is absence of data, not user text.
-      // Remove the chronology reservation instead of displaying a fabricated
-      // placeholder in conversation history.
-      this._pendingUserHist.remove();
-      this._pendingUserHist = null;
-    }
     const entry = this._asstByResp.get(responseId);
 
     if (status === "cancelled") {

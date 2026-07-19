@@ -21,6 +21,8 @@ from speech_to_speech.pipeline.queue_types import TextEventItem
 
 logger = logging.getLogger(__name__)
 
+_DIRECT_AUDIO_PLACEHOLDER = "[User audio]"
+
 
 class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
     """Sits between STT and LLM.
@@ -51,7 +53,7 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
             text = transcription.text.strip()
             transcript = (transcription.transcript or "").strip()
             runtime_config = transcription.runtime_config or self.runtime_config
-            if transcript and self.text_output_queue is not None:
+            if self.text_output_queue is not None:
                 transcript_key = (transcription.turn_id, transcription.turn_revision)
                 should_finalize = (
                     (transcription.is_final or transcription.transcript_finalized)
@@ -61,16 +63,17 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
                     self._finalized_direct_transcripts.add(transcript_key)
                     self.text_output_queue.put(
                         TranscriptionCompletedEvent(
-                            transcript=transcript,
+                            transcript=transcript or _DIRECT_AUDIO_PLACEHOLDER,
                             language_code=transcription.language_code,
                             turn_id=transcription.turn_id,
                             turn_revision=transcription.turn_revision,
                             speech_stopped_at_s=transcription.speech_stopped_at_s,
                             context_committed=transcription.context_committed,
+                            display_only=not bool(transcript),
                             direct_audio_completed=True,
                         )
                     )
-                elif not transcription.is_final:
+                elif transcript and not transcription.is_final:
                     self.text_output_queue.put(
                         PartialTranscriptionEvent(
                             delta=transcript,

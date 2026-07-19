@@ -66,7 +66,7 @@ The UI runs on `http://127.0.0.1:7862` and should point Settings to `http://127.
 
 ## Remote multimodal model
 
-Settings can switch model inference from **Local** to a conversation-scoped **Remote** OpenAI-compatible endpoint. Enter its `/v1` URL, model name, and optional bearer key, then use **Test model connection** before restarting the conversation. Remote selection replaces local Gemma for direct audio, transcription fallback and preview, camera/tool selection, post-tool generation, model identity, tokenization, and context discovery. It never silently falls back to Local; FasterQwen3TTS remains separately selected.
+Settings can switch model inference from **Local** to a conversation-scoped **Remote** OpenAI-compatible endpoint. Enter its `/v1` URL, model name, and optional bearer key, then use **Test model connection** before restarting the conversation. Remote selection replaces local Gemma for direct audio, optional live preview, camera/tool selection, post-tool generation, model identity, tokenization, and context discovery. It never silently falls back to Local; FasterQwen3TTS remains separately selected.
 
 On the model machine, expose llama.cpp to the LAN and enable the tool-compatible chat template, for example:
 
@@ -82,7 +82,7 @@ The realtime backend and UI can start while local Gemma is unavailable. Local en
 
 - No separate ASR model is used in `gemma-audio` mode.
 - A VAD soft endpoint waits 250 ms before launching Gemma. Speech that resumes within the seven-second reopen window keeps its captured audio, cancels any obsolete uncommitted generation, and submits one combined latest revision.
-- Direct audio, transcript fallback, optional previews, and post-tool generation share one model-operation coordinator. Only one request can occupy the selected Local or Remote endpoint; optional previews are dropped while it is busy.
+- Direct audio, optional previews, and post-tool generation share one model-operation coordinator. Only one request can occupy the selected Local or Remote endpoint; optional previews are dropped while it is busy. VAD is the sole audio-admission boundary: transcript metadata comes only from the primary request and cannot reject audio, trigger another request, suppress an answer, or block a tool call.
 - Post-tool responses use streamed Chat Completions and dispatch the first complete sentence to TTS. A barge-in actively closes the obsolete stream; if transport shutdown exceeds two seconds, that generation is detached and its late output is rejected without ending the conversation.
 - Faster on `8881` is the default. A Settings provider change is conversation-scoped and takes effect on the next conversation.
 - Voice defaults to `clone:16d9bb336799`, displayed as `J.A.R.V.I.S`.
@@ -107,7 +107,7 @@ Add `-Component frontend` or `-Component backend` to scope an action, and `-Open
 
 # Conversation context
 
-The local direct-audio mode keeps the latest 30 complete turns with `compact_history` disabled. System instructions live outside that bounded buffer. Progressive transcript previews are display-only; the final transcript, assistant response, function calls, and tool outputs share one session-scoped history. Context diagnostics report counts and trimming events without logging conversation text.
+The local direct-audio mode keeps the latest 30 complete turns with `compact_history` disabled. System instructions live outside that bounded buffer. Progressive transcript previews are display-only. A validated primary transcript and its assistant response share session history; when transcript metadata is absent, the UI shows `[User audio]` without adding the placeholder or an assistant-only exchange to model history. Function calls and outputs remain retained for tool continuity. Context diagnostics report counts and trimming events without logging conversation text.
 
 # Tool follow-ups
 

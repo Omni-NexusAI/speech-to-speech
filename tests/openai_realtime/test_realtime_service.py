@@ -1421,6 +1421,30 @@ class TestDispatchPipelineEvent:
         assert text_prompt_queue.empty()
         assert service._state(conn_id).response_pending is False
 
+    def test_direct_audio_display_placeholder_never_enters_model_context(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        text_prompt_queue,
+    ):
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(
+                transcript="[User audio]",
+                display_only=True,
+                turn_id="turn_audio",
+                turn_revision=0,
+                direct_audio_completed=True,
+            ),
+        )
+
+        assert len(events) == 1
+        assert events[0].transcript == "[User audio]"
+        assert runtime_config.chat.buffer == []
+        assert text_prompt_queue.empty()
+        assert service._state(conn_id).response_pending is False
+
     def test_explicit_response_create_remains_available_after_direct_audio_completion(
         self,
         service,

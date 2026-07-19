@@ -338,8 +338,8 @@ let ttsBackendStatuses = {};
 let diagnosticsOpen = localStorage.getItem(STORAGE_KEYS.diagnostics) === "1";
 /** @type {Array<any>} */
 let pipelineMetrics = [];
-const EXPECTED_UI_API_VERSION = 6;
-const EXPECTED_BACKEND_API_VERSION = 4;
+const EXPECTED_UI_API_VERSION = 7;
+const EXPECTED_BACKEND_API_VERSION = 5;
 const DIAGNOSTIC_STAGES = ["mic", "echo_guard", "vad", "transcription", "gemma", "context", "tool", "tts", "playback"];
 const DIAGNOSTIC_STAGE_LABELS = { echo_guard: "Echo Guard" };
 const diagnosticWarnings = new Map();
@@ -1711,10 +1711,6 @@ async function doStart(audioContext = null) {
     if (metric.source === "backend") {
       clearTimeout(backendMetricTimer);
       setDiagnosticWarning("backend-metrics");
-    }
-    if (metric.stage === "transcription" && metric.status === "failed") {
-      chat.discardPendingUserTurn();
-      setCaption("Speech could not be transcribed.", "muted");
     }
     addPipelineMetric(metric);
   });

@@ -62,6 +62,9 @@ class TranscriptionCompletedEvent(PipelineEvent):
     turn_revision: int | None = None
     speech_stopped_at_s: float | None = Field(default=None, exclude=True)
     context_committed: bool = Field(default=False, exclude=True)
+    # Direct-audio mode may publish a UI-only placeholder when Gemma omits
+    # optional transcript metadata. It must never enter model context.
+    display_only: bool = Field(default=False, exclude=True)
     # Direct-audio Gemma already generated the assistant response for this turn.
     # The realtime service must close the transcription item without starting the
     # regular text-only response path a second time.

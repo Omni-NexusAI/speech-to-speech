@@ -19,7 +19,7 @@
 - When the backend emits `pipeline.metric`, keep the UI rendering lightweight and diagnostic-only; do not infer pipeline state by duplicating backend logic in the browser.
 - Local runtime toggles and TTS backend selection use `pipeline.config.update`, leaving OpenAI-compatible `session.update` for standard voice/instructions/tool fields.
 - Send tool output, optional camera image, and one follow-up `response.create` immediately in hosted order. The backend owns the call-ID barrier; never replay a rejected create on a later user turn.
-- Speech stop reserves persistent user chronology. Replace it with a validated final transcript before assistant or tool UI; if final transcription fails, show only a temporary UI notice and never insert fabricated text or a canned spoken retry.
+- Speech stop reserves persistent user chronology. Replace it with validated transcript metadata when available or persistent `[User audio]` when absent; the placeholder is display-only and transcript availability never controls assistant or tool UI.
 - The live-transcription setting controls only the temporary floating user bubble. Final user text always updates the persistent conversation panel.
 - Diagnostics label the always-on final stage `Transcription` and show retained history tokens against the context window detected from llama.cpp.
 - Camera preview and Diagnostics should not occupy the same desktop corner; keep the camera self-view clear when diagnostics are open.
