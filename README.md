@@ -526,7 +526,9 @@ See [VADHandlerArguments](./src/speech_to_speech/arguments_classes/vad_arguments
 - `--min_speech_continuation_ms`: sustain-bar hysteresis threshold for speech that continues a reopenable soft-ended, uncommitted turn within the reopen window. The default and recommended pairing is `--min_speech_ms 384 --min_speech_continuation_ms 192`.
 - `--min_silence_ms`: minimum length of silence intervals for segmenting speech. Default is 64 ms.
 - `--short_segment_merge_ms`: optional merge window for stitching adjacent VAD segments that are each shorter than `--min_speech_ms`.
-- `--unanswered_reopen_ms`: sanity cap on how long a soft-ended speculative turn that has not yet received any assistant output stays reopenable.
+- `--unanswered_reopen_ms`: fixed continuation horizon anchored to the first soft endpoint. Later fragments do not slide the deadline.
+- `--max_speculative_revisions`: maximum confirmed continuation revisions for one unanswered turn. Default is 8.
+- `--max_speculative_audio_ms`: maximum combined audio that remains eligible for continuation. Default is 30000 ms.
 
 ### STT, LLM, and TTS Parameters
 

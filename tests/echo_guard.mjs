@@ -42,6 +42,30 @@ function hasSignal(buffer) {
   return buffer.some((sample) => Math.abs(sample) > 8);
 }
 
+function deterministicNoise(length) {
+  const values = new Float32Array(length);
+  let state = 0x12345678;
+  for (let i = 0; i < length; i++) {
+    state = (1664525 * state + 1013904223) >>> 0;
+    values[i] = (((state / 0xffffffff) * 2) - 1) * 0.15;
+  }
+  return values;
+}
+
+function roomEcho(reference, delaySamples) {
+  const values = new Float32Array(reference.length);
+  for (let i = 0; i < values.length; i++) {
+    const direct = i - delaySamples;
+    const reflectionA = direct - 240;
+    const reflectionB = direct - 600;
+    values[i] =
+      (direct >= 0 ? reference[direct] * 0.55 : 0)
+      + (reflectionA >= 0 ? reference[reflectionA] * 0.23 : 0)
+      + (reflectionB >= 0 ? reference[reflectionB] * 0.11 : 0);
+  }
+  return values;
+}
+
 const echo = tone(440);
 
 const adaptive = configure("adaptive");
@@ -66,5 +90,24 @@ const metric = doubleTalk.messages.find((value) => value?.kind === "echo_metric"
 assert.ok(metric, "echo diagnostics are emitted");
 assert.equal(metric.nativeAec, true);
 assert.equal(metric.doubleTalk, true);
+
+const delayed = configure("adaptive");
+const longReference = deterministicNoise(INPUT_SAMPLES * 9);
+const delayedEcho = roomEcho(longReference, Math.round(sampleRate * 0.08));
+for (let offset = 0; offset < longReference.length; offset += INPUT_SAMPLES) {
+  delayed._ingest(
+    delayedEcho.subarray(offset, offset + INPUT_SAMPLES),
+    longReference.subarray(offset, offset + INPUT_SAMPLES),
+  );
+}
+const delayedMetric = delayed.messages.filter((value) => value?.kind === "echo_metric").at(-1);
+assert.ok(delayedMetric, "delayed echo diagnostics are emitted");
+assert.ok(delayedMetric.lagMs >= 40 && delayedMetric.lagMs <= 120, "adaptive mode tracks room delay");
+assert.equal(hasSignal(outputBuffers(delayed).at(-1)), false, "adaptive mode suppresses delayed reverberant echo");
+assert.ok(Number.isFinite(delayedMetric.erleDb), "adaptive diagnostics report finite ERLE");
+
+delayed.port.onmessage({ data: { kind: "echo_reset" } });
+assert.equal(delayed._referenceHistory.length, 0, "echo reset clears playback history");
+assert.equal(delayed._echoDelaySamples, 0, "echo reset clears delay state");
 
 console.log("echo guard tests passed");

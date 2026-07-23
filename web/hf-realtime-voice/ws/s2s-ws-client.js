@@ -514,6 +514,8 @@ export class S2sWsRealtimeClient extends EventTarget {
               native_aec: !!data.nativeAec,
               correlation: Number(data.correlation || 0),
               residual: Number(data.residual || 0),
+              residual_energy: Number(data.residualEnergy || 0),
+              erle_db: Number(data.erleDb || 0),
               lag_ms: Number(data.lagMs || 0),
               suppressed_ms: Number(data.suppressedMs || 0),
               double_talk: !!data.doubleTalk,
@@ -1183,6 +1185,7 @@ export class S2sWsRealtimeClient extends EventTarget {
     this._closed = true;
     this._sessionConfigured = false;
     this._muted = true;
+    this._captureNode?.port.postMessage({ kind: "echo_reset" });
     this._captureNode?.port.postMessage({ kind: "enable", value: false });
     this._playbackNode?.port.postMessage({ kind: "clear" });
     for (const track of this.options.micStream?.getTracks?.() ?? []) {

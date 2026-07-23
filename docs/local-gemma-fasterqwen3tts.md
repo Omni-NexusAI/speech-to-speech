@@ -81,9 +81,10 @@ The realtime backend and UI can start while local Gemma is unavailable. Local en
 ## Notes
 
 - No separate ASR model is used in `gemma-audio` mode.
-- A VAD soft endpoint waits 250 ms before launching Gemma. Speech that resumes within the seven-second reopen window keeps its captured audio, cancels any obsolete uncommitted generation, and submits one combined latest revision.
+- A VAD soft endpoint waits 250 ms before launching Gemma. The seven-second continuation horizon is anchored to the first soft endpoint and never slides forward. Continuations require 192 ms of confirmed speech and are bounded to eight revisions or 30 seconds of combined audio; a bound starts a new turn without dropping the new fragment.
 - Direct audio, optional previews, and post-tool generation share one model-operation coordinator. Only one request can occupy the selected Local or Remote endpoint; optional previews are dropped while it is busy. VAD is the sole audio-admission boundary: transcript metadata comes only from the primary request and cannot reject audio, trigger another request, suppress an answer, or block a tool call.
-- Post-tool responses use streamed Chat Completions and dispatch the first complete sentence to TTS. A barge-in actively closes the obsolete stream; if transport shutdown exceeds two seconds, that generation is detached and its late output is rejected without ending the conversation.
+- Direct and post-tool timeouts close the active stream, emit one failed completion, release response ownership, and resume listening without canned speech. Post-tool responses use streamed Chat Completions and dispatch the first complete sentence to TTS. A barge-in actively closes the obsolete stream; if transport shutdown exceeds two seconds, that generation is detached and its late output is rejected without ending the conversation.
+- Tool responses may include an optional model-generated `ASSISTANT_PREAMBLE`. It is spoken and retained before the native function call; no scripted fallback is synthesized when it is omitted.
 - Faster on `8881` is the default. A Settings provider change is conversation-scoped and takes effect on the next conversation.
 - Voice defaults to `clone:16d9bb336799`, displayed as `J.A.R.V.I.S`.
 - The realtime UI lists saved Voice Studio profiles from `profiles/*/meta.json` and only exposes `Base` clone profiles.
@@ -91,7 +92,7 @@ The realtime backend and UI can start while local Gemma is unavailable. Local en
 - Pretrained Qwen voices are intentionally hidden for this local test path.
 - Both providers receive `stream: true`, `response_format: pcm`, the selected clone ID, and an explicit assistant language when Gemma supplies one. Cyrillic, Japanese, Korean, and Chinese script detection is a fallback only.
 - TTS streams are cancelled on Stop/disconnect and aborted when they exceed `min(60s, max(12s, 3x estimated speech duration + 5s))`.
-- Assistant echo guard defaults to **Adaptive**: the browser combines native AEC with the exact playback PCM as a capture-worklet reference, retains a 250 ms tail, and admits sustained uncorrelated human speech. **Strict** suspends microphone upload during playback/tail; **Off** disables the additional reference guard.
+- Assistant echo guard defaults to **Adaptive**: the browser combines native AEC with the exact generated playback PCM, a 0-250 ms delay search, and a 512-tap normalized adaptive filter. It retains a 250 ms tail and releases buffered uncorrelated human speech after about 160 ms. The static voice-clone reference recording is never used for echo cancellation. **Strict** suspends microphone upload during playback/tail; **Off** disables the additional reference guard.
 # Managed lifecycle
 
 Use the tracked background launcher for routine local testing:

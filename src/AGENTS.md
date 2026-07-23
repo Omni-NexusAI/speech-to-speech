@@ -11,7 +11,7 @@
 - Local history retains 30 complete turns without automatic summarization and emits content-free context metrics when committed or trimmed.
 - The realtime backend publishes runtime identity through `/v1/pool` and `pipeline.runtime`; local UI diagnostics use it to detect stale backend code.
 - A Remote model endpoint must own every model operation for its conversation, including audio/transcription, vision/tools, follow-ups, tokenization, context discovery, and identity. Never probe or fall back to Local for that session.
-- Soft VAD endpoints settle for 250 ms. A newer uncommitted audio revision cancels the obsolete transport while retaining and resubmitting combined captured audio.
+- Soft VAD endpoints settle for 250 ms. Continuation requires 192 ms of confirmed speech and uses a fixed horizon anchored to the first soft endpoint; it is bounded to eight revisions and 30 seconds of combined audio. A newer uncommitted revision cancels only the obsolete transport while retaining captured audio.
 - Direct audio, optional preview, and post-tool generation share one conversation-scoped model-operation coordinator. Optional previews drop while occupied; required operations serialize.
 - Cancellable model streams use async-task cancellation behind the synchronous handlers. Do not replace this with cross-thread `httpx.Client.close()`: on Windows it can return locally while llama.cpp keeps the inference slot busy.
 - Direct-audio cancellation identity must propagate through `DirectAssistantResponse`, `DirectAssistantRequest`, LLM chunks, response end, TTS input, and PCM output. A stale generation must be discarded before it can occupy external TTS.
@@ -38,6 +38,8 @@
 - Stop, disconnect, barge-in, and replacement sessions close active direct and post-tool Gemma streams plus active TTS HTTP streams before releasing the pipeline slot.
 - A model transport that does not close within two seconds is detached generation-safely. Its late events are rejected, while the conversation, context, and next response remain usable.
 - Post-tool Chat Completions stream from the selected endpoint and emit the first stable sentence to TTS without waiting for the complete answer.
+- Direct and post-tool transport failures must emit one failed `EndOfResponse`, release model/response ownership, and produce no canned assistant speech.
+- Native tool calls may carry an optional parsed `ASSISTANT_PREAMBLE`; retain it before the call and never synthesize a fallback preamble.
 - Disconnect cleanup flushes every intermediate handler queue before propagating `SESSION_END`, so abandoned speculative turns cannot delay a new session.
 - TTS provider selection is session-scoped: Faster on `8881` remains the default, while Groxaxo on `8882` is accepted only when Voice Studio already has a Base model loaded.
 

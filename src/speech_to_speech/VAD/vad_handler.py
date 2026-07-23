@@ -73,6 +73,8 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         speculative_turns: SpeculativeTurnTracker | None = None,
         speculative_reopen_ms: int = 1000,
         unanswered_reopen_ms: int = 7000,
+        max_speculative_revisions: int = 8,
+        max_speculative_audio_ms: int = 30000,
         short_segment_merge_ms: int = 0,
     ) -> None:
         self.should_listen = should_listen
@@ -90,6 +92,8 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         self.speculative_turns = speculative_turns
         self.speculative_reopen_ms = speculative_reopen_ms
         self.unanswered_reopen_ms = max(self.speculative_reopen_ms, unanswered_reopen_ms)
+        self.max_speculative_revisions = max(0, int(max_speculative_revisions))
+        self.max_speculative_audio_ms = max(0, int(max_speculative_audio_ms))
         self.short_segment_merge_ms = max(0, short_segment_merge_ms)
         self._last_turn_detection: dict | None = None
         self.model, _ = torch.hub.load(
@@ -134,7 +138,8 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         self._speculative_audio_prefix: np.ndarray | None = None
         self._last_final_wall_time: float | None = None
         self._last_final_audio_ms: int | None = None
-        self._pending_reopen_candidate: tuple[str, int, int] | None = None
+        self._reopen_anchor_audio_ms: int | None = None
+        self._last_forced_new_turn_reason: str | None = None
         self._pending_short_segment: _PendingShortSegment | None = None
 
     @property
@@ -174,13 +179,13 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
             logger.info(f"VAD silence duration updated to {td['silence_duration_ms']}ms")
 
     def _start_new_turn(self) -> tuple[str, int]:
-        self._cancel_pending_reopen()
         self._turn_counter += 1
         self._current_turn_id = f"turn_{self._turn_counter}"
         self._current_turn_revision = 0
         self._speculative_audio_prefix = None
         self._last_final_wall_time = None
         self._last_final_audio_ms = None
+        self._reopen_anchor_audio_ms = None
         if self.speculative_turns:
             self.speculative_turns.observe(self._current_turn_id, self._current_turn_revision)
         return self._current_turn_id, self._current_turn_revision
@@ -213,85 +218,43 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
 
     def _active_speech_min_ms(self, start_ms: int) -> float:
         """Duration hysteresis for speech that continues a reopenable turn."""
-        if self._pending_reopen_candidate is not None or self._should_reopen_current_turn(start_ms):
+        if self._should_reopen_current_turn(start_ms):
             return self.min_speech_continuation_ms
         return self.min_speech_ms
 
-    def _should_reopen_current_turn(self, audio_start_ms: int) -> bool:
+    def _combined_audio_duration_ms(self) -> float:
+        prefix = getattr(self, "_speculative_audio_prefix", None)
+        if prefix is None:
+            return 0.0
+        return len(prefix) / self.sample_rate * 1000
+
+    def _reopen_block_reason(self, audio_start_ms: int) -> str | None:
         if not self._uses_realtime_turn_handling():
-            return False
-        if self._current_turn_id is None or self._current_turn_revision is None or self._last_final_audio_ms is None:
-            return False
-
-        is_committed = self.speculative_turns is not None and self.speculative_turns.is_committed(
-            self._current_turn_id,
-            self._current_turn_revision,
-        )
-        if is_committed:
-            return False
-
-        # Elapsed is measured on the audio clock, so the window only advances
-        # while the client streams audio (continuous capture behaves like wall
-        # time; push-to-talk style gaps freeze it).
-        elapsed_ms = max(0, audio_start_ms - self._last_final_audio_ms)
-
-        # Within the short grace window, any uncommitted turn may reopen.
-        # Beyond it, an unanswered turn (no assistant output committed yet)
-        # remains reopenable up to the unanswered_reopen_ms sanity cap, so a
-        # user pause longer than speculative_reopen_ms does not orphan a turn
-        # the assistant has not replied to. The cap also bounds the
-        # empty-transcript case, where no request is queued and the turn would
-        # otherwise never commit.
-        reopen_limit_ms = self.speculative_reopen_ms
-        if self.speculative_turns is not None:
-            reopen_limit_ms = self.unanswered_reopen_ms
-        return elapsed_ms <= reopen_limit_ms
-
-    def _begin_pending_reopen_if_needed(self, audio_start_ms: int) -> None:
-        if self._pending_reopen_candidate is not None or not self._should_reopen_current_turn(audio_start_ms):
-            return
-        if self.speculative_turns is None:
-            return
-        candidate_revision = self.speculative_turns.begin_reopen_candidate(
-            self._current_turn_id,
-            self._current_turn_revision,
-        )
-        if candidate_revision is None or self._current_turn_id is None or self._current_turn_revision is None:
-            return
-        self._pending_reopen_candidate = (
-            self._current_turn_id,
-            self._current_turn_revision,
-            candidate_revision,
-        )
-        logger.info(
-            "VAD: pending reopen candidate for speculative turn %s revision %d",
-            self._current_turn_id,
-            candidate_revision,
-        )
-
-    def _cancel_pending_reopen(self) -> None:
-        if self._pending_reopen_candidate is None:
-            return
-        turn_id, _base_revision, candidate_revision = self._pending_reopen_candidate
-        if self.speculative_turns:
-            self.speculative_turns.cancel_reopen_candidate(turn_id, candidate_revision)
-        self._pending_reopen_candidate = None
-
-    def _confirm_pending_reopen(self) -> tuple[str, int, bool] | None:
-        if self._pending_reopen_candidate is None:
-            return None
-        turn_id, base_revision, candidate_revision = self._pending_reopen_candidate
-        self._pending_reopen_candidate = None
-        if self.speculative_turns and not self.speculative_turns.confirm_reopen_candidate(
-            turn_id,
-            base_revision,
-            candidate_revision,
+            return "realtime_disabled"
+        anchor_audio_ms = getattr(self, "_reopen_anchor_audio_ms", None)
+        if anchor_audio_ms is None:
+            anchor_audio_ms = getattr(self, "_last_final_audio_ms", None)
+        if (
+            self._current_turn_id is None
+            or self._current_turn_revision is None
+            or anchor_audio_ms is None
         ):
-            return None
-        self._current_turn_id = turn_id
-        self._current_turn_revision = candidate_revision
-        logger.info("VAD: reopened speculative turn %s revision %d", turn_id, candidate_revision)
-        return turn_id, candidate_revision, True
+            return "no_reopenable_turn"
+        if self.speculative_turns is not None and self.speculative_turns.is_committed(
+            self._current_turn_id,
+            self._current_turn_revision,
+        ):
+            return "response_committed"
+        if self._current_turn_revision >= getattr(self, "max_speculative_revisions", 8):
+            return "revision_limit"
+        if self._combined_audio_duration_ms() >= getattr(self, "max_speculative_audio_ms", 30000):
+            return "audio_limit"
+        if max(0, audio_start_ms - anchor_audio_ms) > self.unanswered_reopen_ms:
+            return "fixed_horizon_elapsed"
+        return None
+
+    def _should_reopen_current_turn(self, audio_start_ms: int) -> bool:
+        return self._reopen_block_reason(audio_start_ms) is None
 
     def _reopen_current_turn(self) -> tuple[str, int, bool] | None:
         if self._current_turn_id is None or self._current_turn_revision is None:
@@ -323,17 +286,31 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         ):
             return self._current_turn_id, self._current_turn_revision, False
 
-        confirmed_reopen = self._confirm_pending_reopen()
-        if confirmed_reopen is not None:
-            return confirmed_reopen
-
         reopened = False
         if self._should_reopen_current_turn(audio_start_ms):
             reopened_turn = self._reopen_current_turn()
             if reopened_turn is not None:
                 return reopened_turn
 
+        prior_turn = self._current_turn_id
+        prior_revision = self._current_turn_revision
+        anchor_ms = getattr(self, "_reopen_anchor_audio_ms", None)
+        if anchor_ms is None:
+            anchor_ms = getattr(self, "_last_final_audio_ms", None)
+        combined_audio_ms = self._combined_audio_duration_ms()
+        reason = self._reopen_block_reason(audio_start_ms)
+        forced_reasons = {"revision_limit", "audio_limit", "fixed_horizon_elapsed"}
+        self._last_forced_new_turn_reason = reason if reason in forced_reasons else None
         self._start_new_turn()
+        if prior_turn is not None and reason in forced_reasons:
+            logger.info(
+                "VAD: forcing new turn after %s turn=%s rev=%s reopen_age_ms=%s combined_audio_ms=%.0f",
+                reason,
+                prior_turn,
+                prior_revision,
+                max(0, audio_start_ms - anchor_ms) if anchor_ms is not None else None,
+                combined_audio_ms,
+            )
 
         if self._current_turn_id is None or self._current_turn_revision is None:
             raise RuntimeError("VAD failed to allocate turn metadata")
@@ -518,7 +495,6 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                 start_ms,
                 active_speech_duration_ms,
             )
-            self._begin_pending_reopen_if_needed(effective_start_ms)
             active_speech_min_ms = self._active_speech_min_ms(effective_start_ms)
             if effective_active_speech_duration_ms >= active_speech_min_ms:
                 turn_id, turn_revision, reopened = self._ensure_turn_for_speech_start(effective_start_ms)
@@ -627,8 +603,6 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                             turn_revision=turn_revision,
                         )
                     )
-                if not self._speech_started_emitted:
-                    self._cancel_pending_reopen()
                 self._speech_started_emitted = False
                 self._discard_expired_pending_short_segment()
                 return
@@ -676,8 +650,6 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                             turn_revision=turn_revision,
                         )
                     )
-                if not self._speech_started_emitted:
-                    self._cancel_pending_reopen()
                 self._speech_started_emitted = False
             else:
                 if stitched_short_segment:
@@ -730,7 +702,27 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                         turn_revision=turn_revision,
                         detail={"active_ms": round(active_speech_duration_ms, 1), "device": "cpu"},
                     )
-                self._emit_metric("vad", "speech_final", turn_id=turn_id, turn_revision=turn_revision, detail={"duration_ms": round(duration_ms, 1), "active_ms": round(active_speech_duration_ms, 1), "device": "cpu"})
+                if self._reopen_anchor_audio_ms is None:
+                    self._reopen_anchor_audio_ms = end_ms
+                reopen_age_ms = max(0, end_ms - self._reopen_anchor_audio_ms)
+                self._emit_metric(
+                    "vad",
+                    "speech_final",
+                    turn_id=turn_id,
+                    turn_revision=turn_revision,
+                    detail={
+                        "duration_ms": round(duration_ms, 1),
+                        "active_ms": round(active_speech_duration_ms, 1),
+                        "combined_audio_ms": round(combined_duration_s * 1000, 1),
+                        "reopen_age_ms": reopen_age_ms,
+                        "reopen_horizon_ms": self.unanswered_reopen_ms,
+                        "revision_count": turn_revision or 0,
+                        "max_revisions": self.max_speculative_revisions,
+                        "forced_new_turn_reason": self._last_forced_new_turn_reason,
+                        "device": "cpu",
+                    },
+                )
+                self._last_forced_new_turn_reason = None
                 self._speculative_audio_prefix = output_array
                 self._last_final_wall_time = time.time()
                 self._last_final_audio_ms = end_ms
@@ -870,7 +862,8 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         self._speculative_audio_prefix = None
         self._last_final_wall_time = None
         self._last_final_audio_ms = None
-        self._pending_reopen_candidate = None
+        self._reopen_anchor_audio_ms = None
+        self._last_forced_new_turn_reason = None
         if self.speculative_turns:
             self.speculative_turns.reset()
         self.should_listen.set()

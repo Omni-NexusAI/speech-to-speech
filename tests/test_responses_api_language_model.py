@@ -327,12 +327,9 @@ def test_process_read_timeout_ends_response_cleanly():
 
     outputs = list(handler.process(_make_request("Hi")))
 
-    assert len(outputs) == 2
-    assert (
-        isinstance(outputs[0], LLMResponseChunk)
-        and outputs[0].text == "Wow I'm a bit slow today, could you repeat that?"
-    )
-    assert isinstance(outputs[1], EndOfResponse)
+    assert len(outputs) == 1
+    assert isinstance(outputs[0], EndOfResponse)
+    assert outputs[0].error == "Language model response timed out."
 
 
 def test_generation_error_emits_failed_end_of_response():

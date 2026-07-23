@@ -541,6 +541,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                         first_output = False
                     yield output
         except httpx.ReadTimeout:
+            error_message = "Language model response timed out."
             self._emit_model_metric(
                 turn,
                 "timeout",
@@ -550,17 +551,6 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 "OpenAI API read timed out after %.1fs; ending the current response",
                 self.request_timeout_s,
             )
-            if not self._generation_is_stale(turn.gen) and self._turn_output_allowed(turn.turn_id, turn.turn_revision):
-                # Canned apology carries no language_code (mirrors the prior handlers).
-                yield LLMResponseChunk(
-                    text="Wow I'm a bit slow today, could you repeat that?",
-                    runtime_config=turn.runtime_config,
-                    response=turn.response,
-                    turn_id=turn.turn_id,
-                    turn_revision=turn.turn_revision,
-                    speech_stopped_at_s=turn.speech_stopped_at_s,
-                    cancel_generation=turn.gen,
-                )
         except Exception as exc:
             # Any other generation failure must still terminate the response: record
             # the error and fall through to the EndOfResponse below. Without this the
@@ -679,6 +669,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     turn_id=request.turn_id,
                     turn_revision=request.turn_revision,
                     cancel_generation=request.cancel_generation,
+                    error=request.error,
                 )
             return
         runtime_config = request.runtime_config

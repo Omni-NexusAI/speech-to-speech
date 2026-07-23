@@ -713,6 +713,18 @@ def build_pipeline(
                 "stt": module_kwargs.stt,
                 "live_transcription": module_kwargs.enable_live_transcription,
                 "live_transcription_update_interval": module_kwargs.live_transcription_update_interval,
+                "turn_handling": {
+                    "stabilization_ms": int(gemma_audio_stt_handler_kwargs.revision_settle_s * 1000),
+                    "reopen_horizon_ms": vad_handler_kwargs.unanswered_reopen_ms,
+                    "max_revisions": vad_handler_kwargs.max_speculative_revisions,
+                    "max_combined_audio_ms": vad_handler_kwargs.max_speculative_audio_ms,
+                    "horizon_policy": "fixed_first_soft_endpoint",
+                },
+                "echo_guard": {
+                    "default": "adaptive",
+                    "reference": "generated_playback_pcm",
+                    "filter": "delay_tracked_nlms_512",
+                },
                 "context": {
                     "limit": runtime_lm_kwargs.chat_size,
                     "turn_limit": runtime_lm_kwargs.chat_size,

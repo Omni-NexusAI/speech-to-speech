@@ -97,6 +97,9 @@ class DirectAssistantResponse(PipelineMessage):
     # still carry the request generation through LM output and TTS so a
     # barge-in cannot synthesize abandoned assistant text later.
     cancel_generation: int | None = None
+    # A terminal transport failure still has to traverse the direct response
+    # path so the realtime service can emit response.done and release its slot.
+    error: str | None = None
 
 
 class DirectAssistantRequest(DirectAssistantResponse):

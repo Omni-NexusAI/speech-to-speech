@@ -3,6 +3,7 @@ from queue import Queue
 from threading import Event
 from types import SimpleNamespace
 
+import httpx
 import numpy as np
 import pytest
 from openai.types.realtime.conversation_item import RealtimeConversationItemFunctionCallOutput
@@ -12,7 +13,12 @@ from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.LLM.base_openai_compatible_language_model import BaseOpenAICompatibleHandler
 from speech_to_speech.LLM.chat import Chat, make_assistant_message, make_user_message
 from speech_to_speech.pipeline.events import TranscriptionCompletedEvent
-from speech_to_speech.pipeline.messages import DirectAssistantRequest, DirectAssistantResponse, LLMResponseChunk
+from speech_to_speech.pipeline.messages import (
+    DirectAssistantRequest,
+    DirectAssistantResponse,
+    EndOfResponse,
+    LLMResponseChunk,
+)
 from speech_to_speech.STT.gemma_audio_handler import GemmaAudioSTTHandler
 from speech_to_speech.STT.transcription_notifier import TranscriptionNotifier
 
@@ -147,6 +153,110 @@ def test_final_transcript_accepts_narrow_equivalent_labels():
 def test_final_transcript_has_no_second_request_fallback():
     assert not hasattr(GemmaAudioSTTHandler, "_transcribe_once")
     assert not hasattr(GemmaAudioSTTHandler, "_final_transcript")
+
+
+def test_optional_tool_preamble_is_extracted_without_becoming_response_metadata():
+    text = (
+        "USER_TRANSCRIPT: Check today's weather\n"
+        "ASSISTANT_LANGUAGE: English\n"
+        "ASSISTANT_PREAMBLE: I'll check the latest forecast."
+    )
+
+    assert GemmaAudioSTTHandler._extract_transcript(text) == "Check today's weather"
+    assert GemmaAudioSTTHandler._extract_assistant_preamble(text) == "I'll check the latest forecast."
+    assert GemmaAudioSTTHandler._fallback_response_text(text) == ""
+
+
+def test_tool_preamble_is_spoken_and_committed_before_the_function_call():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    chat = Chat(30)
+    vad_audio = SimpleNamespace(
+        runtime_config=RuntimeConfig(chat=chat),
+        turn_id="turn_tool_preamble",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+    tool = ResponseFunctionToolCall(
+        type="function_call",
+        name="web_search",
+        arguments='{"query":"weather"}',
+        call_id="call_weather",
+        id="fc_weather",
+        status="completed",
+    )
+    text = (
+        "USER_TRANSCRIPT: Check today's weather\n"
+        "ASSISTANT_LANGUAGE: English\n"
+        "ASSISTANT_PREAMBLE: I'll check the latest forecast."
+    )
+
+    outputs = list(handler._responses_from_text(text, vad_audio, tools=[tool]))
+
+    assert outputs[0].text == "I'll check the latest forecast."
+    assert outputs[0].tools == [tool]
+    assert [item.type for item in chat.buffer] == ["message", "message"]
+    assert chat.stats()["pending_tool_calls"] == 1
+
+
+def test_tool_preamble_without_transcript_is_still_retained_for_tool_continuity():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    chat = Chat(30)
+    vad_audio = SimpleNamespace(
+        runtime_config=RuntimeConfig(chat=chat),
+        turn_id="turn_tool_preamble_no_transcript",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+    tool = ResponseFunctionToolCall(
+        type="function_call",
+        name="camera_snapshot",
+        arguments="{}",
+        call_id="call_camera_preamble",
+        id="fc_camera_preamble",
+        status="completed",
+    )
+
+    outputs = list(
+        handler._responses_from_text(
+            "ASSISTANT_PREAMBLE: Let me take a closer look.",
+            vad_audio,
+            tools=[tool],
+        )
+    )
+
+    assert outputs[0].transcript is None
+    assert outputs[0].text == "Let me take a closer look."
+    assert [item.type for item in chat.buffer] == ["message"]
+    assert chat.stats()["pending_tool_calls"] == 1
+
+
+def test_direct_transport_timeout_reaches_failed_end_of_response():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
+    handler._iter_direct_responses = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        httpx.ReadTimeout("timed out")
+    )
+    vad_audio = SimpleNamespace(
+        audio=np.zeros(1600, dtype=np.float32),
+        mode="final",
+        runtime_config=RuntimeConfig(chat=Chat(30)),
+        turn_id="turn_timeout",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+
+    direct = list(handler.process(vad_audio))
+    notifier = object.__new__(TranscriptionNotifier)
+    notifier.setup(text_output_queue=None, runtime_config=None)
+    request = list(notifier.process(direct[0]))[0]
+    outputs = list(object.__new__(_PassThroughHandler).process(request))
+
+    assert direct[0].error == "Direct audio model response timed out."
+    assert len(outputs) == 1
+    assert isinstance(outputs[0], EndOfResponse)
+    assert outputs[0].error == direct[0].error
 
 
 def test_unicode_assistant_text_is_preserved_without_console_output():

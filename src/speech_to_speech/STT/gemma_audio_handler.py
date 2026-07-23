@@ -43,13 +43,18 @@ def _response_max_tokens(value: Any, fallback: Any = 384) -> int:
 _TRANSCRIPT_MARKER = "USER_TRANSCRIPT:"
 _RESPONSE_MARKER = "ASSISTANT_RESPONSE:"
 _LANGUAGE_MARKER = "ASSISTANT_LANGUAGE:"
+_PREAMBLE_MARKER = "ASSISTANT_PREAMBLE:"
 _PREVIEW_TRANSCRIPT_MARKER = "TRANSCRIPT:"
 _FINAL_TRANSCRIPT_RE = re.compile(
     r"(?ims)^\s*(?:USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER)\s*:\s*(.+?)"
-    r"(?=^\s*(?:ASSISTANT_LANGUAGE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:|\Z)"
+    r"(?=^\s*(?:ASSISTANT_LANGUAGE|ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:|\Z)"
 )
 _ASSISTANT_RESPONSE_RE = re.compile(r"(?ims)^\s*(?:ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:\s*(.+)\Z")
 _ASSISTANT_LANGUAGE_RE = re.compile(r"(?im)^\s*ASSISTANT_LANGUAGE\s*:\s*([^\r\n]+)")
+_ASSISTANT_PREAMBLE_RE = re.compile(
+    r"(?ims)^\s*ASSISTANT_PREAMBLE\s*:\s*(.+?)"
+    r"(?=^\s*(?:ASSISTANT_LANGUAGE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:|\Z)"
+)
 _SENTENCE_RE = re.compile(r"(.+?[.!?](?:\s+|$))", re.DOTALL)
 _TRANSCRIPT_CONTROL_TEXT = (
     "listen to the attached user audio",
@@ -178,6 +183,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         self._emit_metric(vad_audio, "transcription", "captured", detail={"mode": "final"})
         first = True
         failed_status: str | None = None
+        terminal_error: str | None = None
         try:
             for response in self._iter_direct_responses(audio, vad_audio, generation=generation):
                 if first and (response.text or response.tools):
@@ -186,10 +192,15 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 yield response
         except httpx.ReadTimeout:
             failed_status = "timeout"
-            raise
-        except Exception:
+            terminal_error = "Direct audio model response timed out."
+        except Exception as exc:
             failed_status = "failed"
-            raise
+            terminal_error = f"Direct audio model request failed: {type(exc).__name__}"
+            logger.exception(
+                "Gemma audio direct request failed turn=%s rev=%s",
+                vad_audio.turn_id,
+                vad_audio.turn_revision,
+            )
         finally:
             total_s = perf_counter() - start_s
             logger.info(
@@ -200,6 +211,14 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             )
             status = "cancelled" if self._request_is_stale(vad_audio, generation) else failed_status or "complete"
             self._emit_metric(vad_audio, "gemma", status, elapsed_ms=total_s * 1000)
+        if terminal_error and not self._request_is_stale(vad_audio, generation):
+            yield self._direct(
+                vad_audio,
+                "",
+                is_final=True,
+                error=terminal_error,
+                generation=generation,
+            )
 
     def _request_is_stale(self, vad_audio: STTIn, generation: int | None) -> bool:
         if generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation):
@@ -271,11 +290,14 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             "USER_TRANSCRIPT: <short transcript of what the user said>\n"
             "ASSISTANT_LANGUAGE: <language name for the assistant response, or Auto>\n"
             "ASSISTANT_RESPONSE: <your spoken answer>\n"
-            "When a provided tool is needed, call it in the same response and never fabricate its result. A short "
-            "context-specific spoken acknowledgement is allowed before the function call. You may place "
-            "USER_TRANSCRIPT and ASSISTANT_LANGUAGE in the "
-            "tool-call message content, but do not emit a result-dependent ASSISTANT_RESPONSE until the tool result "
-            "is available. Do not wrap plain-text responses in JSON or Markdown."
+            "When a provided tool is needed, call it in the same response and never fabricate its result. You may "
+            "optionally add ASSISTANT_PREAMBLE: <a short, natural, context-specific acknowledgement> before the "
+            "function call. Omit the field when no acknowledgement is useful. You may place USER_TRANSCRIPT, "
+            "ASSISTANT_LANGUAGE, and ASSISTANT_PREAMBLE in tool-call message content, but do not emit a "
+            "result-dependent ASSISTANT_RESPONSE until the tool result is available. Do not discuss transcription "
+            "machinery, garbled text, attached audio files, or internal audio processing. If the semantic intent is "
+            "genuinely unclear, ask one brief natural clarification as ASSISTANT_RESPONSE. Do not wrap plain-text "
+            "responses in JSON or Markdown."
         )
         user_content: list[dict[str, Any]] = []
         for image_url in self._conversation_image_urls(runtime_config):
@@ -594,7 +616,14 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         tools = self._tool_calls_from_accum(tool_accum)
         if generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation):
             return
-        final_text = pending_response.strip() if assistant_started else self._fallback_response_text(raw_text)
+        preamble = self._extract_assistant_preamble(raw_text) if tools else None
+        final_text = (
+            preamble
+            if tools and preamble
+            else pending_response.strip()
+            if assistant_started
+            else self._fallback_response_text(raw_text)
+        )
         transcript = self._validate_transcript(transcript_value or self._extract_transcript(raw_text))
         self._emit_metric(
             vad_audio,
@@ -602,13 +631,13 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             "transcript_available" if transcript else "transcript_unavailable",
             detail={"mode": "final", "source": "primary"},
         )
-        full_response = self._fallback_response_text(raw_text)
+        full_response = preamble or self._fallback_response_text(raw_text)
         language_code = language_code or self._extract_assistant_language(raw_text)
         if not transcript:
             # Transcript metadata is optional. Keep only native tool state in
             # context; ordinary transcript-less exchanges stay UI-only rather
             # than creating an assistant message without a user message.
-            committed = self._commit_context(vad_audio, None, "", tools)
+            committed = self._commit_context(vad_audio, None, preamble or "", tools)
             yield self._direct(
                 vad_audio,
                 final_text,
@@ -654,6 +683,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         transcript = self._extract_transcript(text)
         tools = tools or []
         language_code = self._extract_assistant_language(text)
+        preamble = self._extract_assistant_preamble(text) if tools else None
         self._emit_metric(
             vad_audio,
             "transcription",
@@ -661,8 +691,8 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             detail={"mode": "final", "source": "primary"},
         )
         if not transcript:
-            response_text = self._fallback_response_text(text)
-            committed = self._commit_context(vad_audio, None, "", tools)
+            response_text = preamble or self._fallback_response_text(text)
+            committed = self._commit_context(vad_audio, None, preamble or "", tools)
             yield self._direct(
                 vad_audio,
                 response_text,
@@ -674,7 +704,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             )
             self._preview_transcripts.pop((vad_audio.turn_id, vad_audio.turn_revision), None)
             return
-        response_text = self._fallback_response_text(text)
+        response_text = preamble or self._fallback_response_text(text)
         if response_text:
             logger.info("Gemma audio response ready (%d characters)", len(response_text))
         committed = self._commit_context(vad_audio, transcript, response_text, tools)
@@ -702,6 +732,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         transcript_finalized: bool = False,
         language_code: str | None = None,
         generation: int | None = None,
+        error: str | None = None,
     ) -> DirectAssistantResponse:
         runtime_config = getattr(vad_audio, "runtime_config", None)
         if language_code and runtime_config is not None:
@@ -719,6 +750,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             context_committed=context_committed,
             transcript_finalized=transcript_finalized,
             cancel_generation=generation,
+            error=error,
         )
 
     def _commit_context(
@@ -816,11 +848,21 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         return value if value and len(value) <= 40 else None
 
     @staticmethod
+    def _extract_assistant_preamble(text: str) -> str | None:
+        match = _ASSISTANT_PREAMBLE_RE.search(text)
+        if not match:
+            return None
+        value = " ".join(match.group(1).strip().split())
+        if not value or len(value) > 280:
+            return None
+        return value
+
+    @staticmethod
     def _fallback_response_text(text: str) -> str:
         assistant = _ASSISTANT_RESPONSE_RE.search(text)
         if assistant:
             return assistant.group(1).strip()
-        if _FINAL_TRANSCRIPT_RE.search(text):
+        if _FINAL_TRANSCRIPT_RE.search(text) or _ASSISTANT_PREAMBLE_RE.search(text):
             return ""
         return text.strip()
 

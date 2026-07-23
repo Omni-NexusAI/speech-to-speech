@@ -172,10 +172,12 @@ NOT collide with the WebRTC variant.
   feeds the `mic-capture` worklet at the `AudioContext` rate. The worklet
   resamples to 16 kHz (boxcar lowpass + decimation on the 48 -> 16 fast
   path, linear interpolation fallback for odd rates) and packs Int16 LE.
-- **Echo guard**: the playback worklet also feeds an inaudible reference input
-  on `mic-capture`. Adaptive mode rejects correlated assistant playback while
-  allowing sustained uncorrelated double-talk; Strict blocks capture through a
-  250 ms playback tail; Off leaves only browser-native AEC.
+- **Echo guard**: the playback worklet feeds its exact generated PCM into an
+  inaudible reference input on `mic-capture`. Adaptive mode searches 0-250 ms
+  of device/room delay and runs a 512-tap normalized adaptive filter, rejects
+  residual correlated playback, and releases buffered uncorrelated double-talk
+  after about 160 ms. Strict blocks capture through a 250 ms playback tail; Off
+  leaves only browser-native AEC. The static voice-clone reference is not used.
 - **Output**: `response.output_audio.delta` decodes to Int16 -> Float32
   and is posted to the `audio-playback` worklet. The worklet maintains a
   per-context ring buffer, linearly interpolates 24 -> 48, and applies
