@@ -345,11 +345,11 @@
             <label class="field">
               <span>Assistant echo guard</span>
               <select id="echo-guard">
-                <option value="adaptive" selected>Adaptive</option>
+                <option value="off" selected>Off (recommended)</option>
+                <option value="adaptive">Adaptive</option>
                 <option value="strict">Strict</option>
-                <option value="off">Off</option>
               </select>
-              <small>Adaptive allows deliberate barge-in while rejecting playback echo. Strict pauses microphone upload while the assistant speaks.</small>
+              <small>Off keeps native browser echo cancellation and sends unmodified mic PCM. Adaptive allows deliberate barge-in; Strict pauses mic upload while the assistant speaks.</small>
             </label>
 
             <div class="field local-mode-field">

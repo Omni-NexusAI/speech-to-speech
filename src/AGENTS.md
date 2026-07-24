@@ -39,7 +39,7 @@
 - A model transport that does not close within two seconds is detached generation-safely. Its late events are rejected, while the conversation, context, and next response remain usable.
 - Post-tool Chat Completions stream from the selected endpoint and emit the first stable sentence to TTS without waiting for the complete answer.
 - Direct and post-tool transport failures must emit one failed `EndOfResponse`, release model/response ownership, and produce no canned assistant speech.
-- Native tool calls may carry an optional parsed `ASSISTANT_PREAMBLE`; retain it before the call and never synthesize a fallback preamble.
+- Native tool calls always carry a concise spoken acknowledgement before the call. Prefer a model-provided `ASSISTANT_PREAMBLE` or assistant lead-in, with a small per-tool fallback when omitted.
 - Disconnect cleanup flushes every intermediate handler queue before propagating `SESSION_END`, so abandoned speculative turns cannot delay a new session.
 - TTS provider selection is session-scoped: Faster on `8881` remains the default, while Groxaxo on `8882` is accepted only when Voice Studio already has a Base model loaded.
 

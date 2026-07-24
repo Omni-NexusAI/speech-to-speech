@@ -45,7 +45,7 @@ MAX_AUDIO_BATCH_BYTES = 6400
 # monkeypatch this to a small value since their fixtures usually skip the
 # real handler chain.
 SESSION_END_DRAIN_TIMEOUT_S = 10.0
-BACKEND_RUNTIME_API_VERSION = 6
+BACKEND_RUNTIME_API_VERSION = 7
 MODEL_CANCEL_TIMEOUT_S = 2.0
 QItem = TypeVar("QItem")
 

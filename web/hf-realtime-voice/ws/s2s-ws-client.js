@@ -152,7 +152,7 @@ export class S2sWsRealtimeClient extends EventTarget {
     /** @type {NoiseGate} Mic noise gate; off by default. */
     this._noiseGate = options.noiseGate ?? { enabled: false, thresholdDb: -45 };
     /** @type {EchoGuardMode} */
-    this._echoGuard = options.echoGuard ?? "adaptive";
+    this._echoGuard = options.echoGuard ?? "off";
     /** @type {WebSocket | null} */
     this._ws = null;
     /** @type {AudioContext | null} */
@@ -1167,7 +1167,7 @@ export class S2sWsRealtimeClient extends EventTarget {
 
   /** @param {EchoGuardMode} mode */
   setEchoGuard(mode) {
-    this._echoGuard = ["off", "adaptive", "strict"].includes(mode) ? mode : "adaptive";
+    this._echoGuard = ["off", "adaptive", "strict"].includes(mode) ? mode : "off";
     const micTrack = this.options.micStream?.getAudioTracks?.()[0];
     const nativeAec = !!micTrack?.getSettings?.().echoCancellation;
     this._captureNode?.port.postMessage({ kind: "echo_guard", mode: this._echoGuard, nativeAec });

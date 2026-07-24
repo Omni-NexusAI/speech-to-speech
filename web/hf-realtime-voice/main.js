@@ -32,7 +32,7 @@ const DEFAULT_INSTRUCTIONS =
 const TOOL_USE_HINT =
   " When the user's request calls for one of your tools, do not describe your " +
   "capabilities or say you can do it and wait for another turn. Instead, say " +
-  "a brief, context-specific acknowledgement when natural, then call the tool " +
+  "a brief acknowledgement such as 'Let me check that,' then call the tool " +
   "right away in the same response.";
 
 const STORAGE_KEYS = {
@@ -114,7 +114,9 @@ function loadSettings() {
     voice: localStorage.getItem(STORAGE_KEYS.voice) || DEFAULT_VOICE,
     instructions: localStorage.getItem(STORAGE_KEYS.instructions) || DEFAULT_INSTRUCTIONS,
     noiseGate: loadGateThreshold(),
-    echoGuard: ["off", "adaptive", "strict"].includes(storedEchoGuard || "") ? storedEchoGuard : "adaptive",
+    // Native browser AEC remains enabled; custom processing is opt-in because it
+    // must never alter the PCM that reaches the direct-audio model.
+    echoGuard: storedEchoGuard === "strict" ? "strict" : "off",
     fullBufferTts: localStorage.getItem(STORAGE_KEYS.fullBufferTts) === "1",
     liveTranscript: localStorage.getItem(STORAGE_KEYS.liveTranscript) === "1",
     maxResponseTokens: Math.min(1024, Math.max(64, Number(localStorage.getItem(STORAGE_KEYS.maxResponseTokens)) || 384)),
@@ -338,8 +340,8 @@ let ttsBackendStatuses = {};
 let diagnosticsOpen = localStorage.getItem(STORAGE_KEYS.diagnostics) === "1";
 /** @type {Array<any>} */
 let pipelineMetrics = [];
-const EXPECTED_UI_API_VERSION = 8;
-const EXPECTED_BACKEND_API_VERSION = 6;
+const EXPECTED_UI_API_VERSION = 9;
+const EXPECTED_BACKEND_API_VERSION = 7;
 const DIAGNOSTIC_STAGES = ["mic", "echo_guard", "vad", "transcription", "gemma", "context", "tool", "tts", "playback"];
 const DIAGNOSTIC_STAGE_LABELS = { echo_guard: "Echo Guard" };
 const diagnosticWarnings = new Map();
@@ -777,16 +779,6 @@ async function enableCamera() {
     audio: false,
   });
   cameraStream = stream;
-  for (const track of stream.getVideoTracks()) {
-    track.addEventListener("ended", () => {
-      if (cameraStream !== stream) return;
-      disableCamera();
-      toolsEnabled.camera_snapshot = false;
-      saveTools();
-      pushToolsToSession();
-      syncToolsUi();
-    }, { once: true });
-  }
   camVideo.srcObject = cameraStream;
   try { await camVideo.play(); } catch { /* autoplay quirks; muted video is fine */ }
   camPip.classList.add("visible");
@@ -831,7 +823,8 @@ async function watchCameraPermission() {
     if (!status) return;
     status.addEventListener("change", () => {
       if (status.state === "granted") {
-        if (toolsEnabled.camera_snapshot) void autoStartCamera();
+        if (!toolsEnabled.camera_snapshot) { toolsEnabled.camera_snapshot = true; saveTools(); }
+        void autoStartCamera();
         syncToolsUi();
       } else if (status.state === "denied") {
         disableCamera();
@@ -1286,7 +1279,7 @@ function readSettingsFromForm() {
     voice: inputVoice.value || defaultVoice,
     instructions: inputInstructions.value.trim() || DEFAULT_INSTRUCTIONS,
     noiseGate: readGateThreshold(),
-    echoGuard: ["off", "adaptive", "strict"].includes(inputEchoGuard.value) ? inputEchoGuard.value : "adaptive",
+    echoGuard: ["off", "adaptive", "strict"].includes(inputEchoGuard.value) ? inputEchoGuard.value : "off",
     fullBufferTts: inputFullBufferTts.checked,
     liveTranscript: inputLiveTranscript.checked,
     maxResponseTokens: Math.min(1024, Math.max(64, Number(inputMaxResponseTokens.value) || 384)),
@@ -1919,8 +1912,9 @@ chat.renderEmptyState();
 initGateArc();
 void fetchConfig();
 if (settings.modelProvider === "local") void refreshLocalPipeline();
-// React to later permission changes, but do not auto-request camera access on page load.
-// The camera starts from the explicit Tools toggle so browser permission prompts stay user-driven.
+// Restore an already-enabled camera after a reload. Browsers only prompt if the
+// user has not yet made a permission choice.
+void autoStartCamera();
 void watchCameraPermission();
 
 // Reconcile a live session if the tab is closed/hidden mid-call (no teardown).

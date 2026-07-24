@@ -167,6 +167,17 @@ def test_optional_tool_preamble_is_extracted_without_becoming_response_metadata(
     assert GemmaAudioSTTHandler._fallback_response_text(text) == ""
 
 
+def test_tool_preamble_has_a_safe_fallback_when_the_model_omits_it():
+    camera = ResponseFunctionToolCall(
+        type="function_call", name="camera_snapshot", arguments="{}", call_id="call_camera", id="fc_camera", status="completed"
+    )
+    search = ResponseFunctionToolCall(
+        type="function_call", name="web_search", arguments="{}", call_id="call_search", id="fc_search", status="completed"
+    )
+    assert GemmaAudioSTTHandler._tool_preamble("", [camera]) == "Let me take a look."
+    assert GemmaAudioSTTHandler._tool_preamble("", [search]) == "Let me check that."
+
+
 def test_tool_preamble_is_spoken_and_committed_before_the_function_call():
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)

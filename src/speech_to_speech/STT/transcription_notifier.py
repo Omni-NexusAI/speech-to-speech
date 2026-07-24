@@ -88,7 +88,7 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
             if not text and not transcription.tools and not transcription.is_final:
                 return
             if text:
-                logger.info("Direct audio assistant response chunk: %s", text)
+                logger.info("Direct audio assistant response chunk (%d characters)", len(text))
             yield DirectAssistantRequest(
                 text=text,
                 transcript=transcript or None,

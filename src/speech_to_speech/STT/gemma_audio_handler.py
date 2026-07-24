@@ -290,13 +290,12 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             "USER_TRANSCRIPT: <short transcript of what the user said>\n"
             "ASSISTANT_LANGUAGE: <language name for the assistant response, or Auto>\n"
             "ASSISTANT_RESPONSE: <your spoken answer>\n"
-            "When a provided tool is needed, call it in the same response and never fabricate its result. You may "
-            "optionally add ASSISTANT_PREAMBLE: <a short, natural, context-specific acknowledgement> before the "
-            "function call. Omit the field when no acknowledgement is useful. You may place USER_TRANSCRIPT, "
-            "ASSISTANT_LANGUAGE, and ASSISTANT_PREAMBLE in tool-call message content, but do not emit a "
-            "result-dependent ASSISTANT_RESPONSE until the tool result is available. Do not discuss transcription "
-            "machinery, garbled text, attached audio files, or internal audio processing. If the semantic intent is "
-            "genuinely unclear, ask one brief natural clarification as ASSISTANT_RESPONSE. Do not wrap plain-text "
+            "When a provided tool is needed, call it in the same response and never fabricate its result. Before the "
+            "function call, provide one brief, natural acknowledgement (for example, 'Let me check that.'). Put it "
+            "in ASSISTANT_PREAMBLE: <acknowledgement>; plain ASSISTANT_RESPONSE text is also accepted for "
+            "compatibility. Do not emit a result-dependent ASSISTANT_RESPONSE until the tool result is available. "
+            "If the semantic intent is genuinely unclear, ask one brief natural clarification as ASSISTANT_RESPONSE. "
+            "Do not wrap plain-text "
             "responses in JSON or Markdown."
         )
         user_content: list[dict[str, Any]] = []
@@ -616,7 +615,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         tools = self._tool_calls_from_accum(tool_accum)
         if generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation):
             return
-        preamble = self._extract_assistant_preamble(raw_text) if tools else None
+        preamble = self._tool_preamble(raw_text, tools) if tools else None
         final_text = (
             preamble
             if tools and preamble
@@ -683,7 +682,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         transcript = self._extract_transcript(text)
         tools = tools or []
         language_code = self._extract_assistant_language(text)
-        preamble = self._extract_assistant_preamble(text) if tools else None
+        preamble = self._tool_preamble(text, tools) if tools else None
         self._emit_metric(
             vad_audio,
             "transcription",
@@ -856,6 +855,30 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         if not value or len(value) > 280:
             return None
         return value
+
+    @classmethod
+    def _tool_preamble(cls, text: str, tools: list[ResponseFunctionToolCall]) -> str | None:
+        """Return a spoken lead-in for every native tool call.
+
+        A model-provided acknowledgement is preferred, but tool execution must
+        never become silent just because the model omitted an optional marker.
+        """
+        if not tools:
+            return None
+        preamble = cls._extract_assistant_preamble(text)
+        if preamble:
+            return preamble
+        response = _ASSISTANT_RESPONSE_RE.search(text)
+        if response:
+            value = " ".join(response.group(1).strip().split())
+            if value and len(value) <= 280:
+                return value
+        names = {tool.name for tool in tools}
+        if "camera_snapshot" in names:
+            return "Let me take a look."
+        if "web_search" in names:
+            return "Let me check that."
+        return "Let me check that."
 
     @staticmethod
     def _fallback_response_text(text: str) -> str:
