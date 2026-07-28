@@ -67,6 +67,14 @@ function roomEcho(reference, delaySamples, gain = 0.55) {
   return values;
 }
 
+function directEcho(reference, delaySamples, gain) {
+  const values = new Float32Array(reference.length);
+  for (let i = delaySamples; i < values.length; i++) {
+    values[i] = reference[i - delaySamples] * gain;
+  }
+  return values;
+}
+
 function add(a, b) {
   const values = new Float32Array(a.length);
   for (let i = 0; i < values.length; i++) values[i] = a[i] + b[i];
@@ -272,6 +280,58 @@ assert.equal(metric.modelReady, true);
 assert.equal(metric.doubleTalk, true);
 assert.ok(Number.isFinite(metric.erleDb));
 assert.ok(metric.candidateMs >= 450);
+
+const naturalBargeIn = configure("adaptive");
+const naturalReference = deterministicNoise(INPUT_SAMPLES * 48, 0x13572468);
+const naturalEcho = directEcho(naturalReference, Math.round(sampleRate * 0.08), 0.08);
+for (let frame = 0; frame < 20; frame++) {
+  const offset = frame * INPUT_SAMPLES;
+  naturalBargeIn._ingest(
+    naturalEcho.subarray(offset, offset + INPUT_SAMPLES),
+    naturalReference.subarray(offset, offset + INPUT_SAMPLES),
+  );
+}
+assert.equal(naturalBargeIn._echoModelReady, true, "quiet hardware-style echo trains the predictor");
+assert.equal(outputBuffers(naturalBargeIn).length, 0, "quiet echo-only playback remains suppressed");
+
+let humanEvidenceFrames = 0;
+const naturalMicFrames = [];
+for (let frame = 20; frame < 34; frame++) {
+  const offset = frame * INPUT_SAMPLES;
+  const isBriefSpeechGap = frame === 23 || frame === 28;
+  const human = isBriefSpeechGap
+    ? new Float32Array(INPUT_SAMPLES)
+    : scale(tone(997, 0.21 + frame * 0.07), 0.08);
+  const mic = add(naturalEcho.subarray(offset, offset + INPUT_SAMPLES), human);
+  naturalMicFrames.push(decimate48k(mic));
+  naturalBargeIn._ingest(mic, naturalReference.subarray(offset, offset + INPUT_SAMPLES));
+  if (!isBriefSpeechGap) humanEvidenceFrames++;
+  if (humanEvidenceFrames < 12) {
+    assert.equal(
+      outputBuffers(naturalBargeIn).length,
+      0,
+      "natural barge-in stays local until 450 ms of human evidence",
+    );
+  }
+}
+const naturalReleased = outputBuffers(naturalBargeIn);
+assert.equal(naturalReleased.length, 14, "brief speech gaps do not prevent confirmed barge-in");
+assert.ok(
+  pcmCorrelation(naturalReleased[0], naturalMicFrames[0]) > 0.995,
+  "natural barge-in still releases untouched original mic PCM",
+);
+for (let frame = 34; frame < 40; frame++) {
+  const offset = frame * INPUT_SAMPLES;
+  naturalBargeIn._ingest(
+    naturalEcho.subarray(offset, offset + INPUT_SAMPLES),
+    naturalReference.subarray(offset, offset + INPUT_SAMPLES),
+  );
+}
+assert.equal(
+  outputBuffers(naturalBargeIn).length,
+  naturalReleased.length,
+  "echo after a genuine interruption is suppressed instead of extending the user turn",
+);
 
 delayed.port.onmessage({ data: { kind: "echo_reset" } });
 assert.equal(delayed._referenceHistory.length, 0, "echo reset clears playback history");

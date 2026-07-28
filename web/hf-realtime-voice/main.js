@@ -16,7 +16,7 @@
  * @typedef {"idle" | "connecting" | "queued" | "your-turn" | "listening" | "user-speaking" | "processing" | "ai-speaking" | "error"} AppState
  */
 
-import { S2sWsRealtimeClient } from "./ws/s2s-ws-client.js?v=10-adaptive-v2";
+import { S2sWsRealtimeClient } from "./ws/s2s-ws-client.js?v=11-barge-in-r1";
 import { $, truncateError, DEBUG } from "./ui/dom.js";
 import { ChatView } from "./ui/chat.js";
 import { Account } from "./ui/account.js";
@@ -30,10 +30,11 @@ const DEFAULT_INSTRUCTIONS =
 // Stops the model from announcing capabilities ("Yes, I can search") and then
 // idling for the next turn — it should act immediately in the same response.
 const TOOL_USE_HINT =
-  " When the user's request calls for one of your tools, do not describe your " +
-  "capabilities or say you can do it and wait for another turn. Instead, say " +
-  "a brief acknowledgement such as 'Let me check that,' then call the tool " +
-  "right away in the same response.";
+  " When the user's request calls for one of your tools, briefly acknowledge " +
+  "that you are acting before the tool call, using natural wording that fits " +
+  "the specific request and varies with the conversation. Do not reuse a stock " +
+  "phrase, describe capabilities, or wait for another turn. Call the tool right " +
+  "away in the same response.";
 
 const STORAGE_KEYS = {
   // Direct s2s server URL, used only when the deploy has no LOAD_BALANCER_URL
@@ -351,7 +352,7 @@ let ttsBackendStatuses = {};
 let diagnosticsOpen = localStorage.getItem(STORAGE_KEYS.diagnostics) === "1";
 /** @type {Array<any>} */
 let pipelineMetrics = [];
-const EXPECTED_UI_API_VERSION = 10;
+const EXPECTED_UI_API_VERSION = 11;
 const EXPECTED_BACKEND_API_VERSION = 7;
 const DIAGNOSTIC_STAGES = ["mic", "echo_guard", "vad", "transcription", "gemma", "context", "tool", "tts", "playback"];
 const DIAGNOSTIC_STAGE_LABELS = { echo_guard: "Echo Guard" };

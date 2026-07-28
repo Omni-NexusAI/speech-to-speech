@@ -16,7 +16,7 @@
 - `scripts/local_realtime.ps1` is the managed background entry point; foreground launchers remain available for raw-console debugging.
 - Model provider selection is conversation-scoped. Remote completely replaces local Gemma operations without fallback; TTS selection remains independent.
 - One conversation may own only one model HTTP operation at a time. Barge-in cancels or detaches that generation within two seconds without ending the WebSocket session or clearing context.
-- Browser echo protection defaults to Adaptive v2: exact playback PCM drives a classifier-only echo model, and only original mic PCM may be released after 450 ms of confirmed double-talk. Strict and Off remain explicit choices.
+- Browser echo protection defaults to Adaptive v2: exact playback PCM drives a classifier-only echo model, and only original mic PCM may be released after 450 ms of confirmed double-talk. Confirmation tolerates brief natural speech gaps while echo-only frames remain withheld. Strict and Off remain explicit choices.
 
 - This fork is used for local speech-to-speech testing with the OpenAI Realtime-compatible server preserved.
 - Keep upstream pipeline behavior intact unless a change is required for the local direct-audio Gemma path.

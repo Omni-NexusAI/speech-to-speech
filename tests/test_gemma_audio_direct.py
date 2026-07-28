@@ -124,7 +124,10 @@ def test_gemma_audio_payload_includes_instructions_history_tools_and_disables_th
 
     payload = handler._payload(np.zeros(1600, dtype=np.float32), vad_audio)
 
-    assert "Always answer as TEST ROLE." in payload["messages"][0]["content"]
+    system_prompt = payload["messages"][0]["content"]
+    assert "Always answer as TEST ROLE." in system_prompt
+    assert "varies with the conversation" in system_prompt
+    assert "Let me check that" not in system_prompt
     assert payload["messages"][1:3] == [
         {"role": "user", "content": "Earlier question"},
         {"role": "assistant", "content": "Earlier answer"},
@@ -174,8 +177,26 @@ def test_tool_preamble_has_a_safe_fallback_when_the_model_omits_it():
     search = ResponseFunctionToolCall(
         type="function_call", name="web_search", arguments="{}", call_id="call_search", id="fc_search", status="completed"
     )
-    assert GemmaAudioSTTHandler._tool_preamble("", [camera]) == "Let me take a look."
-    assert GemmaAudioSTTHandler._tool_preamble("", [search]) == "Let me check that."
+    camera_preamble = GemmaAudioSTTHandler._tool_preamble("", [camera])
+    search_preamble = GemmaAudioSTTHandler._tool_preamble("", [search])
+    assert camera_preamble in {
+        "I'll take a closer look.",
+        "Let me see what you're showing me.",
+        "I'll check the camera view.",
+    }
+    assert search_preamble in {
+        "I'll look that up.",
+        "I'll check the latest information.",
+        "I'll find that for you.",
+    }
+    fallback_variants = {
+        GemmaAudioSTTHandler._tool_preamble(
+            "",
+            [search.model_copy(update={"call_id": f"call_search_{index}", "id": f"fc_search_{index}"})],
+        )
+        for index in range(9)
+    }
+    assert len(fallback_variants) > 1
 
 
 def test_tool_preamble_is_spoken_and_committed_before_the_function_call():

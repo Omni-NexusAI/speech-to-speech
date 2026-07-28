@@ -175,7 +175,7 @@ NOT collide with the WebRTC variant.
 - **Echo guard**: native browser AEC is always enabled. Adaptive is the default
   and feeds the playback worklet's exact generated PCM into a classifier-only
   echo predictor. Echo and uncertain frames are withheld; 450 ms of confirmed
-  double-talk releases the untouched buffered microphone onset. Predictor
+  double-talk, with short natural speech gaps tolerated, releases the untouched buffered microphone onset. Predictor
   residuals are diagnostics only and never replace mic PCM. Strict withholds
   capture through the playback tail; Off uses native AEC only. The static
   voice-clone reference is not used.

@@ -40,10 +40,11 @@ const ECHO_MODEL_WARMUP_MS = 600;
 // Adaptive v2 waits for sustained evidence before releasing the original mic
 // onset. The predictor is classification-only: its residual is never uploaded.
 const DOUBLE_TALK_MS = 450;
+const DOUBLE_TALK_GAP_MS = 120;
 const ECHO_CORRELATION_EVIDENCE = 0.35;
 const ECHO_RESIDUAL_RATIO_MAX = 0.55;
-const HUMAN_CORRELATION_MAX = 0.35;
-const HUMAN_RESIDUAL_RATIO_MIN = 0.75;
+const HUMAN_RESIDUAL_CORRELATION_MAX = 0.35;
+const HUMAN_RESIDUAL_RATIO_MIN = 0.60;
 const REFERENCE_ACTIVE_RMS = 0.001;
 const HUMAN_ACTIVE_RMS = 0.004;
 
@@ -70,6 +71,7 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
     this._echoModelReady = false;
     this._echoTailRemaining = 0;
     this._doubleTalkSamples = 0;
+    this._doubleTalkGapSamples = 0;
     this._doubleTalkActive = false;
     this._pendingHumanChunks = [];
     this._suppressedMs = 0;
@@ -111,6 +113,7 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
     this._referenceHistory = new Float32Array(0);
     this._echoTailRemaining = 0;
     this._doubleTalkSamples = 0;
+    this._doubleTalkGapSamples = 0;
     this._doubleTalkActive = false;
     this._pendingHumanChunks = [];
     this._suppressedMs = 0;
@@ -215,13 +218,15 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
       let energy = 0;
       for (let i = 0; i < n; i++) energy += mic[i] * mic[i];
       const rms = Math.sqrt(energy / n);
-      return { residualRatio: 1, residualRms: rms, erleDb: 0, predictionRms: 0 };
+      return { residualRatio: 1, residualRms: rms, residualCorrelation: 1, erleDb: 0, predictionRms: 0 };
     }
 
     const weights = this._echoFilter;
     let micEnergy = 0;
     let residualEnergy = 0;
     let predictionEnergy = 0;
+    let residualReferenceDot = 0;
+    let referenceEnergy = 0;
     for (let i = 0; i < n; i++) {
       const referenceIndex = start + i;
       const taps = Math.min(ECHO_FILTER_TAPS, referenceIndex + 1);
@@ -236,6 +241,9 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
       micEnergy += mic[i] * mic[i];
       residualEnergy += error * error;
       predictionEnergy += predicted * predicted;
+      const alignedReference = history[referenceIndex];
+      residualReferenceDot += error * alignedReference;
+      referenceEnergy += alignedReference * alignedReference;
       if (adapt) {
         const scale = (ECHO_NLMS_STEP * error) / norm;
         for (let tap = 0; tap < taps; tap++) {
@@ -248,6 +256,9 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
     return {
       residualRatio: Math.sqrt(residualEnergy / safeMicEnergy),
       residualRms: Math.sqrt(residualEnergy / n),
+      residualCorrelation:
+        Math.abs(residualReferenceDot)
+        / Math.sqrt(Math.max(residualEnergy * referenceEnergy, ECHO_NLMS_EPSILON)),
       erleDb: 10 * Math.log10(safeMicEnergy / Math.max(residualEnergy, ECHO_NLMS_EPSILON)),
       predictionRms: Math.sqrt(predictionEnergy / n),
     };
@@ -323,25 +334,39 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
             : this._echoDelayConfidence * 0.85 + match.correlation * 0.15;
       }
 
-      const freezeAdaptation =
-        this._echoModelReady
-        && rms >= HUMAN_ACTIVE_RMS
-        && match.correlation < HUMAN_CORRELATION_MAX;
       const referenceEchoEvidence =
         match.correlation >= ECHO_CORRELATION_EVIDENCE
         || match.residual <= ECHO_RESIDUAL_RATIO_MAX;
-      const prediction = this._echoPrediction(
-        dec,
+      // Classify before adapting. This prevents real near-end speech from being
+      // learned into the echo path merely because the raw mic still correlates
+      // with loud playback.
+      const prediction = this._echoPrediction(dec, false);
+      const humanCandidate =
         playbackActive
-          && referenceRms >= REFERENCE_ACTIVE_RMS
-          && rms >= REFERENCE_ACTIVE_RMS
-          && referenceEchoEvidence
-          && !freezeAdaptation,
-      );
+        && this._echoModelReady
+        && rms >= HUMAN_ACTIVE_RMS
+        && prediction.residualRms >= HUMAN_ACTIVE_RMS
+        && prediction.residualRatio >= HUMAN_RESIDUAL_RATIO_MIN
+        && prediction.residualCorrelation < HUMAN_RESIDUAL_CORRELATION_MAX;
       const echoEvidence =
         referenceEchoEvidence
         || prediction.residualRatio <= ECHO_RESIDUAL_RATIO_MAX;
-      if (playbackActive && referenceRms >= REFERENCE_ACTIVE_RMS && echoEvidence && !freezeAdaptation) {
+      const echoDominant =
+        playbackActive
+        && !humanCandidate
+        && (
+          match.residual <= ECHO_RESIDUAL_RATIO_MAX
+          || prediction.residualRatio <= ECHO_RESIDUAL_RATIO_MAX
+          || match.correlation >= 0.55
+        );
+      const adaptEchoPath =
+        playbackActive
+        && referenceRms >= REFERENCE_ACTIVE_RMS
+        && rms >= REFERENCE_ACTIVE_RMS
+        && echoEvidence
+        && echoDominant;
+      if (adaptEchoPath) {
+        this._echoPrediction(dec, true);
         this._echoModelSamples = Math.min(
           Math.round((ECHO_MODEL_WARMUP_MS / 1000) * TARGET_RATE),
           this._echoModelSamples + n,
@@ -351,35 +376,38 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
         this._echoModelSamples >= Math.round((ECHO_MODEL_WARMUP_MS / 1000) * TARGET_RATE)
         && this._echoDelayConfidence >= 0.2;
 
-      const echoDominant =
-        playbackActive
-        && (
-          match.residual <= ECHO_RESIDUAL_RATIO_MAX
-          || prediction.residualRatio <= ECHO_RESIDUAL_RATIO_MAX
-          || match.correlation >= 0.55
-        );
-      const humanCandidate =
-        playbackActive
-        && this._echoModelReady
-        && rms >= HUMAN_ACTIVE_RMS
-        && prediction.residualRms >= HUMAN_ACTIVE_RMS
-        && prediction.residualRatio >= HUMAN_RESIDUAL_RATIO_MIN
-        && match.correlation < HUMAN_CORRELATION_MAX;
-
       let framesToSend = [dec];
       let suppressEcho = this._echoMode === "strict" ? playbackActive : false;
       if (this._echoMode === "strict" && playbackActive) {
         framesToSend = [];
       } else if (this._echoMode === "adaptive" && playbackActive) {
         if (echoDominant) {
-          this._pendingHumanChunks = [];
-          this._doubleTalkSamples = 0;
-          this._doubleTalkActive = false;
-          framesToSend = [];
-          suppressEcho = true;
+          const candidateInProgress = this._pendingHumanChunks.length > 0 || this._doubleTalkActive;
+          this._doubleTalkGapSamples += n;
+          if (
+            candidateInProgress
+            && this._doubleTalkGapSamples <= Math.round((DOUBLE_TALK_GAP_MS / 1000) * TARGET_RATE)
+          ) {
+            if (this._doubleTalkActive) {
+              framesToSend = [];
+              suppressEcho = true;
+            } else {
+              this._pendingHumanChunks.push(dec.slice());
+              framesToSend = [];
+              suppressEcho = true;
+            }
+          } else {
+            this._pendingHumanChunks = [];
+            this._doubleTalkSamples = 0;
+            this._doubleTalkGapSamples = 0;
+            this._doubleTalkActive = false;
+            framesToSend = [];
+            suppressEcho = true;
+          }
         } else if (humanCandidate && !this._doubleTalkActive) {
           this._pendingHumanChunks.push(dec.slice());
           this._doubleTalkSamples += n;
+          this._doubleTalkGapSamples = 0;
           const confirmed =
             this._doubleTalkSamples >= Math.round((DOUBLE_TALK_MS / 1000) * TARGET_RATE);
           if (confirmed) {
@@ -392,11 +420,27 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
             suppressEcho = true;
           }
         } else if (humanCandidate && this._doubleTalkActive) {
+          this._doubleTalkGapSamples = 0;
           framesToSend = [dec];
           suppressEcho = false;
+        } else if (this._pendingHumanChunks.length && !this._doubleTalkActive) {
+          // Natural speech has short low-energy consonants and inter-syllable
+          // gaps. Keep the onset local across a small ambiguous gap rather than
+          // requiring an unrealistic 450 ms of perfectly uniform frames.
+          this._doubleTalkGapSamples += n;
+          if (this._doubleTalkGapSamples <= Math.round((DOUBLE_TALK_GAP_MS / 1000) * TARGET_RATE)) {
+            this._pendingHumanChunks.push(dec.slice());
+          } else {
+            this._pendingHumanChunks = [];
+            this._doubleTalkSamples = 0;
+            this._doubleTalkGapSamples = 0;
+          }
+          framesToSend = [];
+          suppressEcho = true;
         } else {
           this._pendingHumanChunks = [];
           this._doubleTalkSamples = 0;
+          this._doubleTalkGapSamples = 0;
           framesToSend = [];
           suppressEcho = true;
         }
@@ -450,6 +494,7 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
           nativeAec: this._nativeAec,
           correlation: match.correlation,
           residual: prediction.residualRatio,
+          residualCorrelation: prediction.residualCorrelation,
           residualEnergy: prediction.residualRms * prediction.residualRms,
           erleDb: prediction.erleDb,
           lagMs: (this._echoDelaySamples / TARGET_RATE) * 1000,

@@ -291,8 +291,9 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             "ASSISTANT_LANGUAGE: <language name for the assistant response, or Auto>\n"
             "ASSISTANT_RESPONSE: <your spoken answer>\n"
             "When a provided tool is needed, call it in the same response and never fabricate its result. Before the "
-            "function call, provide one brief, natural acknowledgement (for example, 'Let me check that.'). Put it "
-            "in ASSISTANT_PREAMBLE: <acknowledgement>; plain ASSISTANT_RESPONSE text is also accepted for "
+            "function call, provide one brief, natural acknowledgement whose wording fits the specific request and "
+            "varies with the conversation; do not reuse a stock phrase. Put it in ASSISTANT_PREAMBLE: "
+            "<acknowledgement>; plain ASSISTANT_RESPONSE text is also accepted for "
             "compatibility. Do not emit a result-dependent ASSISTANT_RESPONSE until the tool result is available. "
             "If the semantic intent is genuinely unclear, ask one brief natural clarification as ASSISTANT_RESPONSE. "
             "Do not wrap plain-text "
@@ -874,11 +875,17 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             if value and len(value) <= 280:
                 return value
         names = {tool.name for tool in tools}
+        seed = "|".join(f"{tool.name}:{tool.call_id or tool.id or ''}" for tool in tools)
         if "camera_snapshot" in names:
-            return "Let me take a look."
-        if "web_search" in names:
-            return "Let me check that."
-        return "Let me check that."
+            choices = ("I'll take a closer look.", "Let me see what you're showing me.", "I'll check the camera view.")
+        elif "web_search" in names:
+            choices = ("I'll look that up.", "I'll check the latest information.", "I'll find that for you.")
+        else:
+            choices = ("I'll take care of that.", "I'll check on it.", "I'll look into it.")
+        index = 0
+        for char in seed:
+            index = (index * 33 + ord(char)) % len(choices)
+        return choices[index]
 
     @staticmethod
     def _fallback_response_text(text: str) -> str:

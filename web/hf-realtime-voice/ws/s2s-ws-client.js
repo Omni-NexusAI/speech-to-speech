@@ -487,8 +487,8 @@ export class S2sWsRealtimeClient extends EventTarget {
 
     // The worklets live at the repo root, one level up from this module.
     const base = new URL("../worklets/", import.meta.url);
-    await ctx.audioWorklet.addModule(new URL("mic-capture.js?v=10-adaptive-v2", base).href);
-    await ctx.audioWorklet.addModule(new URL("audio-playback.js?v=10-adaptive-v2", base).href);
+    await ctx.audioWorklet.addModule(new URL("mic-capture.js?v=11-barge-in-r1", base).href);
+    await ctx.audioWorklet.addModule(new URL("audio-playback.js?v=11-barge-in-r1", base).href);
 
     const captureNode = new AudioWorkletNode(ctx, "mic-capture", {
       numberOfInputs: 2,
@@ -515,6 +515,7 @@ export class S2sWsRealtimeClient extends EventTarget {
               correlation: Number(data.correlation || 0),
               residual: Number(data.residual || 0),
               residual_energy: Number(data.residualEnergy || 0),
+              residual_correlation: Number(data.residualCorrelation || 0),
               erle_db: Number(data.erleDb || 0),
               lag_ms: Number(data.lagMs || 0),
               model_ready: !!data.modelReady,

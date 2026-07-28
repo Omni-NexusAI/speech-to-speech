@@ -28,7 +28,7 @@
 - Stop invalidates the active client before asynchronous teardown; closed-client mic, playback, tool, and WebSocket events must never change the idle UI or enter a replacement conversation.
 - Feed the exact generated playback PCM into the capture worklet as a non-audible reference; never substitute the static clone recording. Adaptive v2 is the default and uses a classifier-only echo predictor: residual audio is diagnostic-only and never replaces mic PCM. Strict suspends upload through the echo tail; Off preserves capture PCM with native AEC only.
 - Keep native `echoCancellation`, `noiseSuppression`, and `autoGainControl` enabled and expose echo delay, readiness, confidence, ERLE, residual ratio, suppression, candidate duration, double-talk, and mode in diagnostics.
-- Adaptive v2 fails closed while uncertain, confirms double-talk for about 450 ms, then replays the untouched buffered onset in order. Learned echo state persists across assistant turns and mode changes, and resets only on Stop or session replacement. The response-length setting remains independent.
+- Adaptive v2 classifies human evidence from predictor residual energy and residual/reference decorrelation, confirms about 450 ms while tolerating speech gaps up to 120 ms, then replays the untouched buffered onset in order. Echo-only gaps remain withheld. Learned echo state persists across assistant turns and mode changes, and resets only on Stop or session replacement.
 
 ## Child DOX Index
 
