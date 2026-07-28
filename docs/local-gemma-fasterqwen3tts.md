@@ -92,7 +92,7 @@ The realtime backend and UI can start while local Gemma is unavailable. Local en
 - Pretrained Qwen voices are intentionally hidden for this local test path.
 - Both providers receive `stream: true`, `response_format: pcm`, the selected clone ID, and an explicit assistant language when Gemma supplies one. Cyrillic, Japanese, Korean, and Chinese script detection is a fallback only.
 - TTS streams are cancelled on Stop/disconnect and aborted when they exceed `min(60s, max(12s, 3x estimated speech duration + 5s))`.
-- Assistant echo guard defaults to **Off**: native browser AEC remains enabled and the browser sends unmodified mic PCM to the direct-audio model. The optional **Adaptive** mode uses the exact generated playback PCM with conservative frame correlation and a short barge-in confirmation buffer; it never rewrites mic samples. The static voice-clone reference recording is never used for echo handling. **Strict** suspends microphone upload during playback/tail.
+- Assistant echo guard defaults to **Adaptive**: native browser AEC remains enabled while the exact generated playback PCM drives a classifier-only echo predictor. Echo and uncertain frames are withheld; 450 ms of confirmed independent speech releases the untouched buffered mic onset. Predictor residuals are diagnostics only and never replace microphone samples. The static voice-clone recording is never used. **Strict** suspends upload during playback/tail; **Off** uses native AEC only.
 # Managed lifecycle
 
 Use the tracked background launcher for routine local testing:

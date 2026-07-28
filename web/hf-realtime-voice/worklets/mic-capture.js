@@ -30,14 +30,20 @@ const DEFAULT_CHUNK_MS = 40;
 const GATE_ATTACK_MS = 5; // open almost instantly so word onsets survive
 const GATE_HOLD_MS = 250; // stay open this long after the level drops back under
 const GATE_RELEASE_MS = 80; // then fade closed over this long (no click)
-const ECHO_HISTORY_MS = 400;
-const ECHO_MAX_LAG_MS = 250;
-const ECHO_TAIL_MS = 250;
-// Adaptive mode waits briefly to distinguish real speech from room playback,
-// but preserves the onset in a short local buffer.
-const DOUBLE_TALK_MS = 80;
-const ECHO_CORRELATION_MIN = 0.65;
-const ECHO_RESIDUAL_MAX = 0.65;
+const ECHO_HISTORY_MS = 750;
+const ECHO_MAX_LAG_MS = 500;
+const ECHO_TAIL_MS = 350;
+const ECHO_FILTER_TAPS = 256;
+const ECHO_NLMS_STEP = 0.05;
+const ECHO_NLMS_EPSILON = 1e-7;
+const ECHO_MODEL_WARMUP_MS = 600;
+// Adaptive v2 waits for sustained evidence before releasing the original mic
+// onset. The predictor is classification-only: its residual is never uploaded.
+const DOUBLE_TALK_MS = 450;
+const ECHO_CORRELATION_EVIDENCE = 0.35;
+const ECHO_RESIDUAL_RATIO_MAX = 0.55;
+const HUMAN_CORRELATION_MAX = 0.35;
+const HUMAN_RESIDUAL_RATIO_MIN = 0.75;
 const REFERENCE_ACTIVE_RMS = 0.001;
 const HUMAN_ACTIVE_RMS = 0.004;
 
@@ -54,11 +60,17 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
     this._referenceDecimated = new Float32Array(this._chunkSamples16k);
     this._enabled = true;
 
-    this._echoMode = "off";
+    this._echoMode = "adaptive";
     this._nativeAec = false;
     this._referenceHistory = new Float32Array(0);
+    this._echoFilter = new Float32Array(ECHO_FILTER_TAPS);
+    this._echoDelaySamples = 0;
+    this._echoDelayConfidence = 0;
+    this._echoModelSamples = 0;
+    this._echoModelReady = false;
     this._echoTailRemaining = 0;
     this._doubleTalkSamples = 0;
+    this._doubleTalkActive = false;
     this._pendingHumanChunks = [];
     this._suppressedMs = 0;
     this._echoMetricCounter = 0;
@@ -80,8 +92,8 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
         // dB -> linear amplitude. When off, threshold 0 keeps the gate open.
         this._thresholdLin = data.enabled ? Math.pow(10, data.thresholdDb / 20) : 0;
       } else if (data?.kind === "echo_guard") {
-        const nextMode = ["off", "adaptive", "strict"].includes(data.mode) ? data.mode : "off";
-        if (nextMode !== this._echoMode) this._resetEchoState();
+        const nextMode = ["off", "adaptive", "strict"].includes(data.mode) ? data.mode : "adaptive";
+        if (nextMode !== this._echoMode) this._resetEchoTransientState();
         this._echoMode = nextMode;
         this._nativeAec = !!data.nativeAec;
       } else if (data?.kind === "echo_reset") {
@@ -91,11 +103,25 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
   }
 
   _resetEchoState() {
+    this._resetEchoTransientState();
+    this._resetEchoPredictor();
+  }
+
+  _resetEchoTransientState() {
     this._referenceHistory = new Float32Array(0);
     this._echoTailRemaining = 0;
     this._doubleTalkSamples = 0;
+    this._doubleTalkActive = false;
     this._pendingHumanChunks = [];
     this._suppressedMs = 0;
+  }
+
+  _resetEchoPredictor() {
+    this._echoFilter = new Float32Array(ECHO_FILTER_TAPS);
+    this._echoDelaySamples = 0;
+    this._echoDelayConfidence = 0;
+    this._echoModelSamples = 0;
+    this._echoModelReady = false;
   }
 
   /**
@@ -174,6 +200,59 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
     };
   }
 
+  /**
+   * Predict the microphone echo from the delayed playback reference.
+   * The returned residual is used only for classification and diagnostics.
+   * Uploaded audio always comes from the untouched `mic` frame.
+   * @param {Float32Array} mic
+   * @param {boolean} adapt
+   */
+  _echoPrediction(mic, adapt) {
+    const history = this._referenceHistory;
+    const n = mic.length;
+    const start = history.length - n - this._echoDelaySamples;
+    if (start < 0) {
+      let energy = 0;
+      for (let i = 0; i < n; i++) energy += mic[i] * mic[i];
+      const rms = Math.sqrt(energy / n);
+      return { residualRatio: 1, residualRms: rms, erleDb: 0, predictionRms: 0 };
+    }
+
+    const weights = this._echoFilter;
+    let micEnergy = 0;
+    let residualEnergy = 0;
+    let predictionEnergy = 0;
+    for (let i = 0; i < n; i++) {
+      const referenceIndex = start + i;
+      const taps = Math.min(ECHO_FILTER_TAPS, referenceIndex + 1);
+      let predicted = 0;
+      let norm = ECHO_NLMS_EPSILON;
+      for (let tap = 0; tap < taps; tap++) {
+        const reference = history[referenceIndex - tap];
+        predicted += weights[tap] * reference;
+        norm += reference * reference;
+      }
+      const error = mic[i] - predicted;
+      micEnergy += mic[i] * mic[i];
+      residualEnergy += error * error;
+      predictionEnergy += predicted * predicted;
+      if (adapt) {
+        const scale = (ECHO_NLMS_STEP * error) / norm;
+        for (let tap = 0; tap < taps; tap++) {
+          const nextWeight = weights[tap] + scale * history[referenceIndex - tap];
+          weights[tap] = Math.max(-2, Math.min(2, nextWeight));
+        }
+      }
+    }
+    const safeMicEnergy = Math.max(micEnergy, ECHO_NLMS_EPSILON);
+    return {
+      residualRatio: Math.sqrt(residualEnergy / safeMicEnergy),
+      residualRms: Math.sqrt(residualEnergy / n),
+      erleDb: 10 * Math.log10(safeMicEnergy / Math.max(residualEnergy, ECHO_NLMS_EPSILON)),
+      predictionRms: Math.sqrt(predictionEnergy / n),
+    };
+  }
+
   _maybeEmit() {
     const r = this._ratio;
     const n = this._chunkSamples16k;
@@ -221,33 +300,103 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
       }
       const playbackActive = referenceRms >= REFERENCE_ACTIVE_RMS || this._echoTailRemaining > 0;
       const match = this._echoMatch(dec, sumSq);
+      if (playbackActive && match.correlation >= 0.2) {
+        const delayShift = Math.abs(match.lagSamples - this._echoDelaySamples);
+        if (
+          this._echoDelayConfidence === 0
+          || delayShift <= Math.round(0.08 * TARGET_RATE)
+          || match.correlation > this._echoDelayConfidence + 0.1
+        ) {
+          if (
+            this._echoDelayConfidence === 0
+            || delayShift > Math.round(0.08 * TARGET_RATE)
+          ) {
+            this._echoFilter = new Float32Array(ECHO_FILTER_TAPS);
+            this._echoModelSamples = 0;
+            this._echoModelReady = false;
+          }
+          this._echoDelaySamples = match.lagSamples;
+        }
+        this._echoDelayConfidence =
+          this._echoDelayConfidence === 0
+            ? match.correlation
+            : this._echoDelayConfidence * 0.85 + match.correlation * 0.15;
+      }
+
+      const freezeAdaptation =
+        this._echoModelReady
+        && rms >= HUMAN_ACTIVE_RMS
+        && match.correlation < HUMAN_CORRELATION_MAX;
+      const referenceEchoEvidence =
+        match.correlation >= ECHO_CORRELATION_EVIDENCE
+        || match.residual <= ECHO_RESIDUAL_RATIO_MAX;
+      const prediction = this._echoPrediction(
+        dec,
+        playbackActive
+          && referenceRms >= REFERENCE_ACTIVE_RMS
+          && rms >= REFERENCE_ACTIVE_RMS
+          && referenceEchoEvidence
+          && !freezeAdaptation,
+      );
+      const echoEvidence =
+        referenceEchoEvidence
+        || prediction.residualRatio <= ECHO_RESIDUAL_RATIO_MAX;
+      if (playbackActive && referenceRms >= REFERENCE_ACTIVE_RMS && echoEvidence && !freezeAdaptation) {
+        this._echoModelSamples = Math.min(
+          Math.round((ECHO_MODEL_WARMUP_MS / 1000) * TARGET_RATE),
+          this._echoModelSamples + n,
+        );
+      }
+      this._echoModelReady =
+        this._echoModelSamples >= Math.round((ECHO_MODEL_WARMUP_MS / 1000) * TARGET_RATE)
+        && this._echoDelayConfidence >= 0.2;
+
       const echoDominant =
         playbackActive
-        && match.correlation >= ECHO_CORRELATION_MIN
-        && match.residual <= ECHO_RESIDUAL_MAX;
-      if (playbackActive && rms >= HUMAN_ACTIVE_RMS && !echoDominant) this._doubleTalkSamples += n;
-      else this._doubleTalkSamples = 0;
-      const doubleTalk = this._doubleTalkSamples >= Math.round((DOUBLE_TALK_MS / 1000) * TARGET_RATE);
+        && (
+          match.residual <= ECHO_RESIDUAL_RATIO_MAX
+          || prediction.residualRatio <= ECHO_RESIDUAL_RATIO_MAX
+          || match.correlation >= 0.55
+        );
+      const humanCandidate =
+        playbackActive
+        && this._echoModelReady
+        && rms >= HUMAN_ACTIVE_RMS
+        && prediction.residualRms >= HUMAN_ACTIVE_RMS
+        && prediction.residualRatio >= HUMAN_RESIDUAL_RATIO_MIN
+        && match.correlation < HUMAN_CORRELATION_MAX;
+
       let framesToSend = [dec];
       let suppressEcho = this._echoMode === "strict" ? playbackActive : false;
       if (this._echoMode === "strict" && playbackActive) {
-        framesToSend = [new Float32Array(n)];
+        framesToSend = [];
       } else if (this._echoMode === "adaptive" && playbackActive) {
         if (echoDominant) {
           this._pendingHumanChunks = [];
           this._doubleTalkSamples = 0;
+          this._doubleTalkActive = false;
           framesToSend = [];
           suppressEcho = true;
-        } else if (rms >= HUMAN_ACTIVE_RMS && !doubleTalk) {
+        } else if (humanCandidate && !this._doubleTalkActive) {
           this._pendingHumanChunks.push(dec.slice());
-          if (this._pendingHumanChunks.length > 4) this._pendingHumanChunks.shift();
-          framesToSend = [];
-          suppressEcho = true;
-        } else if (doubleTalk) {
-          framesToSend = [...this._pendingHumanChunks, dec];
-          this._pendingHumanChunks = [];
+          this._doubleTalkSamples += n;
+          const confirmed =
+            this._doubleTalkSamples >= Math.round((DOUBLE_TALK_MS / 1000) * TARGET_RATE);
+          if (confirmed) {
+            this._doubleTalkActive = true;
+            framesToSend = this._pendingHumanChunks;
+            this._pendingHumanChunks = [];
+            suppressEcho = false;
+          } else {
+            framesToSend = [];
+            suppressEcho = true;
+          }
+        } else if (humanCandidate && this._doubleTalkActive) {
+          framesToSend = [dec];
           suppressEcho = false;
         } else {
+          this._pendingHumanChunks = [];
+          this._doubleTalkSamples = 0;
           framesToSend = [];
           suppressEcho = true;
         }
@@ -277,7 +426,7 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
         for (let i = 0; i < n; i++) {
           const coef = target > gain ? this._attackCoef : this._releaseCoef;
           gain = target + (gain - target) * coef;
-          const s = frame[i] * gain * (suppressEcho ? 0 : 1);
+          const s = frame[i] * gain;
           const clamped = s < -1 ? -1 : s > 1 ? 1 : s;
           out[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
         }
@@ -300,11 +449,16 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
           mode: this._echoMode,
           nativeAec: this._nativeAec,
           correlation: match.correlation,
-          residual: match.residual,
-          lagMs: match.lagMs,
+          residual: prediction.residualRatio,
+          residualEnergy: prediction.residualRms * prediction.residualRms,
+          erleDb: prediction.erleDb,
+          lagMs: (this._echoDelaySamples / TARGET_RATE) * 1000,
+          modelReady: this._echoModelReady,
+          predictionConfidence: Math.max(0, Math.min(1, 1 - prediction.residualRatio)),
+          candidateMs: (this._doubleTalkSamples / TARGET_RATE) * 1000,
           suppressedMs: this._suppressedMs,
           suppressing: suppressEcho,
-          doubleTalk,
+          doubleTalk: this._doubleTalkActive,
           playbackActive,
         });
       }

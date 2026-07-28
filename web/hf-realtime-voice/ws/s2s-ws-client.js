@@ -152,7 +152,7 @@ export class S2sWsRealtimeClient extends EventTarget {
     /** @type {NoiseGate} Mic noise gate; off by default. */
     this._noiseGate = options.noiseGate ?? { enabled: false, thresholdDb: -45 };
     /** @type {EchoGuardMode} */
-    this._echoGuard = options.echoGuard ?? "off";
+    this._echoGuard = options.echoGuard ?? "adaptive";
     /** @type {WebSocket | null} */
     this._ws = null;
     /** @type {AudioContext | null} */
@@ -487,8 +487,8 @@ export class S2sWsRealtimeClient extends EventTarget {
 
     // The worklets live at the repo root, one level up from this module.
     const base = new URL("../worklets/", import.meta.url);
-    await ctx.audioWorklet.addModule(new URL("mic-capture.js", base).href);
-    await ctx.audioWorklet.addModule(new URL("audio-playback.js", base).href);
+    await ctx.audioWorklet.addModule(new URL("mic-capture.js?v=10-adaptive-v2", base).href);
+    await ctx.audioWorklet.addModule(new URL("audio-playback.js?v=10-adaptive-v2", base).href);
 
     const captureNode = new AudioWorkletNode(ctx, "mic-capture", {
       numberOfInputs: 2,
@@ -517,6 +517,9 @@ export class S2sWsRealtimeClient extends EventTarget {
               residual_energy: Number(data.residualEnergy || 0),
               erle_db: Number(data.erleDb || 0),
               lag_ms: Number(data.lagMs || 0),
+              model_ready: !!data.modelReady,
+              prediction_confidence: Number(data.predictionConfidence || 0),
+              candidate_ms: Number(data.candidateMs || 0),
               suppressed_ms: Number(data.suppressedMs || 0),
               double_talk: !!data.doubleTalk,
               playback_active: !!data.playbackActive,
@@ -1167,7 +1170,7 @@ export class S2sWsRealtimeClient extends EventTarget {
 
   /** @param {EchoGuardMode} mode */
   setEchoGuard(mode) {
-    this._echoGuard = ["off", "adaptive", "strict"].includes(mode) ? mode : "off";
+    this._echoGuard = ["off", "adaptive", "strict"].includes(mode) ? mode : "adaptive";
     const micTrack = this.options.micStream?.getAudioTracks?.()[0];
     const nativeAec = !!micTrack?.getSettings?.().echoCancellation;
     this._captureNode?.port.postMessage({ kind: "echo_guard", mode: this._echoGuard, nativeAec });

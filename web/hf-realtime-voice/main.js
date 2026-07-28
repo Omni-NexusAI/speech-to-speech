@@ -16,7 +16,7 @@
  * @typedef {"idle" | "connecting" | "queued" | "your-turn" | "listening" | "user-speaking" | "processing" | "ai-speaking" | "error"} AppState
  */
 
-import { S2sWsRealtimeClient } from "./ws/s2s-ws-client.js";
+import { S2sWsRealtimeClient } from "./ws/s2s-ws-client.js?v=10-adaptive-v2";
 import { $, truncateError, DEBUG } from "./ui/dom.js";
 import { ChatView } from "./ui/chat.js";
 import { Account } from "./ui/account.js";
@@ -45,6 +45,7 @@ const STORAGE_KEYS = {
   searchKey: "s2s.ws.searchKey",
   noiseGate: "s2s.ws.noiseGate",
   echoGuard: "s2s.ws.echoGuard",
+  echoGuardVersion: "s2s.ws.echoGuardVersion",
   diagnostics: "s2s.ws.diagnostics",
   diagnosticsGeometry: "s2s.ws.diagnosticsGeometry",
   fullBufferTts: "s2s.ws.fullBufferTts",
@@ -109,14 +110,23 @@ const SNAPSHOT_QUALITY = 0.7;
 
 function loadSettings() {
   const storedEchoGuard = localStorage.getItem(STORAGE_KEYS.echoGuard);
+  const echoGuardVersion = localStorage.getItem(STORAGE_KEYS.echoGuardVersion);
+  const echoGuard =
+    echoGuardVersion === "2" && ["off", "adaptive", "strict"].includes(storedEchoGuard || "")
+      ? storedEchoGuard
+      : storedEchoGuard === "strict"
+        ? "strict"
+        : "adaptive";
+  if (echoGuardVersion !== "2") {
+    localStorage.setItem(STORAGE_KEYS.echoGuard, echoGuard);
+    localStorage.setItem(STORAGE_KEYS.echoGuardVersion, "2");
+  }
   return {
     directUrl: localStorage.getItem(STORAGE_KEYS.directUrl) || "http://127.0.0.1:8765",
     voice: localStorage.getItem(STORAGE_KEYS.voice) || DEFAULT_VOICE,
     instructions: localStorage.getItem(STORAGE_KEYS.instructions) || DEFAULT_INSTRUCTIONS,
     noiseGate: loadGateThreshold(),
-    // Native browser AEC remains enabled; custom processing is opt-in because it
-    // must never alter the PCM that reaches the direct-audio model.
-    echoGuard: storedEchoGuard === "strict" ? "strict" : "off",
+    echoGuard,
     fullBufferTts: localStorage.getItem(STORAGE_KEYS.fullBufferTts) === "1",
     liveTranscript: localStorage.getItem(STORAGE_KEYS.liveTranscript) === "1",
     maxResponseTokens: Math.min(1024, Math.max(64, Number(localStorage.getItem(STORAGE_KEYS.maxResponseTokens)) || 384)),
@@ -148,6 +158,7 @@ function saveSettings(s) {
   localStorage.setItem(STORAGE_KEYS.instructions, s.instructions);
   localStorage.setItem(STORAGE_KEYS.noiseGate, String(s.noiseGate));
   localStorage.setItem(STORAGE_KEYS.echoGuard, s.echoGuard);
+  localStorage.setItem(STORAGE_KEYS.echoGuardVersion, "2");
   localStorage.setItem(STORAGE_KEYS.fullBufferTts, s.fullBufferTts ? "1" : "0");
   localStorage.setItem(STORAGE_KEYS.liveTranscript, s.liveTranscript ? "1" : "0");
   localStorage.setItem(STORAGE_KEYS.maxResponseTokens, String(s.maxResponseTokens));
@@ -340,7 +351,7 @@ let ttsBackendStatuses = {};
 let diagnosticsOpen = localStorage.getItem(STORAGE_KEYS.diagnostics) === "1";
 /** @type {Array<any>} */
 let pipelineMetrics = [];
-const EXPECTED_UI_API_VERSION = 9;
+const EXPECTED_UI_API_VERSION = 10;
 const EXPECTED_BACKEND_API_VERSION = 7;
 const DIAGNOSTIC_STAGES = ["mic", "echo_guard", "vad", "transcription", "gemma", "context", "tool", "tts", "playback"];
 const DIAGNOSTIC_STAGE_LABELS = { echo_guard: "Echo Guard" };
@@ -379,7 +390,7 @@ function searchAvailable() {
 function activeToolDefs() {
   const defs = [];
   if (toolsEnabled.web_search && searchAvailable()) defs.push(TOOL_DEFS.web_search);
-  if (toolsEnabled.camera_snapshot && cameraStream) defs.push(TOOL_DEFS.camera_snapshot);
+  if (toolsEnabled.camera_snapshot) defs.push(TOOL_DEFS.camera_snapshot);
   return defs;
 }
 
@@ -684,7 +695,7 @@ function syncToolsUi() {
   toolWebSwitch.checked = toolsEnabled.web_search && avail;
   toolWebSwitch.disabled = !avail;
   toolWebRow.classList.toggle("disabled", !avail);
-  toolCamSwitch.checked = !!cameraStream;
+  toolCamSwitch.checked = toolsEnabled.camera_snapshot;
 
   if (serverSearchKey) {
     // Key lives server-side: show it as configured, never expose it.
@@ -726,9 +737,6 @@ toolCamSwitch.addEventListener("change", async () => {
       await enableCamera();
     } catch (err) {
       toolCamSwitch.checked = false;
-      toolsEnabled.camera_snapshot = false;
-      saveTools();
-      pushToolsToSession();
       const denied = err instanceof Error && (err.name === "NotAllowedError" || err.name === "SecurityError");
       toolCamHint.textContent = denied
         ? "Camera blocked. Allow camera access from the browser address bar, then switch this on again."
@@ -823,12 +831,20 @@ async function watchCameraPermission() {
     if (!status) return;
     status.addEventListener("change", () => {
       if (status.state === "granted") {
-        if (!toolsEnabled.camera_snapshot) { toolsEnabled.camera_snapshot = true; saveTools(); }
+        if (!toolsEnabled.camera_snapshot) {
+          toolsEnabled.camera_snapshot = true;
+          saveTools();
+          pushToolsToSession();
+        }
         void autoStartCamera();
         syncToolsUi();
       } else if (status.state === "denied") {
         disableCamera();
-        if (toolsEnabled.camera_snapshot) { toolsEnabled.camera_snapshot = false; saveTools(); }
+        if (toolsEnabled.camera_snapshot) {
+          toolsEnabled.camera_snapshot = false;
+          saveTools();
+          pushToolsToSession();
+        }
         syncToolsUi();
       }
     });
@@ -1279,7 +1295,7 @@ function readSettingsFromForm() {
     voice: inputVoice.value || defaultVoice,
     instructions: inputInstructions.value.trim() || DEFAULT_INSTRUCTIONS,
     noiseGate: readGateThreshold(),
-    echoGuard: ["off", "adaptive", "strict"].includes(inputEchoGuard.value) ? inputEchoGuard.value : "off",
+    echoGuard: ["off", "adaptive", "strict"].includes(inputEchoGuard.value) ? inputEchoGuard.value : "adaptive",
     fullBufferTts: inputFullBufferTts.checked,
     liveTranscript: inputLiveTranscript.checked,
     maxResponseTokens: Math.min(1024, Math.max(64, Number(inputMaxResponseTokens.value) || 384)),
