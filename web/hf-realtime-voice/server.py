@@ -69,7 +69,7 @@ LIMITER_ENABLED = bool(LOAD_BALANCER_URL) and bool(SPACE_ID)
 SERPER_URL = "https://google.serper.dev/search"
 # Cap results so the tool output stays small enough to feed back to the model.
 MAX_RESULTS = 5
-LOCAL_UI_API_VERSION = 11
+LOCAL_UI_API_VERSION = 12
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_QWEN3_VOICE_ID = "16d9bb336799"
 DEFAULT_QWEN3_VOICE = f"clone:{DEFAULT_QWEN3_VOICE_ID}"

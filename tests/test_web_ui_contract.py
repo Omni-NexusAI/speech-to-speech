@@ -15,12 +15,14 @@ def test_camera_capability_depends_on_enabled_state_not_stream_readiness():
     assert "pushToolsToSession();" in permission_handler
 
 
-def test_adaptive_v2_is_the_migrated_default_and_ui_contract_is_current():
+def test_adaptive_v3_is_the_migrated_default_and_ui_contract_is_current():
     assert 'echoGuardVersion: "s2s.ws.echoGuardVersion"' in MAIN_JS
     assert 'localStorage.setItem(STORAGE_KEYS.echoGuardVersion, "2")' in MAIN_JS
-    assert 'const EXPECTED_UI_API_VERSION = 11;' in MAIN_JS
-    assert 'src="main.js?v=11-barge-in-r1"' in INDEX_HTML
-    assert '"./ws/s2s-ws-client.js?v=11-barge-in-r1"' in MAIN_JS
-    assert 'new URL("mic-capture.js?v=11-barge-in-r1", base)' in CLIENT_JS
+    assert 'const EXPECTED_UI_API_VERSION = 12;' in MAIN_JS
+    assert 'src="main.js?v=12-adaptive-v3"' in INDEX_HTML
+    assert '"./ws/s2s-ws-client.js?v=12-adaptive-v3"' in MAIN_JS
+    assert 'new URL("mic-capture.js?v=12-adaptive-v3", base)' in CLIENT_JS
+    assert 'acoustic_state: String(data.acousticState || "unknown")' in CLIENT_JS
+    assert "envelope_correlation: Number(data.envelopeCorrelation || 0)" in CLIENT_JS
     assert "Do not reuse a stock " in MAIN_JS
     assert "Let me check that" not in MAIN_JS

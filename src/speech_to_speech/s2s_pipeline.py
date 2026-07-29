@@ -723,7 +723,7 @@ def build_pipeline(
                 "echo_guard": {
                     "default": "adaptive",
                     "reference": "generated_playback_pcm",
-                    "filter": "delay_tracked_nlms_512",
+                    "filter": "adaptive_v3_dual_path_nlms_256",
                 },
                 "context": {
                     "limit": runtime_lm_kwargs.chat_size,

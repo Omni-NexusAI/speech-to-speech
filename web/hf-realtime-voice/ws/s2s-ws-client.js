@@ -487,8 +487,8 @@ export class S2sWsRealtimeClient extends EventTarget {
 
     // The worklets live at the repo root, one level up from this module.
     const base = new URL("../worklets/", import.meta.url);
-    await ctx.audioWorklet.addModule(new URL("mic-capture.js?v=11-barge-in-r1", base).href);
-    await ctx.audioWorklet.addModule(new URL("audio-playback.js?v=11-barge-in-r1", base).href);
+    await ctx.audioWorklet.addModule(new URL("mic-capture.js?v=12-adaptive-v3", base).href);
+    await ctx.audioWorklet.addModule(new URL("audio-playback.js?v=12-adaptive-v3", base).href);
 
     const captureNode = new AudioWorkletNode(ctx, "mic-capture", {
       numberOfInputs: 2,
@@ -513,6 +513,7 @@ export class S2sWsRealtimeClient extends EventTarget {
               mode: data.mode,
               native_aec: !!data.nativeAec,
               correlation: Number(data.correlation || 0),
+              envelope_correlation: Number(data.envelopeCorrelation || 0),
               residual: Number(data.residual || 0),
               residual_energy: Number(data.residualEnergy || 0),
               residual_correlation: Number(data.residualCorrelation || 0),
@@ -520,6 +521,13 @@ export class S2sWsRealtimeClient extends EventTarget {
               lag_ms: Number(data.lagMs || 0),
               model_ready: !!data.modelReady,
               prediction_confidence: Number(data.predictionConfidence || 0),
+              acoustic_state: String(data.acousticState || "unknown"),
+              candidate_path: String(data.candidatePath || "none"),
+              reject_reason: String(data.rejectReason || "unknown"),
+              noise_floor_rms: Number(data.noiseFloorRms || 0),
+              human_floor_rms: Number(data.humanFloorRms || 0),
+              independence_ms: Number(data.independentMs || 0),
+              echo_evidence_ms: Number(data.echoEvidenceMs || 0),
               candidate_ms: Number(data.candidateMs || 0),
               suppressed_ms: Number(data.suppressedMs || 0),
               double_talk: !!data.doubleTalk,

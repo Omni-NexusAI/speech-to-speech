@@ -172,10 +172,11 @@ NOT collide with the WebRTC variant.
   feeds the `mic-capture` worklet at the `AudioContext` rate. The worklet
   resamples to 16 kHz (boxcar lowpass + decimation on the 48 -> 16 fast
   path, linear interpolation fallback for odd rates) and packs Int16 LE.
-- **Echo guard**: native browser AEC is always enabled. Adaptive is the default
-  and feeds the playback worklet's exact generated PCM into a classifier-only
-  echo predictor. Echo and uncertain frames are withheld; 450 ms of confirmed
-  double-talk, with short natural speech gaps tolerated, releases the untouched buffered microphone onset. Predictor
+- **Echo guard**: native browser AEC is always enabled. Adaptive v3 is the default
+  and feeds the playback worklet's exact generated PCM into coupled-echo detection
+  plus a guarded independent-speech path for headsets/AEC-clean capture. Echo and
+  uncertain frames are withheld; 450 ms of confirmed speech, with short natural
+  speech gaps tolerated, releases the untouched buffered microphone onset. Predictor
   residuals are diagnostics only and never replace mic PCM. Strict withholds
   capture through the playback tail; Off uses native AEC only. The static
   voice-clone reference is not used.

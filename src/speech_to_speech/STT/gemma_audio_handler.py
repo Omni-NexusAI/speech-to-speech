@@ -165,6 +165,11 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
 
     def _process_direct(self, vad_audio: STTIn, generation: int | None) -> Iterator[STTOut]:
         start_s = perf_counter()
+        runtime_config = getattr(vad_audio, "runtime_config", None)
+        if getattr(runtime_config, "local_pipeline", None) is not None:
+            # Language belongs to the current direct-audio answer. Do not let a
+            # previous turn's TTS language silently influence this one.
+            runtime_config.local_pipeline.pop("assistant_language", None)
         audio = self._as_float32_mono(vad_audio.audio)
         duration_s = len(audio) / self.sample_rate if self.sample_rate else 0.0
         logger.info(
@@ -284,19 +289,20 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         if session_instructions:
             system_parts.append(session_instructions)
         system_parts.append(
-            "Interpret the accepted user audio semantically and always answer it or call an appropriate provided "
-            "tool. USER_TRANSCRIPT is optional display metadata and must never replace or gate the semantic "
-            "response. When available, use this plain-text shape:\n"
+            "Treat accepted user audio as an ordinary semantic user message. It may use any language, accent, or "
+            "code-switching; understand it directly and answer it or call an appropriate provided tool. Reply in "
+            "English by default unless the user or session instructions explicitly request another response language. "
+            "USER_TRANSCRIPT is optional display metadata and must never replace or gate the semantic response. "
+            "When available, use this plain-text shape:\n"
             "USER_TRANSCRIPT: <short transcript of what the user said>\n"
-            "ASSISTANT_LANGUAGE: <language name for the assistant response, or Auto>\n"
+            "ASSISTANT_LANGUAGE: <language name for the assistant response; use English by default>\n"
             "ASSISTANT_RESPONSE: <your spoken answer>\n"
             "When a provided tool is needed, call it in the same response and never fabricate its result. Before the "
             "function call, provide one brief, natural acknowledgement whose wording fits the specific request and "
             "varies with the conversation; do not reuse a stock phrase. Put it in ASSISTANT_PREAMBLE: "
             "<acknowledgement>; plain ASSISTANT_RESPONSE text is also accepted for "
             "compatibility. Do not emit a result-dependent ASSISTANT_RESPONSE until the tool result is available. "
-            "If the semantic intent is genuinely unclear, ask one brief natural clarification as ASSISTANT_RESPONSE. "
-            "Do not wrap plain-text "
+            "Ask a follow-up only when the request itself lacks a detail needed to complete it. Do not wrap plain-text "
             "responses in JSON or Markdown."
         )
         user_content: list[dict[str, Any]] = []
@@ -583,7 +589,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 before, after = raw_text.split(_RESPONSE_MARKER, 1)
                 transcript = self._extract_transcript(before)
                 transcript_value = transcript
-                language_code = self._extract_assistant_language(before)
+                language_code = self._extract_assistant_language(before) or "English"
                 if transcript:
                     # Establish the user transcript before assistant chunks are
                     # forwarded, so the Realtime UI and conversation chronology
@@ -632,7 +638,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             detail={"mode": "final", "source": "primary"},
         )
         full_response = preamble or self._fallback_response_text(raw_text)
-        language_code = language_code or self._extract_assistant_language(raw_text)
+        language_code = language_code or self._extract_assistant_language(raw_text) or "English"
         if not transcript:
             # Transcript metadata is optional. Keep only native tool state in
             # context; ordinary transcript-less exchanges stay UI-only rather
@@ -682,7 +688,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
     ) -> Iterator[DirectAssistantResponse]:
         transcript = self._extract_transcript(text)
         tools = tools or []
-        language_code = self._extract_assistant_language(text)
+        language_code = self._extract_assistant_language(text) or "English"
         preamble = self._tool_preamble(text, tools) if tools else None
         self._emit_metric(
             vad_audio,

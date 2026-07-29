@@ -92,7 +92,7 @@ The realtime backend and UI can start while local Gemma is unavailable. Local en
 - Pretrained Qwen voices are intentionally hidden for this local test path.
 - Both providers receive `stream: true`, `response_format: pcm`, the selected clone ID, and an explicit assistant language when Gemma supplies one. Cyrillic, Japanese, Korean, and Chinese script detection is a fallback only.
 - TTS streams are cancelled on Stop/disconnect and aborted when they exceed `min(60s, max(12s, 3x estimated speech duration + 5s))`.
-- Assistant echo guard defaults to **Adaptive**: native browser AEC remains enabled while the exact generated playback PCM drives a classifier-only echo predictor. Echo and uncertain frames are withheld; 450 ms of confirmed independent speech, with up to 120 ms for natural syllable gaps, releases the untouched buffered mic onset. Predictor residuals are diagnostics only and never replace microphone samples. The static voice-clone recording is never used. **Strict** suspends upload during playback/tail; **Off** uses native AEC only.
+- Assistant echo guard defaults to **Adaptive v3**: native browser AEC remains enabled while exact generated playback PCM drives coupled-echo detection and a guarded independent-speech path for headsets/AEC-clean capture. Echo and uncertain frames are withheld; 450 ms of confirmed speech, with up to 120 ms for natural syllable gaps, releases the untouched buffered mic onset. Predictor residuals are diagnostics only and never replace microphone samples. The static voice-clone recording is never used. **Strict** suspends upload during playback/tail; **Off** uses native AEC only.
 # Managed lifecycle
 
 Use the tracked background launcher for routine local testing:
@@ -108,7 +108,7 @@ Add `-Component frontend` or `-Component backend` to scope an action, and `-Open
 
 # Conversation context
 
-The local direct-audio mode keeps the latest 30 complete turns with `compact_history` disabled. System instructions live outside that bounded buffer. Progressive transcript previews are display-only. A validated primary transcript and its assistant response share session history; when transcript metadata is absent, the UI shows `[User audio]` without adding the placeholder or an assistant-only exchange to model history. Function calls and outputs remain retained for tool continuity. Context diagnostics report counts and trimming events without logging conversation text.
+The local direct-audio mode keeps the latest 30 complete turns with `compact_history` disabled. System instructions live outside that bounded buffer. Progressive transcript previews are display-only. A validated primary transcript and its assistant response share session history; when transcript metadata is absent, the UI shows `[User audio]` without adding the placeholder or an assistant-only exchange to model history. Function calls and outputs remain retained for tool continuity. Accepted audio is semantic input in any language, accent, or code-switched form; replies default to English unless the user or session requests another language. Context diagnostics report counts and trimming events without logging conversation text.
 
 # Tool follow-ups
 

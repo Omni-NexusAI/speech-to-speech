@@ -16,7 +16,7 @@
  * @typedef {"idle" | "connecting" | "queued" | "your-turn" | "listening" | "user-speaking" | "processing" | "ai-speaking" | "error"} AppState
  */
 
-import { S2sWsRealtimeClient } from "./ws/s2s-ws-client.js?v=11-barge-in-r1";
+import { S2sWsRealtimeClient } from "./ws/s2s-ws-client.js?v=12-adaptive-v3";
 import { $, truncateError, DEBUG } from "./ui/dom.js";
 import { ChatView } from "./ui/chat.js";
 import { Account } from "./ui/account.js";
@@ -352,7 +352,7 @@ let ttsBackendStatuses = {};
 let diagnosticsOpen = localStorage.getItem(STORAGE_KEYS.diagnostics) === "1";
 /** @type {Array<any>} */
 let pipelineMetrics = [];
-const EXPECTED_UI_API_VERSION = 11;
+const EXPECTED_UI_API_VERSION = 12;
 const EXPECTED_BACKEND_API_VERSION = 7;
 const DIAGNOSTIC_STAGES = ["mic", "echo_guard", "vad", "transcription", "gemma", "context", "tool", "tts", "playback"];
 const DIAGNOSTIC_STAGE_LABELS = { echo_guard: "Echo Guard" };

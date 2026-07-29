@@ -132,6 +132,38 @@ const strict = configure("strict");
 strict._ingest(echo, echo);
 assert.equal(hasSignal(outputBuffers(strict).at(-1)), false, "strict mode suspends upload during playback");
 
+const isolatedHeadset = configure("adaptive");
+const isolatedReference = deterministicNoise(INPUT_SAMPLES * 16, 0x2468ace0);
+const isolatedFrames = [];
+for (let frame = 0; frame < 12; frame++) {
+  const offset = frame * INPUT_SAMPLES;
+  // This simulates a headset/native-AEC capture path: the assistant's exact
+  // playback reference is active, but the microphone receives only the user.
+  const human = scale(tone(733, frame * 0.13), 0.012);
+  isolatedFrames.push(decimate48k(human));
+  isolatedHeadset._ingest(human, isolatedReference.subarray(offset, offset + INPUT_SAMPLES));
+  if (frame < 11) {
+    assert.equal(outputBuffers(isolatedHeadset).length, 0, "isolated speech stays local before 450 ms confirmation");
+  }
+}
+assert.equal(isolatedHeadset._echoModelReady, false, "an isolated headset does not need an echo model");
+assert.equal(isolatedHeadset._acousticState, "uncoupled", "sustained independent speech resolves uncoupled capture");
+const isolatedReleased = outputBuffers(isolatedHeadset);
+assert.equal(isolatedReleased.length, 12, "isolated headset speech releases after 450 ms");
+assert.ok(
+  pcmCorrelation(isolatedReleased[0], isolatedFrames[0]) > 0.995,
+  "isolated headset release is untouched original mic PCM",
+);
+
+const aecClean = configure("adaptive");
+const aecReference = deterministicNoise(INPUT_SAMPLES * 14, 0x13579bdf);
+for (let frame = 0; frame < 8; frame++) {
+  const offset = frame * INPUT_SAMPLES;
+  aecClean._ingest(new Float32Array(INPUT_SAMPLES), aecReference.subarray(offset, offset + INPUT_SAMPLES));
+}
+assert.equal(aecClean._acousticState, "uncoupled", "clean native AEC capture is recognized without predictor warmup");
+assert.equal(outputBuffers(aecClean).length, 0, "AEC-clean silence produces no uploaded PCM");
+
 const delayed = configure("adaptive");
 const longReference = deterministicNoise(INPUT_SAMPLES * 40);
 const delayedEcho = roomEcho(longReference, Math.round(sampleRate * 0.5));

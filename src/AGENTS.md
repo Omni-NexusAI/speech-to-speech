@@ -7,6 +7,7 @@
 ## Local Contracts
 
 - Direct-audio Gemma requests include session instructions and a snapshot of bounded chat history with thinking disabled; the current user message carries only audio plus an optional camera frame, never internal control text.
+- Accepted direct audio may be any language or code-switched. Treat it as semantic input, keep transcripts optional, and default spoken replies to English unless the user or session explicitly requests another language; assistant language is turn-scoped.
 - Progressive Gemma transcript previews are opt-in and ephemeral. Final transcript metadata comes only from the primary direct-audio response; missing or malformed metadata must never start a fallback request, suppress assistant/tool output, or enter model history as a placeholder.
 - Local history retains 30 complete turns without automatic summarization and emits content-free context metrics when committed or trimmed.
 - The realtime backend publishes runtime identity through `/v1/pool` and `pipeline.runtime`; local UI diagnostics use it to detect stale backend code.

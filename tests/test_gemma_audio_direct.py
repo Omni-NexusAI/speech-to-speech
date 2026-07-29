@@ -126,6 +126,9 @@ def test_gemma_audio_payload_includes_instructions_history_tools_and_disables_th
 
     system_prompt = payload["messages"][0]["content"]
     assert "Always answer as TEST ROLE." in system_prompt
+    assert "any language, accent, or code-switching" in system_prompt
+    assert "English by default" in system_prompt
+    assert "semantic intent is genuinely unclear" not in system_prompt
     assert "varies with the conversation" in system_prompt
     assert "Let me check that" not in system_prompt
     assert payload["messages"][1:3] == [
@@ -151,6 +154,69 @@ def test_final_transcript_accepts_narrow_equivalent_labels():
     assert GemmaAudioSTTHandler._extract_transcript(
         "USER_TRANSCRIPT: Listen to the attached user audio and respond directly as a concise voice assistant."
     ) is None
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "¿Dónde está la estación?",
+        "次の電車はいつですか？",
+        "أين أقرب محطة؟",
+        "Can you buscar la estación más cercana?",
+    ],
+)
+def test_final_transcript_accepts_multilingual_and_code_switched_text(transcript):
+    text = f"USER_TRANSCRIPT: {transcript}\nASSISTANT_RESPONSE: I will help with that."
+
+    assert GemmaAudioSTTHandler._extract_transcript(text) == transcript
+
+
+def test_multilingual_user_audio_defaults_to_english_response_language():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    runtime_config = RuntimeConfig(chat=Chat(30))
+    vad_audio = SimpleNamespace(
+        runtime_config=runtime_config,
+        turn_id="turn_multilingual",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+
+    outputs = list(
+        handler._responses_from_text(
+            "USER_TRANSCRIPT: ¿Dónde está la estación?\nASSISTANT_RESPONSE: The station is two blocks ahead.",
+            vad_audio,
+        )
+    )
+
+    assert outputs[-1].transcript == "¿Dónde está la estación?"
+    assert outputs[-1].text == "The station is two blocks ahead."
+    assert outputs[-1].language_code == "English"
+    assert runtime_config.local_pipeline["assistant_language"] == "English"
+
+
+def test_direct_audio_resets_a_previous_turn_language_before_generation():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    runtime_config = RuntimeConfig(chat=Chat(30))
+    runtime_config.local_pipeline["assistant_language"] = "Spanish"
+    vad_audio = SimpleNamespace(
+        audio=np.zeros(1600, dtype=np.float32),
+        mode="final",
+        runtime_config=runtime_config,
+        turn_id="turn_language_reset",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+
+    def responses(_audio, received_vad_audio, *, generation=None):
+        assert "assistant_language" not in received_vad_audio.runtime_config.local_pipeline
+        yield DirectAssistantResponse(text="Hello.", is_final=True)
+
+    handler._iter_direct_responses = responses
+    list(handler.process(vad_audio))
+
+    assert "assistant_language" not in runtime_config.local_pipeline
 
 
 def test_final_transcript_has_no_second_request_fallback():
