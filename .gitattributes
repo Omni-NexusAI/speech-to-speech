@@ -1,0 +1,4 @@
+# The reproducible FasterQwen3TTS artifact is a unified patch whose context
+# intentionally preserves upstream whitespace. Do not treat blank-at-EOL
+# context as a repository whitespace error.
+integrations/qwen3-tts-faster-language.patch whitespace=-blank-at-eol

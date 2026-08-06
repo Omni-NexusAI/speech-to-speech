@@ -60,6 +60,9 @@
   invalid update, legacy provider normalization, and removal of foreign tuning
   when providers switch.
 - Keep live smoke testing documented separately from automated tests.
+- Launcher/status regressions must reject transient container IDs and Docker
+  lifecycle calls from speech-to-speech launchers while retaining the stable
+  `qwen3-tts-faster` runtime identity.
 
 ## Child DOX Index
 

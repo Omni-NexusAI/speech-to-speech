@@ -1,3 +1,4 @@
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -6,6 +7,10 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "local_realtime.ps1"
+FOREGROUND_SCRIPT = REPO_ROOT / "scripts" / "start_local_gemma_realtime_backend.ps1"
+UI_SERVER = REPO_ROOT / "web" / "hf-realtime-voice" / "server.py"
+TRANSIENT_CONTAINER_ID = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])", re.IGNORECASE)
+DOCKER_LIFECYCLE = re.compile(r"\bdocker\s+(?:inspect|start|stop|restart)\b", re.IGNORECASE)
 
 
 def _powershell(expression: str) -> str:
@@ -60,3 +65,20 @@ def test_managed_launcher_normalizes_duplicate_windows_path_keys():
     assert '[Environment]::GetEnvironmentVariables("Process")' in source
     assert '$pathKeys.Count -gt 1' in source
     assert '[Environment]::SetEnvironmentVariable("Path", $pathValue, "Process")' in source
+
+
+def test_backend_launchers_do_not_manage_models_or_use_transient_container_ids():
+    for launcher in (SCRIPT, FOREGROUND_SCRIPT):
+        source = launcher.read_text(encoding="utf-8")
+        assert DOCKER_LIFECYCLE.search(source) is None, launcher
+        assert TRANSIENT_CONTAINER_ID.search(source) is None, launcher
+
+    foreground = FOREGROUND_SCRIPT.read_text(encoding="utf-8")
+    assert "Invoke-RestMethod" not in foreground
+    assert "Gemma and TTS services are user-managed" in foreground
+
+
+def test_local_pipeline_reports_stable_tts_container_identity():
+    source = UI_SERVER.read_text(encoding="utf-8")
+    assert '"container": "qwen3-tts-faster"' in source
+    assert TRANSIENT_CONTAINER_ID.search(source) is None

@@ -1,16 +1,15 @@
-# Local Gemma Audio + FasterQwen3TTS
+# Local Gemma Audio + Qwen3-TTS Providers
 
 This fork keeps the upstream Realtime speech-to-speech framework intact while adding one local fast-test path:
 
 - `--stt gemma-audio` skips Parakeet/transcription and sends completed audio turns directly to Gemma.
-- `--qwen3_tts_backend openai-api` sends assistant text to the existing Dockerized FasterQwen3TTS-compatible server.
+- `--qwen3_tts_backend openai-api` sends assistant text to a conversation-scoped OpenAI-compatible Qwen3-TTS provider: Faster by default, or an explicitly selected and validated Groxaxo/audio.cpp candidate.
 
 ## Services
 
 On this Windows machine, the target TTS container for this framework is:
 
 - container: `qwen3-tts-faster`
-- container id: `281c411e5cfe02d0b0d903f67cd3fb712ab38bc705eb3edbedd8a2041c78702b`
 - URL: `http://127.0.0.1:8881/v1`
 - endpoint: `/audio/speech`
 
@@ -34,11 +33,14 @@ $env:GEMMA_API_KEY = '<local llama-server key>'
 python -m speech_to_speech.s2s_pipeline .\examples\local_gemma_fasterqwen3tts.json
 ```
 
-For the Windows local test setup, use the helper:
+For a foreground Windows test run, use the backend-only helper:
 
 ```powershell
 .\scripts\start_local_gemma_realtime_backend.ps1
 ```
+
+The helper launches this worktree's backend source only. Gemma and every TTS
+service remain user-managed and are checked when a conversation starts.
 
 The backend listens on:
 
@@ -84,15 +86,15 @@ The realtime backend and UI can start while local Gemma is unavailable. Local en
 - A VAD soft endpoint waits 250 ms before launching Gemma. The seven-second continuation horizon is anchored to the first soft endpoint and never slides forward. Continuations require 192 ms of confirmed speech and are bounded to eight revisions or 30 seconds of combined audio; a bound starts a new turn without dropping the new fragment.
 - Direct audio, optional previews, and post-tool generation share one model-operation coordinator. Only one request can occupy the selected Local or Remote endpoint; optional previews are dropped while it is busy. VAD is the sole audio-admission boundary: transcript metadata comes only from the primary request and cannot reject audio, trigger another request, suppress an answer, or block a tool call.
 - Direct and post-tool timeouts close the active stream, emit one failed completion, release response ownership, and resume listening without canned speech. Post-tool responses use streamed Chat Completions and dispatch the first complete sentence to TTS. A barge-in actively closes the obsolete stream; if transport shutdown exceeds two seconds, that generation is detached and its late output is rejected without ending the conversation.
-- Tool responses may include an optional model-generated `ASSISTANT_PREAMBLE`. It is spoken and retained before the native function call; no scripted fallback is synthesized when it is omitted.
-- Faster on `8881` is the default. A Settings provider change is conversation-scoped and takes effect on the next conversation.
+- Tool responses may include a model-generated `ASSISTANT_PREAMBLE`. It is spoken and retained before the native function call; when it is omitted, a request-specific varied per-tool fallback keeps the tool call audible without reusing one stock phrase.
+- Faster on `8881` is the default. Groxaxo on `8882` remains user-managed, and the isolated audio.cpp candidate on `8890` is opt-in after explicit validation. A Settings provider change is conversation-scoped and takes effect on the next conversation.
 - Voice defaults to `clone:16d9bb336799`, displayed as `J.A.R.V.I.S`.
-- The realtime UI lists saved Voice Studio profiles from `profiles/*/meta.json` and only exposes `Base` clone profiles.
+- The realtime UI lists only live `Base` clone profiles from the selected backend. Faster reads its configured `profiles/*/meta.json` library, audio.cpp resolves its private candidate library, and Groxaxo remains inventory-only unless its API advertises safe mutation support.
 - The realtime session stores clone IDs, but the frozen `qwen3-tts-faster` API looks up clones by profile name, so the adapter maps `clone:16d9bb336799` to `clone:J.A.R.V.I.S` before calling `/v1/audio/speech`.
 - Pretrained Qwen voices are intentionally hidden for this local test path.
-- Both providers receive `stream: true`, `response_format: pcm`, the selected clone ID, and an explicit assistant language when Gemma supplies one. Cyrillic, Japanese, Korean, and Chinese script detection is a fallback only.
+- All three OpenAI-compatible TTS providers receive `stream: true`, `response_format: pcm`, their selected backend-scoped clone ID, and an explicit assistant language when Gemma supplies one. Cyrillic, Japanese, Korean, and Chinese script detection is a fallback only. audio.cpp uses native incremental PCM only after its live capability and chunk probe succeed; otherwise it reports and uses the cancellable buffered fallback.
 - TTS streams are cancelled on Stop/disconnect and aborted when they exceed `min(60s, max(12s, 3x estimated speech duration + 5s))`.
-- Assistant echo guard defaults to **Adaptive v3**: native browser AEC remains enabled while exact generated playback PCM drives coupled-echo detection and a guarded independent-speech path for headsets/AEC-clean capture. Echo and uncertain frames are withheld; 450 ms of confirmed speech, with up to 120 ms for natural syllable gaps, releases the untouched buffered mic onset. Predictor residuals are diagnostics only and never replace microphone samples. The static voice-clone recording is never used. **Strict** suspends upload during playback/tail; **Off** uses native AEC only.
+- Echo control defaults to **Native**, using the browser's built-in AEC. **Adaptive** is available only when the bundled Sonora AEC3 worklet passes manifest, hash, ABI, and load validation; it receives the exact scheduled playback PCM and preserves independent near-end speech for barge-in. Any AEC3 failure resolves truthfully to Native. **Strict** applies the reference-aware path more aggressively and fails closed by withholding uncertain upload through the echo tail. No mode uploads a custom NLMS/predictor residual, and the static voice-clone recording is never used as the echo reference.
 # Managed lifecycle
 
 Use the tracked background launcher for routine local testing:

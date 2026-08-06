@@ -878,7 +878,7 @@ async def local_pipeline():
             "apiModel": "qwen3-tts",
             "model": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
             "voice": DEFAULT_QWEN3_VOICE,
-            "container": "281c411e5cfe02d0b0d903f67cd3fb712ab38bc705eb3edbedd8a2041c78702b",
+            "container": "qwen3-tts-faster",
         },
         "tools": {"serper": bool(SERPER_KEY), "camera": True},
     }
