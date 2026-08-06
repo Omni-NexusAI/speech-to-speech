@@ -48,6 +48,185 @@ SESSION_END_DRAIN_TIMEOUT_S = 10.0
 BACKEND_RUNTIME_API_VERSION = 7
 MODEL_CANCEL_TIMEOUT_S = 2.0
 QItem = TypeVar("QItem")
+_AUDIO_CPP_TUNING_BOUNDS: dict[str, tuple[float, float]] = {
+    "max_reference_seconds": (1, 30),
+    "first_block_frames": (1, 300),
+    "steady_block_frames": (1, 300),
+    "left_context_frames": (1, 300),
+    "text_lookahead": (16, 512),
+    "phrase_flush_ms": (50, 3000),
+    "temperature": (0, 2),
+    "top_k": (1, 200),
+    "top_p": (0.05, 1),
+    "repetition_penalty": (0.8, 2),
+    "seed": (0, 2**32 - 1),
+}
+_AUDIO_CPP_INTEGER_TUNING_FIELDS = {
+    "max_reference_seconds",
+    "first_block_frames",
+    "steady_block_frames",
+    "left_context_frames",
+    "text_lookahead",
+    "phrase_flush_ms",
+    "top_k",
+    "seed",
+}
+_AUDIO_CPP_MODELS = {
+    "qwen3-tts-0.6b-base-bf16",
+    "qwen3-tts-1.7b-base-bf16",
+}
+
+
+def _validated_audio_cpp_tuning(tuning: Any) -> dict[str, Any]:
+    """Validate the browser's candidate-only session tuning snapshot.
+
+    The candidate supervisor remains authoritative for the named profile and
+    engine fields.  ``resolved`` carries only the two supervisor-resolved
+    phrase-queue values needed locally by HF Realtime; it is bounded again at
+    this trust boundary before it can affect scheduling.
+    """
+    if not isinstance(tuning, dict):
+        raise ValueError("tts_tuning must be an object")
+    tuning_keys = set(tuning)
+    if tuning_keys - {"provider", "profile_id", "overrides", "resolved"}:
+        raise ValueError("tts_tuning contains unsupported fields")
+    if not {"provider", "profile_id", "overrides"}.issubset(tuning_keys):
+        raise ValueError("tts_tuning requires provider, profile_id, and overrides")
+    if tuning.get("provider") != "qwen3tts-audiocpp":
+        raise ValueError("tts_tuning is available only for qwen3tts-audiocpp")
+    profile_id = tuning.get("profile_id")
+    overrides = tuning.get("overrides", {})
+    if not isinstance(profile_id, str) or not profile_id or not isinstance(overrides, dict):
+        raise ValueError("tts_tuning requires profile_id and object overrides")
+
+    validated_overrides: dict[str, Any] = {}
+    for key, value in overrides.items():
+        if key == "model":
+            if value not in _AUDIO_CPP_MODELS:
+                raise ValueError("tts_tuning model override is invalid")
+            validated_overrides[key] = value
+            continue
+        bounds = _AUDIO_CPP_TUNING_BOUNDS.get(key)
+        if bounds is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("tts_tuning overrides are invalid")
+        if key in _AUDIO_CPP_INTEGER_TUNING_FIELDS and not isinstance(value, int):
+            raise ValueError("tts_tuning integer override is invalid")
+        if not bounds[0] <= value <= bounds[1]:
+            raise ValueError("tts_tuning override is out of bounds")
+        validated_overrides[key] = value
+
+    validated: dict[str, Any] = {
+        "provider": "qwen3tts-audiocpp",
+        "profile_id": profile_id,
+        "overrides": validated_overrides,
+    }
+    resolved = tuning.get("resolved")
+    if resolved is not None:
+        if not isinstance(resolved, dict) or set(resolved) != {"text_lookahead", "phrase_flush_ms"}:
+            raise ValueError("tts_tuning resolved phrase queue is invalid")
+        validated_resolved: dict[str, int] = {}
+        for key in ("text_lookahead", "phrase_flush_ms"):
+            value = resolved.get(key)
+            minimum, maximum = _AUDIO_CPP_TUNING_BOUNDS[key]
+            if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+                raise ValueError("tts_tuning resolved phrase queue is out of bounds")
+            validated_resolved[key] = value
+        validated["resolved"] = validated_resolved
+    return validated
+
+
+class _PipelineConfigError(ValueError):
+    def __init__(self, message: str, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+async def _prepare_pipeline_config_update(
+    service: Any,
+    runtime_config: Any,
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], Any]:
+    """Validate a pipeline update without mutating the live session.
+
+    The caller commits both returned objects together only after every field,
+    candidate tuning value, and model endpoint has passed validation.
+    """
+    proposed_pipeline = dict(runtime_config.local_pipeline)
+    proposed_endpoint = runtime_config.model_endpoint
+
+    for key in ("full_buffer_tts", "live_transcription"):
+        if key in config:
+            value = config[key]
+            if not isinstance(value, bool):
+                raise _PipelineConfigError(f"{key} must be a boolean", "invalid_pipeline_config")
+            proposed_pipeline[key] = value
+
+    if "max_response_tokens" in config:
+        try:
+            proposed_pipeline["max_response_tokens"] = min(
+                1024, max(64, int(config["max_response_tokens"]))
+            )
+        except (TypeError, ValueError) as exc:
+            raise _PipelineConfigError(
+                "Response limit must be between 64 and 1024 tokens",
+                "invalid_max_response_tokens",
+            ) from exc
+
+    previous_backend = proposed_pipeline.get("tts_backend", "faster")
+    target_backend = previous_backend
+    if "tts_backend" in config:
+        target_backend = config["tts_backend"]
+        if target_backend == "audio-cpp":
+            target_backend = "qwen3tts-audiocpp"
+        if target_backend not in {"faster", "groxaxo", "qwen3tts-audiocpp"}:
+            raise _PipelineConfigError("Unknown TTS backend", "invalid_tts_backend")
+        proposed_pipeline["tts_backend"] = target_backend
+
+    if "tts_tuning" in config:
+        if target_backend != "qwen3tts-audiocpp":
+            raise _PipelineConfigError(
+                "tts_tuning is available only for qwen3tts-audiocpp",
+                "invalid_tts_tuning",
+            )
+        try:
+            proposed_pipeline["tts_tuning"] = _validated_audio_cpp_tuning(config["tts_tuning"])
+        except ValueError as exc:
+            raise _PipelineConfigError(str(exc), "invalid_tts_tuning") from exc
+    elif target_backend != "qwen3tts-audiocpp" or previous_backend != "qwen3tts-audiocpp":
+        # A provider switch never inherits a different provider's synthesis
+        # snapshot.  The candidate client sends its resolved profile explicitly.
+        proposed_pipeline.pop("tts_tuning", None)
+
+    if "model_endpoint" in config:
+        model_config = config["model_endpoint"]
+        if not isinstance(model_config, dict):
+            raise _PipelineConfigError("Model endpoint must be an object", "invalid_model_provider")
+        provider = model_config.get("provider", "local")
+        if provider not in {"local", "remote"}:
+            raise _PipelineConfigError(
+                "Model provider must be local or remote",
+                "invalid_model_provider",
+            )
+        try:
+            proposed_endpoint = await asyncio.to_thread(
+                service.validate_model_endpoint,
+                provider=provider,
+                base_url=model_config.get("base_url"),
+                model=model_config.get("model"),
+                api_key=model_config.get("api_key") or None,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Model endpoint validation failed provider=%s error=%s",
+                provider,
+                type(exc).__name__,
+            )
+            raise _PipelineConfigError(
+                f"Selected model endpoint is unavailable: {exc}",
+                "model_endpoint_unavailable",
+            ) from exc
+
+    return proposed_pipeline, proposed_endpoint
 
 
 async def _send_event(ws: WebSocket, event: ServerEvent) -> None:
@@ -455,63 +634,20 @@ def create_app(
 
                 if raw.get("type") in {"local.pipeline.update", "pipeline.config.update"}:
                     config = raw.get("config") if isinstance(raw.get("config"), dict) else {}
-                    allowed = {"full_buffer_tts", "live_transcription"}
                     rt_cfg = unit.service._state(session_id).runtime_config
-                    rt_cfg.local_pipeline.update(
-                        {k: bool(v) for k, v in config.items() if k in allowed and isinstance(v, bool)}
-                    )
-                    if "max_response_tokens" in config:
-                        try:
-                            rt_cfg.local_pipeline["max_response_tokens"] = min(
-                                1024, max(64, int(config["max_response_tokens"]))
-                            )
-                        except (TypeError, ValueError):
-                            await _send_event(
-                                ws,
-                                unit.service.make_error(
-                                    "Response limit must be between 64 and 1024 tokens",
-                                    "invalid_max_response_tokens",
-                                ),
-                            )
-                            continue
-                    tts_backend = config.get("tts_backend")
-                    if tts_backend in {"faster", "groxaxo"}:
-                        rt_cfg.local_pipeline["tts_backend"] = tts_backend
-                    model_config = config.get("model_endpoint")
-                    if isinstance(model_config, dict):
-                        provider = model_config.get("provider", "local")
-                        if provider not in {"local", "remote"}:
-                            await _send_event(
-                                ws,
-                                unit.service.make_error(
-                                    "Model provider must be local or remote",
-                                    "invalid_model_provider",
-                                ),
-                            )
-                            continue
-                        try:
-                            endpoint = await asyncio.to_thread(
-                                unit.service.validate_model_endpoint,
-                                provider=provider,
-                                base_url=model_config.get("base_url"),
-                                model=model_config.get("model"),
-                                api_key=model_config.get("api_key") or None,
-                            )
-                        except Exception as exc:
-                            logger.warning(
-                                "Model endpoint validation failed provider=%s error=%s",
-                                provider,
-                                type(exc).__name__,
-                            )
-                            await _send_event(
-                                ws,
-                                unit.service.make_error(
-                                    f"Selected model endpoint is unavailable: {exc}",
-                                    "model_endpoint_unavailable",
-                                ),
-                            )
-                            continue
-                        rt_cfg.model_endpoint = endpoint
+                    try:
+                        proposed_pipeline, proposed_endpoint = await _prepare_pipeline_config_update(
+                            unit.service,
+                            rt_cfg,
+                            config,
+                        )
+                    except _PipelineConfigError as exc:
+                        await _send_event(ws, unit.service.make_error(str(exc), exc.code))
+                        continue
+                    # Commit only after the entire update has validated.  Invalid
+                    # tuning or endpoint data cannot partially change providers.
+                    rt_cfg.local_pipeline = proposed_pipeline
+                    rt_cfg.model_endpoint = proposed_endpoint
                     await ws.send_json(
                         {
                             "type": (

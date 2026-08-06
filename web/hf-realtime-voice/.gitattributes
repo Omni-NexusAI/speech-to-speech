@@ -29,6 +29,9 @@ saved_model/**/* filter=lfs diff=lfs merge=lfs -text
 *.tflite filter=lfs diff=lfs merge=lfs -text
 *.tgz filter=lfs diff=lfs merge=lfs -text
 *.wasm filter=lfs diff=lfs merge=lfs -text
+# GitHub does not accept new LFS objects in public forks.  This small,
+# reproducibly-built AEC3 runtime is intentionally stored as a normal Git blob.
+worklets/aec3/aec3.wasm -filter -diff -merge -text
 *.xz filter=lfs diff=lfs merge=lfs -text
 *.zip filter=lfs diff=lfs merge=lfs -text
 *.zst filter=lfs diff=lfs merge=lfs -text

@@ -23,6 +23,7 @@ if (-not (Test-Path -LiteralPath $exe)) {
 
 Write-Host "Launching Gemma 4 12B QAT + MTP for speech-to-speech testing..." -ForegroundColor Cyan
 Write-Host "  CTX:    $CtxSize | Batch: 512 | Cache: f16" -ForegroundColor DarkGray
+Write-Host "  Fit margin: 2560 MiB reserved for the isolated audio.cpp candidate" -ForegroundColor DarkGray
 Write-Host "  Port:   127.0.0.1:$Port" -ForegroundColor DarkGray
 
 $arguments = @(
@@ -45,6 +46,7 @@ $arguments = @(
     '--ctx-size', [string]$CtxSize
     '--fit', 'on'
     '--fit-ctx', '8192'
+    '--fit-margin', '2560'
     '--batch-size', '512'
     '--ubatch-size', '512'
     '-ngl', '48'

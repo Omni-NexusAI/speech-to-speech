@@ -11,6 +11,11 @@
 - Progressive Gemma transcript previews are opt-in and ephemeral. Final transcript metadata comes only from the primary direct-audio response; missing or malformed metadata must never start a fallback request, suppress assistant/tool output, or enter model history as a placeholder.
 - Local history retains 30 complete turns without automatic summarization and emits content-free context metrics when committed or trimmed.
 - The realtime backend publishes runtime identity through `/v1/pool` and `pipeline.runtime`; local UI diagnostics use it to detect stale backend code.
+- Runtime echo metadata declares Native as the default and the browser as owner.
+  Adaptive is effective only when the client reports a validated Sonora AEC3
+  WASM module with device-pair calibration; module failure falls back to Native,
+  while Strict remains fail-closed. Do not advertise the removed server-side
+  NLMS filter.
 - A Remote model endpoint must own every model operation for its conversation, including audio/transcription, vision/tools, follow-ups, tokenization, context discovery, and identity. Never probe or fall back to Local for that session.
 - Soft VAD endpoints settle for 250 ms. Continuation requires 192 ms of confirmed speech and uses a fixed horizon anchored to the first soft endpoint; it is bounded to eight revisions and 30 seconds of combined audio. A newer uncommitted revision cancels only the obsolete transport while retaining captured audio.
 - Direct audio, optional preview, and post-tool generation share one conversation-scoped model-operation coordinator. Optional previews drop while occupied; required operations serialize.
@@ -36,6 +41,11 @@
 - Normalize opaque llama.cpp function-call IDs to the Realtime `call_*` contract at the direct-audio Gemma adapter boundary; keep the global chat validator strict.
 - Full-buffer Gemma mode keeps a cancellable streaming HTTP transport and buffers text locally so session Stop can abort in-flight generation.
 - Realtime config uses `pipeline.config.update` for model endpoint, `full_buffer_tts`, live-preview state, and the conversation-scoped TTS provider; retain `local.pipeline.update` only as a compatibility alias.
+- Validate every pipeline-config field, candidate tuning snapshot, and model
+  endpoint against a proposed copy before mutating session runtime state. Commit
+  the provider, tuning, flags, and model endpoint together, normalize the legacy
+  `audio-cpp` provider alias, and clear candidate tuning when another provider is
+  selected.
 - Stop, disconnect, barge-in, and replacement sessions close active direct and post-tool Gemma streams plus active TTS HTTP streams before releasing the pipeline slot.
 - A model transport that does not close within two seconds is detached generation-safely. Its late events are rejected, while the conversation, context, and next response remain usable.
 - Post-tool Chat Completions stream from the selected endpoint and emit the first stable sentence to TTS without waiting for the complete answer.
@@ -43,8 +53,51 @@
 - Native tool calls always carry a concise spoken acknowledgement before the call. Prefer request-specific, naturally varied model wording in `ASSISTANT_PREAMBLE` or an assistant lead-in; use varied per-tool fallbacks only when omitted.
 - Disconnect cleanup flushes every intermediate handler queue before propagating `SESSION_END`, so abandoned speculative turns cannot delay a new session.
 - TTS provider selection is session-scoped: Faster on `8881` remains the default, while Groxaxo on `8882` is accepted only when Voice Studio already has a Base model loaded.
+- Construct TTS handlers without contacting remote providers. Probe the
+  selected TTS backend at generation/session time and return provider-specific
+  readiness errors without preventing model-free pipeline startup.
+- `qwen3tts-audiocpp` is an explicit candidate provider at `8890/v1`. It may be selected only after the UI validates a resident Base model and synchronizes the selected Base clone into the candidate's private library; it never starts, switches, or unloads candidate models from the realtime pipeline.
+- The audio.cpp candidate requests `stream=true` raw PCM only when live status advertises native incremental PCM. Stream each verified chunk immediately; if native fails before any PCM is emitted, retry the same candidate-private clone once with the explicit buffered-phrase fallback. Never replay a request after any PCM has reached the pipeline, and preserve Faster as the default realtime provider.
+- A punctuation-complete audio.cpp phrase is stable and starts TTS immediately;
+  candidate look-ahead and flush timing apply only to incomplete fragments. Phrase
+  coalescing may never cross a provider or cancellation-generation boundary, and
+  cancellation while awaiting a flush must exit without occupying external TTS.
+- Give only a cold native audio.cpp endpoint/model/lifecycle epoch a bounded
+  45-second first-PCM allowance. The first complete native PCM sample marks that
+  epoch warm, restoring the normal 12-60-second budget; a same-model reload or
+  supervisor restart changes the status-event epoch and must become cold again.
+  Faster, Groxaxo, buffered fallback, and cancellation behavior never inherit
+  this allowance.
+- audio.cpp clone requests preserve the selected candidate-private clone ID and
+  must not retry a Faster fallback clone when that candidate request fails.
+- The Realtime router accepts `qwen3tts-audiocpp` (and normalizes the legacy
+  `audio-cpp` alias) as a conversation-scoped TTS provider. Candidate speech
+  payloads must carry the model identity returned by its live resident-model
+  status; never reuse the handler's Faster model name for that request.
+- audio.cpp completed-phrase fallback has a longer cancellable response budget
+  than native PCM delivery; retain prompt Stop/barge-in cancellation instead
+  of dropping a valid offline phrase on the native-stream timeout.
+- A buffered candidate request cancelled by Stop, barge-in, or replacement
+  before its first completed phrase emits `tts/cancelled_before_audio`, not a
+  normal zero-audio completion. A non-cancelled zero-byte provider response
+  emits `tts/empty_audio` and a warning so missed playback is diagnosable.
 
 ## Verification
+
+- Candidate tuning is session-scoped as `tts_tuning` and accepted only for
+  `qwen3tts-audiocpp`; it contains a validated profile id plus bounded temporary
+  overrides and a bounded supervisor-resolved phrase-queue snapshot. The TTS
+  handler may use that snapshot for candidate-only text look-ahead and flush
+  timing; Faster and Groxaxo retain their existing ready-queue behavior. Tuning
+  never changes candidate residency and is omitted from other providers.
+- Candidate diagnostics keep first stable phrase, TTS request, first PCM,
+  browser-owned first playback, synthesis RTF, and end-to-end timing as distinct
+  measurements rather than treating buffered completion as first PCM.
+- Candidate `tts.done` diagnostics consume only bounded response metadata:
+  reference source/requested/used seconds, whether a paired limit applied,
+  `full` versus `matched-excerpt` pairing, and the truthful delivery mode.
+  Never carry reference transcript content into pipeline metrics, and clear
+  response metadata between provider requests so it cannot cross providers.
 
 - Run focused pytest tests for modified handlers before broader checks.
 

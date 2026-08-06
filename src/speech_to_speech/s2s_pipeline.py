@@ -90,6 +90,24 @@ logger = logging.getLogger(__name__)
 logging.getLogger("numba").setLevel(logging.WARNING)  # quiet down numba logs
 
 
+ECHO_GUARD_RUNTIME_DESCRIPTOR = {
+    "default": "native",
+    "modes": ["native", "adaptive", "strict"],
+    "reference": "post_gain_resampled_scheduled_playback_pcm",
+    "ownership": "client",
+    "adaptive": {
+        "implementation": "sonora_aec3_wasm",
+        "activation": "validated_module_only",
+        "availability": "client_reported",
+        "calibration": "per_microphone_output_device_pair",
+        "failure_mode": "native",
+    },
+    "strict": {
+        "failure_mode": "fail_closed",
+    },
+}
+
+
 @dataclass
 class ParsedArguments:
     module_kwargs: ModuleArguments
@@ -720,11 +738,7 @@ def build_pipeline(
                     "max_combined_audio_ms": vad_handler_kwargs.max_speculative_audio_ms,
                     "horizon_policy": "fixed_first_soft_endpoint",
                 },
-                "echo_guard": {
-                    "default": "adaptive",
-                    "reference": "generated_playback_pcm",
-                    "filter": "adaptive_v3_dual_path_nlms_256",
-                },
+                "echo_guard": deepcopy(ECHO_GUARD_RUNTIME_DESCRIPTOR),
                 "context": {
                     "limit": runtime_lm_kwargs.chat_size,
                     "turn_limit": runtime_lm_kwargs.chat_size,

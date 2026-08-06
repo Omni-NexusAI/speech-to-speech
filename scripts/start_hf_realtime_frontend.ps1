@@ -11,7 +11,10 @@ $UiRoot = Join-Path $RepoRoot "web\hf-realtime-voice"
 $Python = Join-Path $RepoRoot ".venv\Scripts\python.exe"
 
 if (-not (Test-Path $Python)) {
-    $Python = "python"
+    $SharedPython = $env:SPEECH_TO_SPEECH_PYTHON
+    if (-not $SharedPython) { $SharedPython = "C:\speech-to-speech\.venv\Scripts\python.exe" }
+    if (Test-Path $SharedPython) { $Python = $SharedPython }
+    else { $Python = "python" }
 }
 
 Push-Location $UiRoot

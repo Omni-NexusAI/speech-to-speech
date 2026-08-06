@@ -764,6 +764,24 @@ def test_openai_payload_preserves_multilingual_text_unchanged():
     assert payload["stream"] is True
 
 
+def test_openai_process_preserves_legacy_stream_mock_contract_and_forwards_candidate_tuning():
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.api_fallback_voice = None
+    handler._api_voice_for_backend = lambda voice: voice
+    captured = []
+
+    def stream(text, voice, **kwargs):
+        captured.append((text, voice, kwargs))
+        return iter([_audible_stream_chunk()])
+
+    handler._stream_openai_api_voice = stream
+    assert len(list(handler._process_openai_api("hello", "clone:one"))) == 1
+    assert "tts_tuning" not in captured[-1][2]
+    tuning = {"provider": "qwen3tts-audiocpp", "profile_id": "balanced", "overrides": {"top_k": 31}}
+    assert len(list(handler._process_openai_api("hello", "clone:one", progressive_buffered=True, tts_tuning=tuning))) == 1
+    assert captured[-1][2]["tts_tuning"] == tuning
+
+
 def test_process_voice_clone_scales_max_new_tokens_for_faster_backend(monkeypatch):
     captured = {}
     handler = object.__new__(Qwen3TTSHandler)

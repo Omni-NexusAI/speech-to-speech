@@ -11,10 +11,15 @@ $RuntimeRoot = Join-Path $RepoRoot ".runtime"
 $LogRoot = Join-Path $RuntimeRoot "logs"
 $StatePath = Join-Path $RuntimeRoot "state.json"
 $Python = Join-Path $RepoRoot ".venv\Scripts\python.exe"
+# Worktrees intentionally do not duplicate the sizeable local virtual
+# environment. The tracked launcher still starts this worktree's source,
+# while using the established local runtime when its own .venv is absent.
+if (-not (Test-Path $Python)) {
+    $SharedPython = $env:SPEECH_TO_SPEECH_PYTHON
+    if (-not $SharedPython) { $SharedPython = "C:\speech-to-speech\.venv\Scripts\python.exe" }
+    if (Test-Path $SharedPython) { $Python = $SharedPython }
+}
 $ConfigPath = Join-Path $RepoRoot "examples\local_gemma_fasterqwen3tts.json"
-# Docker recreates a container whenever the FasterQwen3TTS image changes; its
-# stable service name is the safe lifecycle identity, not a transient hash.
-$TtsContainer = "qwen3-tts-faster"
 $ExpectedTtsModel = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 $StateVersion = 2
 $Specs = @{
@@ -81,12 +86,17 @@ function Get-Process-Info([int]$ProcessId) {
 
     $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
     if (-not $process) { return $null }
+    $fallbackStart = $null
+    try {
+        if ($process.StartTime) { $fallbackStart = $process.StartTime.ToUniversalTime().ToString("o") }
+    }
+    catch { }
     return [pscustomobject]@{
         pid = [int]$process.Id
         parentPid = 0
         executable = [string]$process.Path
         commandLine = ""
-        startTimeUtc = $process.StartTime.ToUniversalTime().ToString("o")
+        startTimeUtc = $fallbackStart
     }
 }
 
@@ -175,17 +185,11 @@ function Verify-Dependencies {
     $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
     $gemmaBase = ([string]$config.gemma_audio_base_url).TrimEnd("/")
     if (-not (Endpoint-Ok "$gemmaBase/models")) {
-        Write-Warning "Local Gemma is not reachable at $gemmaBase. The stack will still start for Remote model sessions."
+        Write-Warning "Local Gemma is not reachable at $gemmaBase. The pipeline will start model-free and re-check the selected provider per session."
     }
-
-    $containerState = docker inspect $TtsContainer --format "{{.State.Status}}" 2>$null
-    if ($LASTEXITCODE -ne 0) { throw "FasterQwen3TTS container not found: $TtsContainer" }
-    if ($containerState -ne "running") { docker start $TtsContainer | Out-Null }
-    $containerEnv = docker inspect $TtsContainer --format "{{json .Config.Env}}" | ConvertFrom-Json
-    if ($containerEnv -notcontains "MODEL_ID=$ExpectedTtsModel") {
-        throw "FasterQwen3TTS container is not configured for $ExpectedTtsModel"
+    if (-not (Endpoint-Ok "http://127.0.0.1:8881/health")) {
+        Write-Warning "FasterQwen3TTS is not reachable on port 8881. The pipeline will still start; choose or start a TTS provider later."
     }
-    if (-not (Endpoint-Ok "http://127.0.0.1:8881/health")) { throw "FasterQwen3TTS is not healthy on port 8881" }
 }
 
 function Start-One([string]$Name, $State) {
@@ -212,15 +216,33 @@ function Start-One([string]$Name, $State) {
     Set-Content -Path $stderr -Value ""
     $oldUnbuffered = $env:PYTHONUNBUFFERED
     $oldRuntimeLog = $env:S2S_RUNTIME_LOG_FILE
+    $oldPythonPath = $env:PYTHONPATH
     $env:PYTHONUNBUFFERED = "1"
+    # Discard any inherited checkout path. The backend still needs this
+    # worktree's src directory when it borrows the shared virtual environment.
+    $env:PYTHONPATH = if ($Name -eq "backend") { Join-Path $RepoRoot "src" } else { "" }
     if ($Name -eq "backend") { $env:S2S_RUNTIME_LOG_FILE = $stdout }
     if ($Name -eq "backend" -and -not $env:OPENAI_API_KEY) { $env:OPENAI_API_KEY = "local-llama-cpp" }
     try {
+        # Some parent launchers expose both `Path` and `PATH` in the Windows
+        # process environment. Start-Process builds a case-insensitive child
+        # dictionary and aborts on that duplicate, so normalize only the key
+        # casing while preserving the effective search path value.
+        $processEnvironment = [Environment]::GetEnvironmentVariables("Process")
+        $pathKeys = @($processEnvironment.Keys | Where-Object { [string]$_ -ieq "Path" })
+        if ($pathKeys.Count -gt 1) {
+            $pathValue = [Environment]::GetEnvironmentVariable("Path", "Process")
+            foreach ($pathKey in $pathKeys) {
+                [Environment]::SetEnvironmentVariable([string]$pathKey, $null, "Process")
+            }
+            [Environment]::SetEnvironmentVariable("Path", $pathValue, "Process")
+        }
         $launcher = Start-Process -FilePath $Python -ArgumentList $spec.Args -WorkingDirectory $spec.WorkDir -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
     }
     finally {
         $env:PYTHONUNBUFFERED = $oldUnbuffered
         $env:S2S_RUNTIME_LOG_FILE = $oldRuntimeLog
+        $env:PYTHONPATH = $oldPythonPath
     }
 
     for ($i = 0; $i -lt 90; $i++) {
@@ -295,6 +317,8 @@ function Show-Status {
     $gemmaBase = ([string]$config.gemma_audio_base_url).TrimEnd("/")
     Write-Host "Gemma: $(if(Endpoint-Ok "$gemmaBase/models"){'healthy'}else{'down'}) ($gemmaBase)"
     Write-Host "FasterQwen3TTS: $(if(Endpoint-Ok 'http://127.0.0.1:8881/health'){'healthy'}else{'down'}) ($ExpectedTtsModel)"
+    Write-Host "Groxaxo: $(if(Endpoint-Ok 'http://127.0.0.1:8882/v1/backend/models'){'healthy'}else{'down'}) (user-managed)"
+    Write-Host "Qwen3TTS audio.cpp: $(if(Endpoint-Ok 'http://127.0.0.1:8890/health'){'healthy'}else{'down'}) (isolated candidate)"
     if (Endpoint-Ok $Specs.backend.Health) {
         $pool = Invoke-RestMethod $Specs.backend.Health
         Write-Host "Backend runtime API: $($pool.runtime.api_version); started: $($pool.runtime.started_at_utc)"

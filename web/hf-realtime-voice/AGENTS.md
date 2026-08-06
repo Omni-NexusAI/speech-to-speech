@@ -18,18 +18,91 @@
 - Keep the upstream `Built by` credit intact. The top identity row must source local Gemma and FasterQwen3TTS provider status from `/api/local-pipeline`, and place the Omni-NexusAI fork credit in a separate `Modified by` row.
 - When the backend emits `pipeline.metric`, keep the UI rendering lightweight and diagnostic-only; do not infer pipeline state by duplicating backend logic in the browser.
 - Local runtime toggles and TTS backend selection use `pipeline.config.update`, leaving OpenAI-compatible `session.update` for standard voice/instructions/tool fields.
+- Initial capture remains gated until `pipeline.config.updated` acknowledges the
+  complete conversation-scoped configuration. A missing acknowledgement times
+  out after 15 seconds; any server error before it is fatal, visible, and closes
+  the socket so the backend releases the pipeline slot.
 - Send tool output, optional camera image, and one follow-up `response.create` immediately in hosted order. The backend owns the call-ID barrier; never replay a rejected create on a later user turn.
 - Speech stop reserves persistent user chronology. Replace it with validated transcript metadata when available or persistent `[User audio]` when absent; the placeholder is display-only and transcript availability never controls assistant or tool UI.
 - The live-transcription setting controls only the temporary floating user bubble. Final user text always updates the persistent conversation panel.
 - Diagnostics label the always-on final stage `Transcription` and show retained history tokens against the context window detected from llama.cpp.
 - Camera preview and Diagnostics should not occupy the same desktop corner; keep the camera self-view clear when diagnostics are open.
-- Settings list live Faster and Groxaxo status. Provider changes apply to the next conversation, and an unavailable selected provider blocks start without silent fallback.
+- Settings list every configured TTS provider even while unavailable. Provider
+  changes apply to the next conversation, and an unavailable selected provider
+  blocks start without silent fallback.
+- Voice inventory and profile controls are scoped to the selected backend.
+  Reconcile Faster's live voices with its configured writable library, use the
+  candidate-private audio.cpp profile API, and keep Groxaxo inventory-only
+  unless its existing API explicitly advertises safe mutation support.
+- Treat each selected backend's current no-store inventory as authoritative;
+  do not hide a live audio.cpp profile merely because another provider uses the
+  same ID. Clear and disable the voice selector before awaiting a backend
+  switch, ignore stale inventory responses, and expose no clone IDs while the
+  active backend is unavailable. A new audio.cpp clone visibly requires its
+  own explicit validation before a conversation can start.
+- Persist one selected Base clone per backend. Restore it on backend switches;
+  if missing, choose the provider default or first live Base clone and make the
+  fallback visible.
+- Restore server-managed settings before the first backend inventory request.
+  On backend or clone changes, await the server-backed selection save before
+  refreshing identity-scoped validation; do not show a previous provider or
+  previous clone's readiness while the new selection is settling.
+- Opening Settings refreshes both selected-backend inventory and live backend
+  readiness; a transient startup probe must not leave a healthy provider
+  labeled unavailable for the rest of the page session.
+- Faster model inventory is truthful: its fixed clone-only API currently has no load/switch/unload endpoints, so controls must stay unavailable instead of simulating a model lifecycle.
+- The audio.cpp candidate stays separate and is selectable only after an
+  explicit probe proves health, a resident compatible model, speech, and a
+  synchronized private clone profile. Native incremental PCM requires a live
+  capability advertisement, the exact
+  `X-TTS-Streaming-Mode: native-incremental-pcm` response header, and at least
+  two nonempty PCM chunks. A missing or mismatched header, one completed body,
+  or a failed native request is buffered-only evidence; persist that truthful
+  delivery mode per model/clone. Never start, switch, or replace
+  Faster/Groxaxo automatically.
+- Persist local UI preferences (including the selected TTS backend) atomically
+  through `/api/ui-settings` so an environment/browser reset can restore them.
+  Never retain model or service API keys there; those remain browser-session
+  settings.
+- General provider validation checks health, resident model, capabilities,
+  selected clone presence, and a short synthesis without changing model
+  residency. Persist and retrieve results by backend/model/clone so switching
+  between previously validated candidate clones does not erase either record;
+  experimental audio.cpp still requires explicit validation.
+- Persist non-secret backend endpoints, prompts, selected backend, and
+  per-backend clone selections atomically through server-managed runtime state.
+  Await saves in the Settings UI and keep all API keys browser-session-only.
 - Keep model inference controls separate from TTS controls, and place Voice directly beneath TTS Backend in the vertically scrolling settings layout.
 - Stop invalidates the active client before asynchronous teardown; closed-client mic, playback, tool, and WebSocket events must never change the idle UI or enter a replacement conversation.
-- Feed the exact generated playback PCM into the capture worklet as a non-audible reference; never substitute the static clone recording. Adaptive v3 is the default: a classifier-only predictor protects coupled speakers while a guarded independent-speech path serves headsets/native AEC with no trainable echo. Residual audio is diagnostic-only and never replaces mic PCM. Strict suspends upload through the echo tail; Off preserves capture PCM with native AEC only.
-- Keep native `echoCancellation`, `noiseSuppression`, and `autoGainControl` enabled and expose echo delay, readiness, confidence, ERLE, waveform/envelope correlation, acoustic state, dynamic human floor, candidate path, suppression, and candidate duration in diagnostics.
-- Adaptive v3 confirms about 450 ms while tolerating speech gaps up to 120 ms, then replays the untouched buffered onset in order. Coupled echo and ambiguous frames remain withheld; uncoupled evidence may resolve an untrained headset path. Learned echo state and acoustic classification reset only on Stop or session replacement.
+- Feed the exact generated playback PCM into the capture worklet as a non-audible reference; never substitute the static clone recording. Native browser AEC is the default. Adaptive uses only the SHA-verified, import-free bundled AEC3 module; any manifest, ABI, hash, compile, or worklet failure resolves truthfully to Native. Strict suspends uncertain upload through the echo tail without inserting zero PCM.
+- Keep native `echoCancellation`, `noiseSuppression`, and `autoGainControl` enabled and expose requested/effective mode, module availability, calibration, reference wiring, and double-talk status in diagnostics. The response-length setting remains independent.
+- Persist delay, strict suppression, leakage, and double-talk calibration by microphone/output-device pair. Feed the worklet the active AudioContext output latency and keep Sonora's derived `aec3-output-evidence` label distinct from WebRTC's private internal double-talk state.
 
 ## Child DOX Index
+
+- Realtime Audio Diagnostics follows the live graph and waterfall and stays
+  collapsed by default. Its compact summary shows provider, Realtime-selected
+  profile, delivery mode, and first-PCM latency; nested bounded Advanced
+  overrides stay aligned with the candidate schema and are grouped by latency
+  and phrase dispatch, conditioning and TTS sampling, and expert safety.
+  Realtime persists its canonical selection under `scope=realtime`, keeps
+  temporary overrides page-scoped, and can save the effective values as a new
+  immutable-built-in-safe custom profile without changing Voice Studio's
+  selection. Show named, override, and effective values separately; require an
+  explicit unsafe unlock before editing the 72-frame decoder context. Never
+  send audio.cpp tuning to another TTS provider. Expanded metrics include LLM first stable phrase, TTS first PCM,
+  first playback, synthesis RTF, end-to-end time, model/profile, GPU headroom,
+  paired reference source/requested/used duration, limit-applied state,
+  pairing mode, truthful delivery mode,
+  requested/effective echo mode, verified AEC3 identity, device calibration,
+  and truthful Native fallback reasons.
+- After resolving a candidate profile, carry only its bounded
+  `text_lookahead`/`phrase_flush_ms` snapshot in session `tts_tuning` so HF
+  Realtime can apply the same phrase queue without hardcoding profile defaults.
+  Drop stale resolved values when the selected profile changes.
+- Candidate supervisor REST payloads retain `scope=realtime`; WebSocket
+  `tts_tuning` is strictly limited to `provider`, `profile_id`, `overrides`, and
+  optional `resolved`. Candidate preflight must complete one live profile
+  resolution, and provider switches clear foreign voice/tuning state.
 
 - No child AGENTS.md files currently.

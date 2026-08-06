@@ -181,9 +181,90 @@
         </button>
       </header>
       <div id="diagnostics-warning" class="diagnostics-warning" hidden></div>
-      <p id="diagnostics-summary" class="diagnostics-summary">Waiting for a voice turn.</p>
-      <div id="diagnostics-graph" class="diagnostics-graph" aria-label="Pipeline stage graph"></div>
-      <div id="diagnostics-waterfall" class="diagnostics-waterfall"></div>
+       <p id="diagnostics-summary" class="diagnostics-summary">Waiting for a voice turn.</p>
+       <div id="diagnostics-graph" class="diagnostics-graph" aria-label="Pipeline stage graph"></div>
+       <div id="diagnostics-waterfall" class="diagnostics-waterfall"></div>
+       <details id="diagnostics-audio-details" class="diagnostics-audio" aria-label="Realtime audio diagnostics">
+         <summary class="diagnostics-audio-heading">
+           <span>Realtime Audio</span>
+           <span id="diagnostics-audio-summary">provider pending · profile pending · mode pending · first PCM pending</span>
+         </summary>
+         <div class="diagnostics-audio-body">
+          <div class="diagnostics-profile-row">
+            <label>TTS profile <select id="diagnostics-tts-profile"></select></label>
+            <button id="diagnostics-tts-profile-apply" type="button">Use in Realtime</button>
+          </div>
+          <div class="diagnostics-profile-row diagnostics-profile-save-row">
+            <label>New profile name <input id="diagnostics-tts-profile-name" type="text" maxlength="80" placeholder="My tuned profile"></label>
+            <button id="diagnostics-tts-profile-save-as" type="button">Save effective values as new profile</button>
+          </div>
+          <p class="diagnostics-audio-note">Built-in profiles are immutable. Save As creates a custom profile from the current effective values.</p>
+          <p id="diagnostics-tuning-status" class="diagnostics-audio-note">Select audio.cpp to tune its next session.</p>
+          <details id="diagnostics-tuning-advanced">
+            <summary>Advanced synthesis controls</summary>
+            <div class="diagnostics-tuning-value-state" aria-label="Tuning value sources">
+              <span><strong>Named profile</strong><output id="diagnostics-tuning-named-values">pending</output></span>
+              <span><strong>Temporary overrides</strong><output id="diagnostics-tuning-override-values">none</output></span>
+              <span><strong>Effective runtime</strong><output id="diagnostics-tuning-effective-values">pending</output></span>
+            </div>
+            <fieldset class="diagnostics-tuning-group">
+              <legend>Latency and phrase dispatch <span class="layer-badge">audio.cpp + phrase queue</span></legend>
+              <div class="diagnostics-tuning-grid">
+                <label>First block (80 ms frames)<small class="layer-badge">audio.cpp engine</small><input id="tuning-first-block-frames" data-tuning-key="first_block_frames" type="number" min="1" max="300" step="1"></label>
+                <label>Steady block (80 ms frames)<small class="layer-badge">audio.cpp engine</small><input id="tuning-steady-block-frames" data-tuning-key="steady_block_frames" type="number" min="1" max="300" step="1"></label>
+                <label>Text look-ahead (chars)<small class="layer-badge">phrase queue</small><input id="tuning-text-lookahead" data-tuning-key="text_lookahead" type="number" min="16" max="512" step="1"></label>
+                <label>Safe-clause idle flush (ms)<small class="layer-badge">phrase queue</small><input id="tuning-phrase-flush-ms" data-tuning-key="phrase_flush_ms" type="number" min="50" max="3000" step="10"></label>
+              </div>
+            </fieldset>
+            <fieldset class="diagnostics-tuning-group">
+              <legend>Conditioning and TTS sampling <span class="layer-badge">Qwen3-TTS</span></legend>
+              <p class="diagnostics-audio-note">These sampler values control speech-token variation and prosody. They do not change the chat LLM.</p>
+              <div class="diagnostics-tuning-grid">
+                <label>Matched reference limit (s)<small class="layer-badge">conditional</small><input id="tuning-max-reference-seconds" data-tuning-key="max_reference_seconds" type="number" min="1" max="30" step="1"></label>
+                <label>Temperature<small class="layer-badge">audio.cpp engine</small><input id="tuning-temperature" data-tuning-key="temperature" type="number" min="0.05" max="2" step="0.05"></label>
+                <label>Top-k<small class="layer-badge">audio.cpp engine</small><input id="tuning-top-k" data-tuning-key="top_k" type="number" min="1" max="200" step="1"></label>
+                <label>Top-p<small class="layer-badge">audio.cpp engine</small><input id="tuning-top-p" data-tuning-key="top_p" type="number" min="0.05" max="1" step="0.01"></label>
+                <label>Repetition penalty<small class="layer-badge">audio.cpp engine</small><input id="tuning-repetition-penalty" data-tuning-key="repetition_penalty" type="number" min="0.8" max="2" step="0.01"></label>
+                <label>Seed<small class="layer-badge">audio.cpp engine</small><input id="tuning-seed" data-tuning-key="seed" type="number" min="0" max="4294967295" step="1" placeholder="blank = random"></label>
+              </div>
+              <p class="diagnostics-audio-note">The reference limit is effective only when the clone stores a transcript-matched excerpt.</p>
+            </fieldset>
+            <fieldset class="diagnostics-tuning-group">
+              <legend>Expert safety <span class="layer-badge">explicit opt-in</span></legend>
+              <div class="diagnostics-tuning-grid">
+                <label>Required resident model<small class="layer-badge">safety</small><input id="tuning-model" data-tuning-key="model" data-tuning-type="string" type="text" placeholder="current resident model"></label>
+                <label>Decoder context (frames)<small class="layer-badge layer-badge-warning">experimental below 72</small><input id="tuning-left-context-frames" data-tuning-key="left_context_frames" type="number" min="1" max="300" step="1" disabled></label>
+                <label class="diagnostics-tuning-check"><input id="tuning-context-unlock" type="checkbox">Unlock unsafe decoder-context editing</label>
+                <label>Clone mode<small class="layer-badge">fixed</small><input type="text" value="Full ICL" disabled></label>
+                <label>Crossfade (samples)<small class="layer-badge">inactive</small><input id="tuning-crossfade" type="number" value="0" disabled></label>
+                <label>Output transport<small class="layer-badge">fixed</small><input type="text" value="24 kHz PCM16" disabled></label>
+              </div>
+              <p class="diagnostics-audio-note diagnostics-context-warning" id="diagnostics-context-warning">Keep decoder context at the model-required 72 frames. Reducing it can cause progressive quality loss.</p>
+            </fieldset>
+            <div class="diagnostics-tuning-actions">
+              <button id="diagnostics-tuning-apply" type="button">Apply temporary overrides</button>
+              <button id="diagnostics-tuning-clear" type="button">Clear overrides</button>
+           </div>
+           <p id="diagnostics-tuning-warnings" class="diagnostics-audio-note"></p>
+         </details>
+          <details><summary>Echo and live measurements</summary>
+            <p id="diagnostics-audio-status">AEC3 is verified when a conversation starts; Native remains the fallback.</p>
+            <p class="diagnostics-audio-note"><strong id="diagnostics-echo-device-pair">device pair pending</strong> · <span id="diagnostics-echo-output-latency">Output latency: pending</span></p>
+            <div class="diagnostics-tuning-grid">
+              <label>Reference delay (ms)<input data-echo-calibration-key="delayMs" type="number" min="0" max="500" step="1" value="0"></label>
+              <label>Strict suppression strength<input data-echo-calibration-key="suppressionStrength" type="number" min="0" max="1" step="0.05" value="0.65"></label>
+              <label>Leakage threshold<input data-echo-calibration-key="leakageThreshold" type="number" min="0.05" max="1" step="0.05" value="0.65"></label>
+              <label>Double-talk sensitivity<input data-echo-calibration-key="doubleTalkSensitivity" type="number" min="0" max="1" step="0.05" value="0.5"></label>
+            </div>
+            <div class="diagnostics-tuning-actions">
+              <button id="diagnostics-echo-save" type="button">Save device calibration</button>
+              <button id="diagnostics-echo-use-measured" type="button">Use measured delay</button>
+            </div>
+            <p class="diagnostics-audio-note">Calibration is saved separately for this microphone/output pair. Adaptive keeps AEC3-processed near-end speech eligible for barge-in; Strict can fail closed.</p>
+            <pre id="diagnostics-audio-metrics">Waiting for latency, model, profile, echo, and GPU metrics.</pre>
+          </details>
+         </div>
+       </details>
       <details class="diagnostics-raw">
         <summary>Raw metrics</summary>
         <div id="diagnostics-list" class="diagnostics-list"></div>
@@ -313,6 +394,50 @@
               </select>
             </label>
 
+            <details class="field profile-manager">
+              <summary>Manage selected backend clone profiles</summary>
+              <small id="profile-library-status">Loading configured Faster voice library…</small>
+              <label class="field">
+                <span>Profile name</span>
+                <input id="profile-name" type="text" autocomplete="off" maxlength="80" placeholder="New clone name" />
+              </label>
+              <label class="field">
+                <span>Reference transcript</span>
+                <textarea id="profile-ref-text" rows="3" placeholder="Words spoken in the reference WAV"></textarea>
+              </label>
+              <label class="field">
+                <span>Language</span>
+                <input id="profile-language" type="text" value="Auto" maxlength="32" />
+              </label>
+              <div class="profile-actions">
+                <button id="profile-create" type="button" class="btn">Duplicate selected</button>
+                <button id="profile-save" type="button" class="btn">Save edits</button>
+                <button id="profile-delete" type="button" class="btn">Delete selected</button>
+              </div>
+              <label class="field">
+                <span>Import reference WAV</span>
+                <input id="profile-audio" type="file" accept="audio/wav,.wav" />
+              </label>
+              <button id="profile-import" type="button" class="btn">Import as new clone</button>
+              <small>Profile actions target only the selected backend and are disabled when that backend is inventory-only.</small>
+            </details>
+
+            <details class="field model-manager">
+              <summary>Selected backend model status</summary>
+              <small id="model-inventory-status">Loading Faster model state…</small>
+              <div class="profile-actions">
+                <button id="faster-model-load" type="button" class="btn">Load</button>
+                <button id="faster-model-switch" type="button" class="btn">Switch</button>
+                <button id="faster-model-unload" type="button" class="btn">Unload</button>
+              </div>
+              <small>Controls are enabled only when the selected service actually exposes model lifecycle support.</small>
+            </details>
+
+            <div class="field">
+              <button id="validate-audio-cpp" type="button" class="btn">Validate selected TTS backend</button>
+              <small id="audio-cpp-status">Checks live health, resident model, selected clone, capabilities, and a short real synthesis without changing model residency.</small>
+            </div>
+
             <div class="field">
               <span class="field-head">
                 Noise gate
@@ -345,19 +470,19 @@
             <label class="field">
               <span>Assistant echo guard</span>
               <select id="echo-guard">
-                <option value="adaptive" selected>Adaptive (recommended)</option>
+                <option value="native" selected>Native browser AEC (default)</option>
+                <option value="adaptive">Adaptive (AEC3 reference cancellation)</option>
                 <option value="strict">Strict</option>
-                <option value="off">Off</option>
               </select>
-              <small>Adaptive rejects playback echo while preserving confirmed barge-in. Strict pauses mic upload during playback; Off uses native browser echo cancellation only.</small>
+              <small>Native browser AEC is the default. Adaptive uses the verified playback-reference AEC3 module and falls back truthfully to Native if loading fails. Strict pauses uncertain mic upload without manufacturing silence.</small>
             </label>
 
             <div class="field local-mode-field">
               <label class="inline-check">
                 <input id="full-buffer-tts" type="checkbox" />
-                <span>Wait for complete Gemma response</span>
+                <span>Non-streaming assistant dispatch</span>
               </label>
-              <small>Disables phrase dispatch. Qwen3TTS audio streaming remains controlled by the local backend.</small>
+              <small id="tts-streaming-status">Streaming is the default. This optional mode waits for the complete Gemma response; it does not fake backend PCM streaming.</small>
             </div>
 
             <label class="field">
@@ -389,6 +514,7 @@
         </div>
 
         <footer class="modal-footer">
+          <small id="settings-save-status"></small>
           <button id="settings-save" type="submit" class="btn primary" value="save">Save</button>
         </footer>
       </form>
@@ -455,6 +581,6 @@
       </div>
     </dialog>
 
-    <script type="module" src="main.js?v=12-adaptive-v3"></script>
+    <script type="module" src="main.js?v=25-config-ack"></script>
   </body>
 </html>

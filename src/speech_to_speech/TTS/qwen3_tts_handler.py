@@ -64,6 +64,8 @@ DEFAULT_OPENAI_API_BASE_URL = "http://127.0.0.1:8881/v1"
 DEFAULT_OPENAI_API_VOICE = "clone:16d9bb336799"
 DEFAULT_OPENAI_API_BACKEND_MODEL = "1.7B-Base"
 DEFAULT_GROXAXO_API_BASE_URL = "http://127.0.0.1:8882/v1"
+DEFAULT_AUDIO_CPP_API_BASE_URL = "http://127.0.0.1:8890/v1"
+AUDIO_CPP_NATIVE_COLD_FIRST_PCM_BUDGET_S = 45.0
 DEFAULT_OPENAI_API_VOICE_LIBRARY_DIR = (
     r"C:\Users\yepyy\Documents\Codex\2026-05-24\files-mentioned-by-the-user-i"
     r"\qwen3-tts-candidate\voice_library_from_original"
@@ -189,8 +191,13 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.groxaxo_api_base_url = (
             os.getenv("QWEN3_TTS_GROXAXO_BASE_URL") or DEFAULT_GROXAXO_API_BASE_URL
         ).rstrip("/")
+        self.audio_cpp_api_base_url = (
+            os.getenv("QWEN3_TTS_AUDIO_CPP_BASE_URL") or DEFAULT_AUDIO_CPP_API_BASE_URL
+        ).rstrip("/")
         self._active_response: httpx.Response | None = None
         self._active_response_lock = Lock()
+        self._audio_cpp_native_warm_streams: set[tuple[str, str, str]] = set()
+        self._audio_cpp_native_lifecycle_epochs: dict[tuple[str, str], str] = {}
 
         if self.faster_backend == "openai-api":
             self.backend = "openai_api"
@@ -201,8 +208,10 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         if self.backend == "openai_api":
             self.device = "remote"
             self.model_name = model_name
-            logger.info("Using OpenAI-compatible Qwen3-TTS API at %s", self.api_base_url)
-            self._ensure_openai_api_backend_model()
+            logger.info(
+                "Using deferred OpenAI-compatible Qwen3-TTS API at %s; provider availability is checked per request",
+                self.api_base_url,
+            )
         elif self.backend == "mlx":
             self.device = "mps"
             self.model_name = self._resolve_mlx_model_name(model_name)
@@ -726,15 +735,27 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                 return str(output.voice)
         return self.api_voice
 
-    def _openai_api_payload(self, text: str, voice: str, language: str = "Auto") -> dict[str, Any]:
-        return {
-            "model": self.api_model,
+    def _openai_api_payload(
+        self,
+        text: str,
+        voice: str,
+        language: str = "Auto",
+        *,
+        stream: bool = True,
+        model: str | None = None,
+        tts_tuning: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "model": model or self.api_model,
             "input": text,
             "voice": voice,
             "response_format": getattr(self, "api_response_format", "pcm"),
-            "stream": True,
+            "stream": stream,
             "language": language,
         }
+        if tts_tuning is not None:
+            payload["tuning"] = tts_tuning
+        return payload
 
     def _openai_api_headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -845,11 +866,73 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         if runtime_config is not None:
             selected = str(runtime_config.local_pipeline.get("tts_backend") or "faster").lower()
         if selected == "faster":
+            base_url = getattr(self, "api_base_url", DEFAULT_OPENAI_API_BASE_URL)
+            try:
+                response = httpx.get(
+                    f"{base_url.removesuffix('/v1')}/health",
+                    headers=self._openai_api_headers(),
+                    timeout=2.0,
+                )
+                response.raise_for_status()
+                health = response.json()
+            except Exception as exc:
+                raise RuntimeError(
+                    "FasterQwen3TTS is selected but is currently unreachable on port 8881. "
+                    "The pipeline remains running; start the service or choose another TTS backend."
+                ) from exc
+            capabilities = health.get("capabilities") or {}
+            if not health.get("model_loaded") or not capabilities.get("clone_only"):
+                raise RuntimeError("FasterQwen3TTS is reachable but its Base clone model is not ready.")
+            self.api_streaming_supported = bool(capabilities.get("native_pcm_streaming"))
+            self.api_response_format = "pcm" if self.api_streaming_supported else "wav"
+            sample_rate = capabilities.get("sample_rate")
+            if isinstance(sample_rate, int) and sample_rate > 0:
+                self.api_sample_rate = sample_rate
             return (
                 selected,
-                getattr(self, "api_base_url", DEFAULT_OPENAI_API_BASE_URL),
+                base_url,
                 getattr(self, "api_backend_model", DEFAULT_OPENAI_API_BACKEND_MODEL),
             )
+        if selected in {"qwen3tts-audiocpp", "audio-cpp"}:
+            status_url = f"{self.audio_cpp_api_base_url}/backend/models"
+            try:
+                response = httpx.get(status_url, headers=self._openai_api_headers(), timeout=2.0)
+                response.raise_for_status()
+                status = response.json()
+            except Exception as exc:
+                raise RuntimeError(
+                    "Qwen3TTS audio.cpp is unreachable on port 8890. Load a compatible Base model in its Voice Studio first."
+                ) from exc
+            current = str(status.get("current") or "")
+            loaded = status.get("loaded_models") or []
+            runtime = status.get("runtime") or {}
+            progressive = bool(runtime.get("progressive_phrase_pcm"))
+            native_incremental = bool(runtime.get("native_incremental_pcm"))
+            if (
+                status.get("state") != "loaded"
+                or current not in loaded
+                or not current.endswith("base-bf16")
+                or not (native_incremental or progressive)
+            ):
+                raise RuntimeError(
+                    "Qwen3TTS audio.cpp requires one loaded Base BF16 model and a PCM delivery capability. "
+                    "Use its Voice Studio to load and validate the selected model first."
+                )
+            # Reset mutable Faster-derived transport fields on every provider
+            # resolve.  A validated native candidate streams the engine's PCM
+            # chunks directly; older candidates retain completed phrase PCM as
+            # the explicit rollback path.
+            self.api_streaming_supported = native_incremental
+            self.api_candidate_streaming_mode = (
+                "native_incremental_pcm" if native_incremental else "buffered_phrase"
+            )
+            self.api_response_format = "pcm"
+            sample_rate = runtime.get("sample_rate")
+            self.api_sample_rate = int(sample_rate) if isinstance(sample_rate, int) and sample_rate > 0 else 24000
+            self._observe_audio_cpp_native_lifecycle_epoch(
+                self.audio_cpp_api_base_url, current, status
+            )
+            return "qwen3tts-audiocpp", self.audio_cpp_api_base_url, current
         if selected != "groxaxo":
             raise RuntimeError(f"Unsupported TTS backend selection: {selected!r}")
 
@@ -899,6 +982,68 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         estimated = max(words / 2.6 if words else 0.0, chars / 14.0 if chars else 0.0)
         return min(60.0, max(12.0, 3.0 * estimated + 5.0))
 
+    @staticmethod
+    def _audio_cpp_native_lifecycle_epoch(
+        status: dict[str, Any], model: str
+    ) -> str | None:
+        events = status.get("events")
+        if not isinstance(events, list):
+            return None
+        supervisor_event: dict[str, Any] | None = None
+        model_event: dict[str, Any] | None = None
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            action = str(event.get("action") or "")
+            if action == "supervisor-started":
+                supervisor_event = event
+            if action in {"child-start", "model-ready"} and str(event.get("model") or "") == model:
+                model_event = event
+        if supervisor_event is None and model_event is None:
+            return None
+        return json.dumps(
+            {"supervisor": supervisor_event, "model": model_event},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+
+    def _observe_audio_cpp_native_lifecycle_epoch(
+        self, base_url: str, model: str, status: dict[str, Any]
+    ) -> None:
+        observed = self._audio_cpp_native_lifecycle_epoch(status, model)
+        if observed is None:
+            return
+        base_key = (str(base_url).rstrip("/"), str(model))
+        epochs = getattr(self, "_audio_cpp_native_lifecycle_epochs", None)
+        if epochs is None:
+            epochs = {}
+            self._audio_cpp_native_lifecycle_epochs = epochs
+        previous = epochs.get(base_key)
+        epochs[base_key] = observed
+        if previous is not None and previous != observed:
+            warm_streams = self._audio_cpp_native_warm_streams_state()
+            warm_streams.difference_update(
+                key for key in tuple(warm_streams) if key[:2] == base_key
+            )
+
+    def _audio_cpp_native_stream_key(
+        self, base_url: str | None, model: str | None
+    ) -> tuple[str, str, str]:
+        base_key = (
+            str(base_url or getattr(self, "api_base_url", "")).rstrip("/"),
+            str(model or ""),
+        )
+        epochs = getattr(self, "_audio_cpp_native_lifecycle_epochs", None) or {}
+        return (*base_key, epochs.get(base_key, "unobserved"))
+
+    def _audio_cpp_native_warm_streams_state(self) -> set[tuple[str, str, str]]:
+        warm_streams = getattr(self, "_audio_cpp_native_warm_streams", None)
+        if warm_streams is None:
+            warm_streams = set()
+            self._audio_cpp_native_warm_streams = warm_streams
+        return warm_streams
+
     def _process_openai_api(
         self,
         text: str,
@@ -906,27 +1051,74 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         *,
         language: str = "Auto",
         base_url: str | None = None,
+        model: str | None = None,
         generation: int | None = None,
+        progressive_buffered: bool = False,
+        native_candidate: bool = False,
+        tts_tuning: dict[str, Any] | None = None,
     ) -> Iterator[np.ndarray]:
-        voices = [self._api_voice_for_backend(voice)]
-        if self.api_fallback_voice and self.api_fallback_voice not in voices:
+        private_clone = progressive_buffered or native_candidate
+        voices = [voice if private_clone else self._api_voice_for_backend(voice)]
+        # audio.cpp owns a private clone library.  Retrying the configured
+        # Faster fallback would silently substitute a foreign clone and makes
+        # a selected-candidate failure impossible to diagnose.
+        if not private_clone and self.api_fallback_voice and self.api_fallback_voice not in voices:
             voices.append(self._api_voice_for_backend(self.api_fallback_voice))
         last_error: Exception | None = None
         for candidate_voice in voices:
+            emitted_audio = False
             try:
-                yield from self._stream_openai_api_voice(
-                    text,
-                    candidate_voice,
-                    language=language,
-                    base_url=base_url,
-                    generation=generation,
+                stream_kwargs = {
+                    "language": language,
+                    "base_url": base_url,
+                    "model": model,
+                    "generation": generation,
+                    "progressive_buffered": progressive_buffered,
+                }
+                # Preserve the established mock/custom-subclass call contract
+                # for non-candidate providers.  Candidate tuning is optional
+                # and must not become an unexpected None keyword argument.
+                if tts_tuning is not None:
+                    stream_kwargs["tts_tuning"] = tts_tuning
+                if native_candidate:
+                    stream_kwargs["native_candidate"] = True
+                self._last_streaming_mode = (
+                    "native_incremental_pcm"
+                    if native_candidate
+                    else "buffered_phrase"
+                    if progressive_buffered
+                    else "provider_default"
                 )
+                for audio_chunk in self._stream_openai_api_voice(text, candidate_voice, **stream_kwargs):
+                    emitted_audio = True
+                    yield audio_chunk
                 return
             except TTSRunawayError:
                 raise
             except httpx.ReadTimeout as exc:
+                if native_candidate and not emitted_audio:
+                    logger.warning(
+                        "audio.cpp native PCM timed out before first playback chunk; using explicit buffered fallback"
+                    )
+                    fallback_kwargs = dict(stream_kwargs)
+                    fallback_kwargs["progressive_buffered"] = True
+                    fallback_kwargs["native_candidate"] = False
+                    self._last_streaming_mode = "buffered_fallback"
+                    yield from self._stream_openai_api_voice(text, candidate_voice, **fallback_kwargs)
+                    return
                 raise TTSRunawayError("TTS stream produced no data before its latency budget expired") from exc
             except Exception as exc:
+                if native_candidate and not emitted_audio:
+                    logger.warning(
+                        "audio.cpp native PCM failed before first playback chunk; using explicit buffered fallback: %s",
+                        exc,
+                    )
+                    fallback_kwargs = dict(stream_kwargs)
+                    fallback_kwargs["progressive_buffered"] = True
+                    fallback_kwargs["native_candidate"] = False
+                    self._last_streaming_mode = "buffered_fallback"
+                    yield from self._stream_openai_api_voice(text, candidate_voice, **fallback_kwargs)
+                    return
                 last_error = exc
                 logger.warning("OpenAI-compatible Qwen3-TTS request failed for voice %s: %s", candidate_voice, exc)
         if last_error is not None:
@@ -939,11 +1131,37 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         *,
         language: str = "Auto",
         base_url: str | None = None,
+        model: str | None = None,
         generation: int | None = None,
+        progressive_buffered: bool = False,
+        tts_tuning: dict[str, Any] | None = None,
+        native_candidate: bool = False,
     ) -> Iterator[np.ndarray]:
         url = f"{base_url or self.api_base_url}/audio/speech"
         start = perf_counter()
-        runaway_budget_s = self._runaway_budget_s(text)
+        # Buffered audio.cpp fallback can legitimately exceed Faster's short
+        # realtime stream budget. Every transport remains cancellation-owned so
+        # Stop/barge-in can release it promptly. A native audio.cpp engine/model
+        # receives one bounded cold first-PCM allowance. The first complete PCM
+        # sample marks only that endpoint/model warm; later requests retain the
+        # normal 12-60 second budget used before this exception was introduced.
+        normal_runaway_budget_s = self._runaway_budget_s(text)
+        native_stream_key = (
+            self._audio_cpp_native_stream_key(base_url, model)
+            if native_candidate and not progressive_buffered
+            else None
+        )
+        native_cold_start = bool(
+            native_stream_key is not None
+            and native_stream_key not in self._audio_cpp_native_warm_streams_state()
+        )
+        runaway_budget_s = (
+            180.0
+            if progressive_buffered
+            else max(AUDIO_CPP_NATIVE_COLD_FIRST_PCM_BUDGET_S, normal_runaway_budget_s)
+            if native_cold_start
+            else normal_runaway_budget_s
+        )
         total_samples = 0
         pending_bytes = b""
         pending_samples = np.array([], dtype=np.int16)
@@ -953,13 +1171,21 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             "POST",
             url,
             headers=self._openai_api_headers(),
-            json_body=self._openai_api_payload(text, voice, language),
+            json_body=self._openai_api_payload(
+                text,
+                voice,
+                language,
+                stream=not progressive_buffered,
+                model=model,
+                tts_tuning=tts_tuning,
+            ),
             timeout=request_timeout,
         )
         with self._active_response_lock:
             self._active_response = response
         try:
             response.wait_for_headers()
+            self._last_tts_response_headers = dict(getattr(response, "response_headers", {}) or {})
             if getattr(self, "api_response_format", "pcm") != "pcm":
                 encoded_parts: list[bytes] = []
                 for chunk in response.iter_bytes():
@@ -993,6 +1219,8 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                     continue
                 pcm24 = np.frombuffer(pending_bytes[:even], dtype="<i2")
                 pending_bytes = pending_bytes[even:]
+                if native_stream_key is not None and pcm24.size:
+                    self._audio_cpp_native_warm_streams_state().add(native_stream_key)
                 pcm16 = self._resample_to_pipeline_sr(pcm24, self.api_sample_rate).astype(np.int16)
                 pending_samples = np.concatenate([pending_samples, pcm16])
                 n = (len(pending_samples) // self.blocksize) * self.blocksize
@@ -1036,8 +1264,119 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                 chunk = np.pad(chunk, (0, self.blocksize - len(chunk)))
             yield chunk
 
+    @staticmethod
+    def _candidate_response_metric_detail(headers: dict[str, Any] | None) -> dict[str, Any]:
+        """Return bounded, transcript-free diagnostics from candidate headers."""
+        normalized = {
+            str(key).strip().lower(): str(value).strip()
+            for key, value in (headers or {}).items()
+        }
+        detail: dict[str, Any] = {}
+        float_headers = {
+            "reference_source_seconds": "x-tts-reference-source-seconds",
+            "reference_requested_limit_seconds": "x-tts-reference-requested-limit-seconds",
+            "reference_used_seconds": "x-tts-reference-used-seconds",
+        }
+        for field, header in float_headers.items():
+            raw = normalized.get(header)
+            if raw is None:
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value >= 0:
+                detail[field] = round(value, 3)
+
+        limit_raw = normalized.get("x-tts-reference-limit-applied")
+        if limit_raw is None:
+            limit_raw = normalized.get("x-tts-reference-truncated")
+        if limit_raw in {"true", "false"}:
+            applied = limit_raw == "true"
+            detail["reference_limit_applied"] = applied
+            # Retain the original metric name for older diagnostics clients.
+            detail["reference_truncated"] = applied
+
+        pairing = normalized.get("x-tts-reference-pairing")
+        if pairing in {"full", "matched-excerpt"}:
+            detail["reference_pairing"] = pairing
+
+        delivery_mode = normalized.get("x-tts-delivery-mode")
+        if delivery_mode in {
+            "offline-full-decoder",
+            "native-incremental-pcm",
+            "buffered-fallback",
+        }:
+            detail["delivery_mode"] = delivery_mode
+
+        if detail.get("reference_used_seconds", 0) > 0:
+            detail["reference_used"] = True
+        return detail
+
+    @staticmethod
+    def _candidate_phrase_queue_settings(current_input: TTSInput) -> tuple[int, float] | None:
+        """Return the bounded audio.cpp-only look-ahead target and flush window."""
+        runtime_config = current_input.runtime_config
+        local_pipeline = getattr(runtime_config, "local_pipeline", None)
+        if not isinstance(local_pipeline, dict) or local_pipeline.get("tts_backend") != "qwen3tts-audiocpp":
+            return None
+        tuning = local_pipeline.get("tts_tuning")
+        if not isinstance(tuning, dict) or tuning.get("provider") != "qwen3tts-audiocpp":
+            return None
+        resolved = tuning.get("resolved")
+        if not isinstance(resolved, dict):
+            return None
+        text_lookahead = resolved.get("text_lookahead")
+        phrase_flush_ms = resolved.get("phrase_flush_ms")
+        if (
+            isinstance(text_lookahead, bool)
+            or not isinstance(text_lookahead, int)
+            or not 16 <= text_lookahead <= 512
+            or isinstance(phrase_flush_ms, bool)
+            or not isinstance(phrase_flush_ms, int)
+            or not 50 <= phrase_flush_ms <= 3000
+        ):
+            return None
+        return text_lookahead, phrase_flush_ms / 1000.0
+
+    @staticmethod
+    def _has_explicit_phrase_boundary(text: str) -> bool:
+        """Return whether *text* already ends at a speakable sentence boundary.
+
+        LLM and direct-audio handlers emit punctuation-complete text as soon as
+        it is stable.  Candidate look-ahead must not hold that first phrase just
+        to collect more text; the look-ahead/flush policy is only for an
+        otherwise incomplete fragment.
+        """
+
+        return bool(re.search(r"[.!?\u3002\uff01\uff1f\u2026][\"'\u2019\u201d)\]}]*\s*$", text))
+
+    @staticmethod
+    def _tts_backend_for_input(item: TTSInput) -> str:
+        runtime_config = item.runtime_config
+        local_pipeline = getattr(runtime_config, "local_pipeline", None)
+        if not isinstance(local_pipeline, dict):
+            return "faster"
+        provider = str(local_pipeline.get("tts_backend") or "faster").lower()
+        return "qwen3tts-audiocpp" if provider == "audio-cpp" else provider
+
+    def _input_generation_is_stale(self, item: TTSInput) -> bool:
+        generation = item.cancel_generation
+        cancel_scope = getattr(self, "cancel_scope", None)
+        return bool(
+            generation is not None
+            and cancel_scope is not None
+            and cancel_scope.is_stale(generation)
+        )
+
     def _coalesce_pending_tts_input(self, current_input: TTSInput) -> tuple[str, Optional[str], bool]:
-        """Combine already-queued text chunks before the next TTS synthesis call."""
+        """Combine compatible text chunks before the next synthesis call.
+
+        Existing providers retain the ready-queue-only 420-character cap.
+        audio.cpp may additionally wait for its supervisor-resolved look-ahead
+        target, bounded by the profile's flush window. A response/control or
+        turn boundary always releases the current phrase immediately.
+        """
         if not hasattr(self.queue_in, "mutex") or not hasattr(self.queue_in, "queue"):
             return current_input.text, current_input.language_code, False
 
@@ -1047,8 +1386,33 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         parts = [text.strip()] if text and text.strip() else []
         saw_end_of_response = False
 
+        phrase_queue = self._candidate_phrase_queue_settings(current_input)
+        if phrase_queue and self._has_explicit_phrase_boundary(text):
+            # Punctuation already made this phrase stable upstream.  Dispatch it
+            # immediately so native synthesis can overlap the rest of the LLM
+            # response instead of waiting for another phrase or the flush timer.
+            return " ".join(parts).strip(), language_code, saw_end_of_response
+        target_chars = phrase_queue[0] if phrase_queue else MAX_COALESCED_TTS_CHARS
+        deadline = perf_counter() + phrase_queue[1] if phrase_queue else None
+
         with self.queue_in.mutex:
-            while self.queue_in.queue:
+            while True:
+                combined_length = len(" ".join(parts))
+                if phrase_queue and combined_length >= target_chars:
+                    break
+                if not self.queue_in.queue:
+                    if deadline is None or not hasattr(self.queue_in, "not_empty"):
+                        break
+                    if self._input_generation_is_stale(current_input):
+                        break
+                    remaining = deadline - perf_counter()
+                    if remaining <= 0:
+                        break
+                    # Cancellation does not have to enqueue another phrase, so
+                    # wake periodically and re-check the generation while an
+                    # incomplete fragment is waiting on its flush deadline.
+                    self.queue_in.not_empty.wait(timeout=min(remaining, 0.05))
+                    continue
                 next_item = self.queue_in.queue[0]
                 if is_control_message(next_item, SESSION_END.kind):
                     break
@@ -1061,6 +1425,10 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                     break
                 if current_input.turn_id != next_item.turn_id or current_input.turn_revision != next_item.turn_revision:
                     break
+                if current_input.cancel_generation != next_item.cancel_generation:
+                    break
+                if self._tts_backend_for_input(current_input) != self._tts_backend_for_input(next_item):
+                    break
                 if (
                     language_code is not None
                     and next_item.language_code is not None
@@ -1069,10 +1437,10 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                     break
 
                 candidate = next_item.text.strip()
-                # The Faster HTTP backend is serialized.  Keep phrase dispatch
-                # responsive and leave remaining chunks queued instead of turning
-                # an interrupted long answer into one huge TTS request.
-                if parts and len(" ".join(parts)) + len(candidate) + 1 > MAX_COALESCED_TTS_CHARS:
+                # Keep every provider below the established hard request cap.
+                # audio.cpp's look-ahead is a target rather than a truncation:
+                # consume the complete stable phrase that crosses the target.
+                if parts and combined_length + len(candidate) + 1 > MAX_COALESCED_TTS_CHARS:
                     break
                 self.queue_in.queue.popleft()
                 if candidate:
@@ -1105,8 +1473,28 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
 
         runtime_config = tts_input.runtime_config
         response = tts_input.response
+        generation = tts_input.cancel_generation
+        cancel_scope = getattr(self, "cancel_scope", None)
+        if generation is None and cancel_scope is not None:
+            generation = cancel_scope.generation
+        if self._input_generation_is_stale(tts_input):
+            self._emit_metric(
+                "tts",
+                "cancelled_before_audio",
+                tts_input,
+                detail={"reason": "stale before phrase dispatch"},
+            )
+            return
 
         coalesced_text, language_code, _saw_end_of_response = self._coalesce_pending_tts_input(tts_input)
+        if self._input_generation_is_stale(tts_input):
+            self._emit_metric(
+                "tts",
+                "cancelled_before_audio",
+                tts_input,
+                detail={"reason": "cancelled while waiting for phrase flush"},
+            )
+            return
 
         text = coalesced_text or "Hello."
 
@@ -1118,23 +1506,67 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         if not language_code and runtime_config is not None:
             language_code = runtime_config.local_pipeline.get("assistant_language")
         api_language = self._api_language_name(language_code, text)
-        generation = tts_input.cancel_generation
-        if generation is None and self.cancel_scope is not None:
-            generation = self.cancel_scope.generation
         if self.backend == "openai_api":
             provider_name, provider_url, provider_model = self._resolve_api_provider(runtime_config)
+        candidate_native = provider_name == "qwen3tts-audiocpp" and bool(
+            getattr(self, "api_streaming_supported", False)
+        )
+        tts_tuning = None
+        if provider_name == "qwen3tts-audiocpp" and runtime_config is not None:
+            candidate_tuning = runtime_config.local_pipeline.get("tts_tuning")
+            if isinstance(candidate_tuning, dict) and candidate_tuning.get("provider") == "qwen3tts-audiocpp":
+                tts_tuning = candidate_tuning
         if self.backend != "openai_api":
             self._apply_session_voice_override(model_type, runtime_config, response)
 
         # Do not print assistant content through Rich here. A Windows CP1252
         # console can reject non-ASCII text and leave Rich's buffer poisoned,
         # blocking every later TTS request in the process.
-        logger.info("Qwen3 TTS request chars=%d backend=%s", len(text), self.backend)
+        logger.info(
+            "Qwen3 TTS request chars=%d provider=%s model=%s voice=%s format=%s",
+            len(text),
+            provider_name,
+            provider_model,
+            api_voice if self.backend == "openai_api" else getattr(self, "speaker", None),
+            getattr(self, "api_response_format", None) if self.backend == "openai_api" else "pcm",
+        )
         start_s = perf_counter()
+        if self.backend == "openai_api":
+            # A failed or mocked request must not inherit pairing metadata from
+            # an earlier provider call in the same long-lived handler.
+            self._last_tts_response_headers = {}
+        intended_streaming_mode = (
+            getattr(self, "api_candidate_streaming_mode", "buffered_phrase")
+            if provider_name == "qwen3tts-audiocpp"
+            else "provider_default"
+        )
+        first_phrase_turns = getattr(self, "_metric_first_phrase_turns", None)
+        if first_phrase_turns is None:
+            first_phrase_turns = self._metric_first_phrase_turns = set()
+        phrase_key = (tts_input.turn_id, tts_input.turn_revision)
+        if phrase_key not in first_phrase_turns:
+            first_phrase_turns.add(phrase_key)
+            if len(first_phrase_turns) > 256:
+                first_phrase_turns.pop()
+            phrase_elapsed_ms = None
+            if tts_input.speech_stopped_at_s is not None:
+                phrase_elapsed_ms = max(0.0, (start_s - tts_input.speech_stopped_at_s) * 1000)
+            self._emit_metric(
+                "gemma",
+                "first_stable_phrase",
+                tts_input,
+                elapsed_ms=phrase_elapsed_ms,
+                detail={"chars": len(text), "provider": provider_name},
+            )
         self._emit_metric(
             "tts",
             "request_start",
             tts_input,
+            elapsed_ms=(
+                max(0.0, (start_s - tts_input.speech_stopped_at_s) * 1000)
+                if tts_input.speech_stopped_at_s is not None
+                else None
+            ),
             detail={
                 "backend": provider_name,
                 "api_base_url": provider_url if self.backend == "openai_api" else None,
@@ -1142,17 +1574,31 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                 "language": api_language,
                 "api_response_format": getattr(self, "api_response_format", None),
                 "chars": len(text),
+                "tts_profile_id": tts_tuning.get("profile_id") if isinstance(tts_tuning, dict) else None,
+                "tts_tuning_provider": tts_tuning.get("provider") if isinstance(tts_tuning, dict) else None,
+                "streaming_mode": intended_streaming_mode,
             },
         )
 
         try:
             if self.backend == "openai_api":
+                process_kwargs: dict[str, Any] = {
+                    "language": api_language,
+                    "base_url": provider_url,
+                    "model": provider_model,
+                    "generation": generation,
+                    "progressive_buffered": (
+                        provider_name == "qwen3tts-audiocpp" and not candidate_native
+                    ),
+                }
+                if candidate_native:
+                    process_kwargs["native_candidate"] = True
+                if tts_tuning is not None:
+                    process_kwargs["tts_tuning"] = tts_tuning
                 audio_iter = self._process_openai_api(
                     text,
                     api_voice or self.api_voice,
-                    language=api_language,
-                    base_url=provider_url,
-                    generation=generation,
+                    **process_kwargs,
                 )
             elif self.ref_audio:
                 audio_iter = self._process_voice_clone(text)
@@ -1170,18 +1616,95 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             for audio_chunk in audio_iter:
                 if first_audio:
                     self._log_first_audio_latency(tts_input)
-                    self._emit_metric("tts", "first_audio", tts_input, elapsed_ms=(perf_counter() - start_s) * 1000)
+                    first_pcm_ms = (perf_counter() - start_s) * 1000
+                    self._emit_metric(
+                        "tts",
+                        "first_audio",
+                        tts_input,
+                        elapsed_ms=first_pcm_ms,
+                        detail={
+                            "backend": provider_name,
+                            "model": provider_model,
+                            "profile_id": tts_tuning.get("profile_id") if isinstance(tts_tuning, dict) else None,
+                            "mode": getattr(self, "_last_streaming_mode", intended_streaming_mode),
+                            "first_pcm_ms": round(first_pcm_ms, 3),
+                            "end_to_end_ms": (
+                                round(max(0.0, (perf_counter() - tts_input.speech_stopped_at_s) * 1000), 3)
+                                if tts_input.speech_stopped_at_s is not None
+                                else None
+                            ),
+                            "gpu": None,
+                        },
+                    )
                     first_audio = False
                 audio_samples += int(np.asarray(audio_chunk).size)
                 yield audio_chunk
             elapsed_s = perf_counter() - start_s
             audio_s = audio_samples / PIPELINE_SR
+            if audio_samples == 0:
+                cancelled = (
+                    generation is not None
+                    and self.cancel_scope is not None
+                    and self.cancel_scope.is_stale(generation)
+                )
+                status = "cancelled_before_audio" if cancelled else "empty_audio"
+                message = (
+                    "Qwen3-TTS request cancelled before buffered audio was ready"
+                    if cancelled
+                    else "Qwen3-TTS request completed without audio"
+                )
+                log = logger.info if cancelled else logger.warning
+                log(
+                    "%s provider=%s model=%s voice=%s elapsed=%.2fs",
+                    message,
+                    provider_name,
+                    provider_model,
+                    api_voice or self.api_voice,
+                    elapsed_s,
+                )
+                self._emit_metric(
+                    "tts",
+                    status,
+                    tts_input,
+                    elapsed_ms=elapsed_s * 1000,
+                    detail={
+                        "backend": provider_name,
+                        "model": provider_model,
+                        "voice": api_voice or self.api_voice,
+                        "reason": "barge-in/stop/replacement" if cancelled else "provider returned no audio",
+                    },
+                )
+                return
             self._emit_metric(
                 "tts",
                 "done",
                 tts_input,
                 elapsed_ms=elapsed_s * 1000,
-                detail={"audio_s": round(audio_s, 3), "rtf": round(elapsed_s / audio_s, 3) if audio_s else None},
+                detail={
+                    "backend": provider_name,
+                    "model": provider_model,
+                    "profile_id": tts_tuning.get("profile_id") if isinstance(tts_tuning, dict) else None,
+                    "profile_revision": None,
+                    "mode": getattr(self, "_last_streaming_mode", intended_streaming_mode),
+                    "generation_ms": round(elapsed_s * 1000, 3),
+                    "audio_duration_ms": round(audio_s * 1000, 3),
+                    "rtf": round(elapsed_s / audio_s, 3) if audio_s else None,
+                    "reference_used": bool(getattr(self, "ref_audio", None)),
+                    "reference_truncated": str(
+                        getattr(self, "_last_tts_response_headers", {}).get(
+                            "x-tts-reference-truncated", ""
+                        )
+                    ).lower()
+                    == "true",
+                    "gpu": None,
+                    **(
+                        self._candidate_response_metric_detail(
+                            getattr(self, "_last_tts_response_headers", {})
+                        )
+                        if provider_name == "qwen3tts-audiocpp"
+                        else {}
+                    ),
+                },
             )
         except TTSRunawayError as e:
             logger.error("Qwen3-TTS runaway stream aborted: %s", e)

@@ -162,7 +162,8 @@ NOT collide with the WebRTC variant.
 | `ws/s2s-ws-client.js` | WebSocket handshake + OpenAI Realtime GA protocol |
 | `ws/codec.js` | base64 <-> PCM helpers + transcript extraction (pure) |
 | `ws/orb-visualizer.js` | `OrbVisualiser`: FFT bands -> orb CSS custom properties |
-| `worklets/mic-capture.js` | AudioWorklet: 48 kHz Float32 -> 16 kHz Int16 PCM, posts ~40 ms chunks |
+| `worklets/mic-capture.js` | Native-AEC/Strict fallback worklet: resamples capture to 16 kHz PCM16 without a custom predictor |
+| `worklets/aec3/` | SHA-verified pinned Sonora/WebRTC AEC3 WASM, loader, reference-aware capture worklet, build recipe, and license |
 | `worklets/audio-playback.js` | AudioWorklet: 24 kHz Float32 ring buffer -> 48 kHz, linear interp, fade in/out |
 | `style.css` | Orb animations, layout, dark theme (verbatim from the WebRTC app) |
 
@@ -172,14 +173,16 @@ NOT collide with the WebRTC variant.
   feeds the `mic-capture` worklet at the `AudioContext` rate. The worklet
   resamples to 16 kHz (boxcar lowpass + decimation on the 48 -> 16 fast
   path, linear interpolation fallback for odd rates) and packs Int16 LE.
-- **Echo guard**: native browser AEC is always enabled. Adaptive v3 is the default
-  and feeds the playback worklet's exact generated PCM into coupled-echo detection
-  plus a guarded independent-speech path for headsets/AEC-clean capture. Echo and
-  uncertain frames are withheld; 450 ms of confirmed speech, with short natural
-  speech gaps tolerated, releases the untouched buffered microphone onset. Predictor
-  residuals are diagnostics only and never replace mic PCM. Strict withholds
-  capture through the playback tail; Off uses native AEC only. The static
-  voice-clone reference is not used.
+- **Echo guard**: Native browser AEC is the safe default. Adaptive loads the
+  pinned Sonora/WebRTC AEC3 WASM only after its manifest ABI and SHA-256 pass,
+  then processes aligned 10 ms render-before-capture frames using the exact PCM
+  sent to the playback graph. Any module failure resolves truthfully to Native.
+  Strict applies stronger reference-aware suppression and fails closed by
+  omitting uncertain frames through the playback tail; it never inserts zero
+  PCM. Delay, suppression, leakage, and double-talk sensitivity are saved per
+  microphone/output-device pair. The static voice-clone recording is never used
+  as the echo reference, and Native remains the default until physical
+  speaker-loopback and real human barge-in tests pass.
 - **Output**: `response.output_audio.delta` decodes to Int16 -> Float32
   and is posted to the `audio-playback` worklet. The worklet maintains a
   per-context ring buffer, linearly interpolates 24 -> 48, and applies

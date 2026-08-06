@@ -46,3 +46,17 @@ def test_exact_repo_commands_are_recognized_but_unknown_commands_are_not():
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell lifecycle script")
 def test_script_contains_no_unsupported_select_object_reverse():
     assert "Select-Object -Reverse" not in SCRIPT.read_text(encoding="utf-8")
+
+
+def test_managed_backend_uses_worktree_source_without_inheriting_pythonpath():
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert '$oldPythonPath = $env:PYTHONPATH' in source
+    assert 'if ($Name -eq "backend") { Join-Path $RepoRoot "src" } else { "" }' in source
+    assert '$env:PYTHONPATH = $oldPythonPath' in source
+
+
+def test_managed_launcher_normalizes_duplicate_windows_path_keys():
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert '[Environment]::GetEnvironmentVariables("Process")' in source
+    assert '$pathKeys.Count -gt 1' in source
+    assert '[Environment]::SetEnvironmentVariable("Path", $pathValue, "Process")' in source

@@ -12,6 +12,7 @@
  *     { kind: "clear" }                                 wipe queue (barge-in)
  *
  *   worklet -> main:
+ *     { kind: "started" }                               first rendered frame
  *     { kind: "stats", queuedMs, played }               every ~250 ms
  *     { kind: "underrun" }                              every time the queue
  *                                                      runs dry mid-playback
@@ -39,6 +40,7 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
     this._fadeIn = 0;
     this._fadeOut = 0;
     this._lastSample = 0;
+    this._startPending = false;
 
     this.port.onmessage = (e) => {
       const data = e.data;
@@ -55,6 +57,7 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
             this._queue.push(data.samples);
             if (!this._playing) {
               this._playing = true;
+              this._startPending = true;
               this._fadeIn = FADE_FRAMES;
               this._fadeOut = 0;
             }
@@ -130,6 +133,10 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
           }
         } else {
           sample = v;
+          if (this._startPending) {
+            this._startPending = false;
+            this.port.postMessage({ kind: "started" });
+          }
           this._lastSample = v;
           this._advance();
         }

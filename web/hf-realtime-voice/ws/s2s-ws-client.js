@@ -66,13 +66,22 @@
  * @property {NoiseGate} [noiseGate] Client-side noise gate applied to the mic
  *   before it's sent. Tunable live via `setNoiseGate`.
  * @property {EchoGuardMode} [echoGuard] Playback-reference echo suppression.
+ * @property {Record<string, EchoCalibration>} [echoCalibrations] Saved AEC3
+ *   calibration indexed by microphone/output-device pair.
  * @property {Record<string, any>} [pipelineConfig] Conversation-scoped model and TTS routing.
  *
  * @typedef {Object} NoiseGate
  * @property {boolean} enabled
  * @property {number} thresholdDb Open threshold in dBFS (e.g. -45).
  *
- * @typedef {"off" | "adaptive" | "strict"} EchoGuardMode
+ * @typedef {"native" | "adaptive" | "strict"} EchoGuardMode
+ *
+ * @typedef {Object} EchoCalibration
+ * @property {number} delayMs
+ * @property {number} suppressionStrength
+ * @property {number} leakageThreshold
+ * @property {number} doubleTalkSensitivity
+ * @property {number} [echoTailMs]
  *
  * @typedef {Object} ToolDef
  * @property {"function"} type
@@ -93,6 +102,10 @@ import {
   trimTrailingSlash,
 } from "./codec.js";
 import { OrbVisualiser, VIS_FFT_SIZE } from "./orb-visualizer.js";
+import {
+  aec3ProcessorOptions,
+  loadAec3Worklet,
+} from "../worklets/aec3/aec3-loader.js";
 
 /** Build an Error carrying a `code` (and optional extra fields) so callers can
  *  branch on the failure kind: "limit" | "queue-full" | "queue-expired" | "aborted".
@@ -111,6 +124,35 @@ function _codedError(message, code, extra) {
 // as soon as a sub-field shape it doesn't know about appears.
 const OUTPUT_SAMPLE_RATE = 16000;
 const MIC_CHUNK_MS = 40;
+export const PIPELINE_CONFIG_ACK_TIMEOUT_MS = 15_000;
+const DEFAULT_ECHO_CALIBRATION = Object.freeze({
+  delayMs: 0,
+  suppressionStrength: 0.65,
+  leakageThreshold: 0.65,
+  doubleTalkSensitivity: 0.5,
+  echoTailMs: 350,
+});
+
+/** @param {Partial<EchoCalibration> | null | undefined} value */
+function normalizeEchoCalibration(value) {
+  const clamp = (candidate, minimum, maximum, fallback) => {
+    const number = Number(candidate);
+    return Number.isFinite(number) ? Math.max(minimum, Math.min(maximum, number)) : fallback;
+  };
+  return {
+    delayMs: clamp(value?.delayMs, 0, 500, DEFAULT_ECHO_CALIBRATION.delayMs),
+    suppressionStrength: clamp(
+      value?.suppressionStrength, 0, 1, DEFAULT_ECHO_CALIBRATION.suppressionStrength,
+    ),
+    leakageThreshold: clamp(
+      value?.leakageThreshold, 0.05, 1, DEFAULT_ECHO_CALIBRATION.leakageThreshold,
+    ),
+    doubleTalkSensitivity: clamp(
+      value?.doubleTalkSensitivity, 0, 1, DEFAULT_ECHO_CALIBRATION.doubleTalkSensitivity,
+    ),
+    echoTailMs: clamp(value?.echoTailMs, 0, 1000, DEFAULT_ECHO_CALIBRATION.echoTailMs),
+  };
+}
 
 export class S2sWsRealtimeClient extends EventTarget {
   /** @param {WsClientOptions} options */
@@ -152,7 +194,13 @@ export class S2sWsRealtimeClient extends EventTarget {
     /** @type {NoiseGate} Mic noise gate; off by default. */
     this._noiseGate = options.noiseGate ?? { enabled: false, thresholdDb: -45 };
     /** @type {EchoGuardMode} */
-    this._echoGuard = options.echoGuard ?? "adaptive";
+    this._echoGuard = options.echoGuard ?? "native";
+    /** @type {Record<string, EchoCalibration>} */
+    this._echoCalibrations = options.echoCalibrations ?? {};
+    this._echoDevicePair = "";
+    /** @type {EchoCalibration | null} */
+    this._echoCalibration = null;
+    this._aec3Status = null;
     /** @type {WebSocket | null} */
     this._ws = null;
     /** @type {AudioContext | null} */
@@ -174,6 +222,8 @@ export class S2sWsRealtimeClient extends EventTarget {
     /** @type {WsStatus} */
     this._status = "idle";
     this._aiSpeaking = false;
+    this._speechStoppedAtMs = null;
+    this._firstPlaybackReported = false;
     /** @type {Set<string>} response_ids that have actually played audio, so the
      * UI can tell a barge-in cut (keep it) from a never-heard speculative
      * response (drop it). */
@@ -205,9 +255,15 @@ export class S2sWsRealtimeClient extends EventTarget {
     this._toolOutputAcks = new Map();
     /** @type {Set<{ resolve: () => void, reject: (reason?: unknown) => void, timer: number }>} */
     this._responseIdleWaiters = new Set();
-    /** @type {Promise<void> | null} */
-    this._readyPromise = null;
     this._sessionConfigured = false;
+    /** @type {Promise<void> | null} */
+    this._configAckPromise = null;
+    /** @type {(() => void) | null} */
+    this._configAckResolve = null;
+    /** @type {((error: Error) => void) | null} */
+    this._configAckReject = null;
+    /** @type {ReturnType<typeof setTimeout> | 0} */
+    this._configAckTimer = 0;
     this._debug = (() => { try { return localStorage.getItem("s2s.debug") === "1"; } catch { return false; } })();
   }
 
@@ -221,6 +277,43 @@ export class S2sWsRealtimeClient extends EventTarget {
     if (this._status === status) return;
     this._status = status;
     this.dispatchEvent(new CustomEvent("status", { detail: { status } }));
+  }
+
+  _waitForInitialConfigAck() {
+    if (this._sessionConfigured) return Promise.resolve();
+    if (this._configAckPromise) return this._configAckPromise;
+    this._configAckPromise = new Promise((resolve, reject) => {
+      this._configAckResolve = resolve;
+      this._configAckReject = reject;
+      this._configAckTimer = setTimeout(() => {
+        this._rejectInitialConfig(
+          _codedError(
+            "Timed out waiting for the speech pipeline configuration acknowledgement",
+            "pipeline-config-timeout",
+          ),
+        );
+      }, PIPELINE_CONFIG_ACK_TIMEOUT_MS);
+    });
+    return this._configAckPromise;
+  }
+
+  _resolveInitialConfig() {
+    if (this._configAckTimer) clearTimeout(this._configAckTimer);
+    this._configAckTimer = 0;
+    const resolve = this._configAckResolve;
+    this._configAckResolve = null;
+    this._configAckReject = null;
+    resolve?.();
+  }
+
+  /** @param {Error} error */
+  _rejectInitialConfig(error) {
+    if (this._configAckTimer) clearTimeout(this._configAckTimer);
+    this._configAckTimer = 0;
+    const reject = this._configAckReject;
+    this._configAckResolve = null;
+    this._configAckReject = null;
+    reject?.(error);
   }
 
   /** Full assistant transcript so far for a response: the completed segments
@@ -280,9 +373,15 @@ export class S2sWsRealtimeClient extends EventTarget {
     }
 
     // Spin up the AudioContext + worklets in parallel with the WS dial.
+    const configReady = this._waitForInitialConfigAck();
     const audioReady = this._setupAudio();
     const wsReady = this._openWebSocket(connectUrl);
-    await Promise.all([audioReady, wsReady]);
+    try {
+      await Promise.all([audioReady, wsReady, configReady]);
+    } catch (error) {
+      await this.close();
+      throw error;
+    }
   }
 
   /**
@@ -487,13 +586,30 @@ export class S2sWsRealtimeClient extends EventTarget {
 
     // The worklets live at the repo root, one level up from this module.
     const base = new URL("../worklets/", import.meta.url);
-    await ctx.audioWorklet.addModule(new URL("mic-capture.js?v=12-adaptive-v3", base).href);
-    await ctx.audioWorklet.addModule(new URL("audio-playback.js?v=12-adaptive-v3", base).href);
+    await ctx.audioWorklet.addModule(new URL("audio-playback.js?v=13-aec3-reference", base).href);
+    const aec3 = await loadAec3Worklet(ctx);
+    if (!aec3.available) {
+      await ctx.audioWorklet.addModule(new URL("mic-capture.js?v=12-aec3-fallback", base).href);
+    }
 
-    const captureNode = new AudioWorkletNode(ctx, "mic-capture", {
+    const micTrack = this.options.micStream?.getAudioTracks?.()[0];
+    const micSettings = micTrack?.getSettings?.() || {};
+    const microphoneId = micSettings.deviceId || micTrack?.label || "default-microphone";
+    const outputId = typeof ctx.sinkId === "string" && ctx.sinkId
+      ? ctx.sinkId
+      : "default-output";
+    this._echoDevicePair = `${microphoneId}::${outputId}`;
+    this._echoCalibration = normalizeEchoCalibration(
+      this._echoCalibrations[this._echoDevicePair],
+    );
+    const outputLatencyMs = Number.isFinite(ctx.outputLatency)
+      ? Math.max(0, ctx.outputLatency * 1000)
+      : 0;
+
+    const captureNode = new AudioWorkletNode(ctx, aec3.processorName, {
       numberOfInputs: 2,
       numberOfOutputs: 0,
-      processorOptions: { chunkMs: MIC_CHUNK_MS },
+      processorOptions: aec3ProcessorOptions(aec3, { chunkMs: MIC_CHUNK_MS }),
     });
     captureNode.port.onmessage = (e) => {
       if (this._closed) return;
@@ -511,37 +627,63 @@ export class S2sWsRealtimeClient extends EventTarget {
             source: "browser",
             detail: {
               mode: data.mode,
+              requested_mode: data.requestedMode || this._echoGuard,
+              effective_mode: data.mode,
               native_aec: !!data.nativeAec,
+              module_available: !!data.moduleAvailable,
+              reference_wired: !!data.referenceWired,
               correlation: Number(data.correlation || 0),
-              envelope_correlation: Number(data.envelopeCorrelation || 0),
-              residual: Number(data.residual || 0),
-              residual_energy: Number(data.residualEnergy || 0),
-              residual_correlation: Number(data.residualCorrelation || 0),
-              erle_db: Number(data.erleDb || 0),
-              lag_ms: Number(data.lagMs || 0),
+              residual: Number.isFinite(data.residual) ? Number(data.residual) : null,
+              residual_energy: Number.isFinite(data.residualEnergy) ? Number(data.residualEnergy) : null,
+              erle_db: Number.isFinite(data.erleDb) ? Number(data.erleDb) : null,
+              lag_ms: Number.isFinite(data.lagMs) ? Number(data.lagMs) : null,
+              output_latency_ms: outputLatencyMs,
+              device_pair: this._echoDevicePair,
               model_ready: !!data.modelReady,
-              prediction_confidence: Number(data.predictionConfidence || 0),
-              acoustic_state: String(data.acousticState || "unknown"),
-              candidate_path: String(data.candidatePath || "none"),
-              reject_reason: String(data.rejectReason || "unknown"),
-              noise_floor_rms: Number(data.noiseFloorRms || 0),
-              human_floor_rms: Number(data.humanFloorRms || 0),
-              independence_ms: Number(data.independentMs || 0),
-              echo_evidence_ms: Number(data.echoEvidenceMs || 0),
+              prediction_confidence: Number.isFinite(data.predictionConfidence)
+                ? Number(data.predictionConfidence)
+                : null,
               candidate_ms: Number(data.candidateMs || 0),
               suppressed_ms: Number(data.suppressedMs || 0),
-              double_talk: !!data.doubleTalk,
+              double_talk: data.doubleTalk == null ? null : !!data.doubleTalk,
+              double_talk_source: data.doubleTalkSource || null,
               playback_active: !!data.playbackActive,
             },
+          },
+        }));
+      } else if (data?.kind === "aec3_status") {
+        this._aec3Status = {
+          ...data,
+          devicePair: this._echoDevicePair,
+          outputLatencyMs,
+          calibration: this._echoCalibration,
+          loaderAvailable: aec3.available,
+          loaderReason: aec3.reason || "",
+        };
+        this.dispatchEvent(new CustomEvent("echo-status", { detail: this._aec3Status }));
+      } else if (data?.kind === "aec3_error") {
+        this.dispatchEvent(new CustomEvent("echo-status", {
+          detail: {
+            available: false,
+            requestedMode: this._echoGuard,
+            effectiveMode: this._echoGuard === "strict" ? "strict-fallback" : "native",
+            devicePair: this._echoDevicePair,
+            outputLatencyMs,
+            calibration: this._echoCalibration,
+            error: data.error || "AEC3 worklet failed",
           },
         }));
       }
     };
     // Push the initial gate config now that the worklet exists.
     captureNode.port.postMessage({ kind: "gate", ...this._noiseGate });
-    const micTrack = this.options.micStream?.getAudioTracks?.()[0];
     const nativeAec = !!micTrack?.getSettings?.().echoCancellation;
     captureNode.port.postMessage({ kind: "echo_guard", mode: this._echoGuard, nativeAec });
+    captureNode.port.postMessage({
+      kind: "echo_calibration",
+      ...this._echoCalibration,
+      outputLatencyMs,
+    });
     this._captureNode = captureNode;
 
     const micSrc = ctx.createMediaStreamSource(this.options.micStream);
@@ -611,6 +753,20 @@ export class S2sWsRealtimeClient extends EventTarget {
    */
   _onPlaybackMessage(data) {
     if (this._closed) return;
+    if (data?.kind === "started" && !this._firstPlaybackReported) {
+      this._firstPlaybackReported = true;
+      const elapsed = this._speechStoppedAtMs == null ? null : Math.max(0, performance.now() - this._speechStoppedAtMs);
+      this.dispatchEvent(new CustomEvent("pipeline-metric", {
+        detail: {
+          stage: "playback",
+          status: "first_audio",
+          source: "browser",
+          elapsed_ms: elapsed,
+          detail: { first_playback_ms: elapsed },
+        },
+      }));
+      return;
+    }
     if (data?.kind === "stats") {
       this.dispatchEvent(new CustomEvent("pipeline-metric", {
         detail: { stage: "playback", status: "queue", source: "browser", detail: { queued_ms: data.queuedMs || 0, played: data.played || 0 } },
@@ -710,6 +866,8 @@ export class S2sWsRealtimeClient extends EventTarget {
 
       case "input_audio_buffer.speech_stopped":
         if (this._status === "user-speaking") this._setStatus("processing");
+        this._speechStoppedAtMs = performance.now();
+        this._firstPlaybackReported = false;
         this.dispatchEvent(new CustomEvent("turn-state", { detail: { status: "speech_stopped" } }));
         this.dispatchEvent(new CustomEvent("pipeline-metric", {
           detail: { stage: "mic", status: "captured", source: "browser", detail: {} },
@@ -767,6 +925,18 @@ export class S2sWsRealtimeClient extends EventTarget {
         // drop a cancelled response's transcript and commit a completed one.
         const status = event.response?.status ?? "completed";
         const responseId = event.response?.id ?? "";
+        const endToEndMs = this._speechStoppedAtMs == null
+          ? null
+          : Math.max(0, performance.now() - this._speechStoppedAtMs);
+        this.dispatchEvent(new CustomEvent("pipeline-metric", {
+          detail: {
+            stage: "response",
+            status: "done",
+            source: "browser",
+            elapsed_ms: endToEndMs,
+            detail: { end_to_end_ms: endToEndMs, response_status: status },
+          },
+        }));
         // Did this response ever play audio? Distinguishes a barge-in cut (the
         // user heard part of it) from a speculative response that never played.
         const audible = responseId ? this._audibleResponses.has(responseId) : false;
@@ -802,6 +972,7 @@ export class S2sWsRealtimeClient extends EventTarget {
         if (!this._sessionConfigured) {
           this._sendSessionUpdate();
           this._sessionConfigured = true;
+          this._resolveInitialConfig();
           if (this._status === "connecting") this._setStatus("connected");
         }
         break;
@@ -926,9 +1097,12 @@ export class S2sWsRealtimeClient extends EventTarget {
       case "error": {
         const err = event.error;
         console.error("[ws] server error:", err);
-        if (!this._sessionConfigured && err?.code === "model_endpoint_unavailable") {
-          const failure = new Error(err?.message ?? "Selected model endpoint is unavailable");
-          this.dispatchEvent(new CustomEvent("error", { detail: { error: failure } }));
+        if (!this._sessionConfigured) {
+          const failure = _codedError(
+            err?.message ?? "The speech pipeline rejected its initial configuration",
+            err?.code ?? err?.type ?? "pipeline-config-rejected",
+          );
+          this._rejectInitialConfig(failure);
           await this.close();
           break;
         }
@@ -971,6 +1145,11 @@ export class S2sWsRealtimeClient extends EventTarget {
   /** @param {CloseEvent} ev */
   _onWsClose(ev) {
     console.log("[ws] socket closed:", ev.code, ev.reason);
+    if (!this._sessionConfigured) {
+      this._rejectInitialConfig(
+        new Error(`WebSocket closed before pipeline configuration (${ev.code}) ${ev.reason || ""}`.trim()),
+      );
+    }
     if (this._status === "closed" || this._status === "error") return;
     if (ev.code === 1000) {
       this._setStatus("closed");
@@ -1179,10 +1358,26 @@ export class S2sWsRealtimeClient extends EventTarget {
 
   /** @param {EchoGuardMode} mode */
   setEchoGuard(mode) {
-    this._echoGuard = ["off", "adaptive", "strict"].includes(mode) ? mode : "adaptive";
+    this._echoGuard = ["native", "adaptive", "strict"].includes(mode) ? mode : "native";
     const micTrack = this.options.micStream?.getAudioTracks?.()[0];
     const nativeAec = !!micTrack?.getSettings?.().echoCancellation;
     this._captureNode?.port.postMessage({ kind: "echo_guard", mode: this._echoGuard, nativeAec });
+  }
+
+  /** Persisted by the UI under the current microphone/output-device pair. */
+  setEchoCalibration(calibration) {
+    this._echoCalibration = normalizeEchoCalibration(calibration);
+    if (this._echoDevicePair) {
+      this._echoCalibrations[this._echoDevicePair] = this._echoCalibration;
+    }
+    const outputLatencyMs = Number.isFinite(this._ctx?.outputLatency)
+      ? Math.max(0, this._ctx.outputLatency * 1000)
+      : 0;
+    this._captureNode?.port.postMessage({
+      kind: "echo_calibration",
+      ...this._echoCalibration,
+      outputLatencyMs,
+    });
   }
 
   /** @param {Record<string, unknown>} event */
@@ -1196,6 +1391,7 @@ export class S2sWsRealtimeClient extends EventTarget {
     // `_pollQueue` throws "aborted" and connect() unwinds cleanly.
     this._closed = true;
     this._sessionConfigured = false;
+    this._rejectInitialConfig(new Error("Connection closed before pipeline configuration completed"));
     this._muted = true;
     this._captureNode?.port.postMessage({ kind: "echo_reset" });
     this._captureNode?.port.postMessage({ kind: "enable", value: false });

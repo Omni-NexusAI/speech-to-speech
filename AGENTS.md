@@ -16,7 +16,7 @@
 - `scripts/local_realtime.ps1` is the managed background entry point; foreground launchers remain available for raw-console debugging.
 - Model provider selection is conversation-scoped. Remote completely replaces local Gemma operations without fallback; TTS selection remains independent.
 - One conversation may own only one model HTTP operation at a time. Barge-in cancels or detaches that generation within two seconds without ending the WebSocket session or clearing context.
-- Browser echo protection defaults to Adaptive v3: exact playback PCM drives classifier-only coupled-echo detection plus an uncoupled headset/native-AEC path. Only original mic PCM may be released after 450 ms of confirmed speech; ambiguous and echo-only frames remain withheld. Strict and Off remain explicit choices.
+- Browser echo protection defaults to Native browser AEC. Exact playback PCM remains available as a reference tap; Adaptive resolves to Native until an actual AEC3 module is loaded and validated, while Strict may fail closed by pausing upload through the echo tail.
 
 - This fork is used for local speech-to-speech testing with the OpenAI Realtime-compatible server preserved.
 - Keep upstream pipeline behavior intact unless a change is required for the local direct-audio Gemma path.
@@ -26,8 +26,13 @@
 - For Gemma 4 12B tests, use the settings from `C:\llama.cpp\launch_gemma-4-12B-it-qat-MTP.ps1` with context reduced to 16k; this repo provides `scripts\launch_gemma_4_12b_16k.ps1` for that.
 - The target TTS service is the stable Docker container name `qwen3-tts-faster` on `http://127.0.0.1:8881/v1`; container IDs are transient after authorized rebuilds and must not be used by lifecycle scripts.
 - Qwen3 clone output must use the `1.7B-Base` backend model by default; the `qwen3-tts-faster` API exposes native incremental PCM16 clone streaming while preserving buffered formats for non-streaming requests.
+- The isolated audio.cpp Qwen3-TTS candidate remains opt-in at `8890`/`8891`: its `qwen3tts-audiocpp` provider is selected only after explicit health, resident-model, private Base-profile, and speech validation. Use native incremental PCM only when the running engine advertises it and a direct chunk probe verifies it; otherwise label and retain the cancellable buffered-phrase fallback. It never changes Faster or Groxaxo lifecycle.
 - Faster clone requests carry an explicit assistant language when known; keep the reproducible local server patch under `integrations/` in sync with the rebuilt image.
-- The realtime UI should expose saved Voice Studio `Base` clone profiles only, with `clone:16d9bb336799` (`J.A.R.V.I.S`) as the default.
+- The realtime UI exposes live `Base` clone profiles from the selected TTS
+  backend and retains one valid selection per backend. Faster keeps
+  `clone:16d9bb336799` (`J.A.R.V.I.S`) as its default.
+- Managed HFRT startup is model-independent: missing Gemma or TTS endpoints are
+  warnings, and repository launchers never manage external model containers.
 - Do not test Gemma/llama.cpp while the local Gemma server is being rebuilt.
 
 ## Child DOX Index

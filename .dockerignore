@@ -4,6 +4,8 @@ cache
 .git
 .mypy_cache
 .pytest_cache
+.pytest-*
+.pytest_*
 .ruff_cache
 __pycache__
 **/__pycache__

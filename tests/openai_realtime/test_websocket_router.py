@@ -292,6 +292,160 @@ class TestClientEventDispatch:
                 cid = service.connection_ids[0]
                 assert service._state(cid).runtime_config.local_pipeline["tts_backend"] == "groxaxo"
 
+    def test_pipeline_config_update_accepts_audio_cpp_backend(self, setup):
+        app, service, *_ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "pipeline.config.update",
+                        "config": {"tts_backend": "qwen3tts-audiocpp"},
+                    }
+                )
+                ack = ws.receive_json()
+                assert ack["type"] == "pipeline.config.updated"
+                assert ack["config"]["tts_backend"] == "qwen3tts-audiocpp"
+                cid = service.connection_ids[0]
+                assert service._state(cid).runtime_config.local_pipeline["tts_backend"] == "qwen3tts-audiocpp"
+
+    def test_pipeline_config_update_keeps_bounded_resolved_audio_cpp_phrase_queue(self, setup):
+        app, service, *_ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "pipeline.config.update",
+                        "config": {
+                            "tts_backend": "qwen3tts-audiocpp",
+                            "tts_tuning": {
+                                "provider": "qwen3tts-audiocpp",
+                                "profile_id": "balanced",
+                                "overrides": {
+                                    "max_reference_seconds": 20,
+                                    "first_block_frames": 4,
+                                    "steady_block_frames": 12,
+                                    "left_context_frames": 25,
+                                    "top_k": 40,
+                                },
+                                "resolved": {
+                                    "text_lookahead": 64,
+                                    "phrase_flush_ms": 500,
+                                },
+                            },
+                        },
+                    }
+                )
+
+                ack = ws.receive_json()
+                assert ack["type"] == "pipeline.config.updated"
+                tuning = ack["config"]["tts_tuning"]
+                assert tuning["resolved"] == {"text_lookahead": 64, "phrase_flush_ms": 500}
+                assert tuning["overrides"]["first_block_frames"] == 4
+                cid = service.connection_ids[0]
+                assert service._state(cid).runtime_config.local_pipeline["tts_tuning"] == tuning
+
+    def test_pipeline_config_update_rejects_unbounded_resolved_audio_cpp_phrase_queue(self, setup):
+        app, service, *_ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "pipeline.config.update",
+                        "config": {
+                            "tts_backend": "qwen3tts-audiocpp",
+                            "tts_tuning": {
+                                "provider": "qwen3tts-audiocpp",
+                                "profile_id": "low-latency",
+                                "overrides": {},
+                                "resolved": {
+                                    "text_lookahead": 1,
+                                    "phrase_flush_ms": 20,
+                                },
+                            },
+                        },
+                    }
+                )
+
+                error = ws.receive_json()
+                assert error["type"] == "error"
+                assert error["error"]["type"] == "invalid_tts_tuning"
+                cid = service.connection_ids[0]
+                assert "tts_tuning" not in service._state(cid).runtime_config.local_pipeline
+
+    def test_pipeline_config_update_rejects_rest_scope_without_partial_mutation(self, setup):
+        app, service, *_ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "pipeline.config.update",
+                        "config": {"tts_backend": "groxaxo", "full_buffer_tts": False},
+                    }
+                )
+                assert ws.receive_json()["type"] == "pipeline.config.updated"
+
+                ws.send_json(
+                    {
+                        "type": "pipeline.config.update",
+                        "config": {
+                            "tts_backend": "qwen3tts-audiocpp",
+                            "full_buffer_tts": True,
+                            "tts_tuning": {
+                                "provider": "qwen3tts-audiocpp",
+                                "scope": "realtime",
+                                "profile_id": "balanced",
+                                "overrides": {},
+                            },
+                        },
+                    }
+                )
+                error = ws.receive_json()
+                assert error["type"] == "error"
+                assert error["error"]["type"] == "invalid_tts_tuning"
+                runtime = service._state(service.connection_ids[0]).runtime_config.local_pipeline
+                assert runtime["tts_backend"] == "groxaxo"
+                assert runtime["full_buffer_tts"] is False
+                assert "tts_tuning" not in runtime
+
+    def test_pipeline_config_update_normalizes_alias_and_clears_foreign_tuning(self, setup):
+        app, service, *_ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "pipeline.config.update",
+                        "config": {
+                            "tts_backend": "audio-cpp",
+                            "tts_tuning": {
+                                "provider": "qwen3tts-audiocpp",
+                                "profile_id": "low-latency",
+                                "overrides": {},
+                                "resolved": {"text_lookahead": 48, "phrase_flush_ms": 320},
+                            },
+                        },
+                    }
+                )
+                candidate_ack = ws.receive_json()
+                assert candidate_ack["type"] == "pipeline.config.updated"
+                assert candidate_ack["config"]["tts_backend"] == "qwen3tts-audiocpp"
+                assert candidate_ack["config"]["tts_tuning"]["profile_id"] == "low-latency"
+
+                ws.send_json(
+                    {"type": "pipeline.config.update", "config": {"tts_backend": "faster"}}
+                )
+                faster_ack = ws.receive_json()
+                assert faster_ack["type"] == "pipeline.config.updated"
+                assert faster_ack["config"]["tts_backend"] == "faster"
+                assert "tts_tuning" not in faster_ack["config"]
+                runtime = service._state(service.connection_ids[0]).runtime_config.local_pipeline
+                assert runtime["tts_backend"] == "faster"
+                assert "tts_tuning" not in runtime
+
     def test_conversation_item_create_returns_events(self, setup):
         app, *_ = setup
         with TestClient(app) as client:
@@ -331,9 +485,11 @@ class TestClientEventDispatch:
                 conn_id = list(service._conns.keys())[0]
                 service.response._ensure_response(conn_id)
                 ws.send_json({"type": "response.cancel"})
-                msg1 = ws.receive_json()
-                msg2 = ws.receive_json()
-                types = {msg1["type"], msg2["type"]}
+                types = set()
+                for _ in range(8):
+                    types.add(ws.receive_json()["type"])
+                    if {"response.output_audio.done", "response.done"} <= types:
+                        break
                 assert "response.output_audio.done" in types
                 assert "response.done" in types
 
