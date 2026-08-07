@@ -701,7 +701,9 @@ def test_local_ui_teardown_isolates_closed_client_events():
     assert "runTool(c, name, args, callId)" in main_js
     assert 'if (this._closed && status !== "closed") return;' in client_js
     assert 'this._captureNode?.port.postMessage({ kind: "enable", value: false });' in client_js
-    assert 'this._playbackNode?.port.postMessage({ kind: "clear" });' in client_js
+    assert 'this._invalidatePlayback("stop")' in client_js
+    assert 'kind: "clear",' in client_js
+    assert 'generation: this._playbackGeneration' in client_js
 
 
 def test_diagnostics_use_transcription_and_dynamic_context_tokens():

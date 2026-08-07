@@ -37,7 +37,9 @@ backend instead of the WebRTC SDP proxy. Same load balancer, same
    `session.audio.output`, `session.output_modalities`).
 5. Client streams mic audio as PCM16 16 kHz mono base64 chunks
    (`input_audio_buffer.append`, one frame every ~40 ms).
-6. Server pushes `response.output_audio.delta` (PCM16 24 kHz mono base64)
+6. Server pushes `response.output_audio.delta` (pipeline-native PCM16 16 kHz
+   mono base64) after any provider-native audio is adapted by the Realtime
+   pipeline.
    and transcript deltas.
 
 The backend exposes one concurrent session per compute (same as WebRTC
@@ -164,7 +166,7 @@ NOT collide with the WebRTC variant.
 | `ws/orb-visualizer.js` | `OrbVisualiser`: FFT bands -> orb CSS custom properties |
 | `worklets/mic-capture.js` | Native-AEC/Strict fallback worklet: resamples capture to 16 kHz PCM16 without a custom predictor |
 | `worklets/aec3/` | SHA-verified pinned Sonora/WebRTC AEC3 WASM, loader, reference-aware capture worklet, build recipe, and license |
-| `worklets/audio-playback.js` | AudioWorklet: 24 kHz Float32 ring buffer -> 48 kHz, linear interp, fade in/out |
+| `worklets/audio-playback.js` | AudioWorklet: continuous generation-tagged Float32 FIFO, profile priming, resampling, end flush, and stale-tail rejection |
 | `style.css` | Orb animations, layout, dark theme (verbatim from the WebRTC app) |
 
 ## Audio pipeline notes
@@ -184,13 +186,20 @@ NOT collide with the WebRTC variant.
   as the echo reference, and Native remains the default until physical
   speaker-loopback and real human barge-in tests pass.
 - **Output**: `response.output_audio.delta` decodes to Int16 -> Float32
-  and is posted to the `audio-playback` worklet. The worklet maintains a
-  per-context ring buffer, linearly interpolates 24 -> 48, and applies
-  short 32-frame fades on entry/exit to suppress clicks.
+  and is posted to one `audio-playback` FIFO across phrase chunks and same-turn
+  tool continuations. Validated native audio.cpp playback primes Low Latency,
+  Balanced, and Quality at 800, 1280, and 1760 ms; a custom resolved target is
+  capped at 2000 ms. Faster, Groxaxo, and buffered fallback remain immediate.
+  The visible speaking state begins only when the worklet renders a first sample
+  and ends only when that queue drains; network PCM receipt and `response.done`
+  keep their separate transport and response-lock semantics.
+  Priming never consumes the head, a real underrun re-primes to the full target,
+  and `response.output_audio.done` flushes a short final stream immediately.
 - **Barge-in**: when the server VAD detects user speech mid-response
   (`input_audio_buffer.speech_started` while `ai-speaking`), the client
-  posts `{ kind: "clear" }` to the playback worklet to wipe the queue
-  immediately. The server itself cancels the in-flight response.
+  advances the playback generation and clears the queue once. Late PCM retains
+  its old generation and is rejected by the worklet. Stop, replacement,
+  disconnect, and response cancellation use the same stale-tail boundary.
 
 ## Credits
 

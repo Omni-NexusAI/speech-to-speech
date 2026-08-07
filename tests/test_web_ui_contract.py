@@ -27,11 +27,11 @@ def test_native_v3_is_the_migrated_default_and_echo_ui_is_truthful():
     assert 'const EXPECTED_UI_API_VERSION = 20;' in MAIN_JS
     assert "Do not reuse a stock " in MAIN_JS
     assert "Let me check that" not in MAIN_JS
-    assert 'src="main.js?v=25-config-ack"' in INDEX_HTML
-    assert '"./ws/s2s-ws-client.js?v=13-config-ack"' in MAIN_JS
+    assert 'src="main.js?v=27-audible-lifecycle"' in INDEX_HTML
+    assert '"./ws/s2s-ws-client.js?v=15-audible-lifecycle"' in MAIN_JS
     assert "loadAec3Worklet(ctx)" in CLIENT_JS
     assert 'new URL("mic-capture.js?v=12-aec3-fallback", base)' in CLIENT_JS
-    assert 'new URL("audio-playback.js?v=13-aec3-reference", base)' in CLIENT_JS
+    assert 'new URL("audio-playback.js?v=15-audible-lifecycle", base)' in CLIENT_JS
     assert "new AudioWorkletNode(ctx, aec3.processorName" in CLIENT_JS
 
 
@@ -139,7 +139,8 @@ def test_audio_cpp_profile_refresh_is_used_for_backend_changes_and_session_paylo
     assert "activeTtsTuning(backend)" in form_settings
     pipeline = MAIN_JS.split("pipelineConfig:", 1)[1].split("...(audioContext", 1)[0]
     assert "...(activeTtsTuning(settings.ttsBackend)" in pipeline
-    assert "client.updateLocalPipeline({" in MAIN_JS
+    assert "client.updateLocalPipeline(" in MAIN_JS
+    assert "activePlaybackConfig(settings.ttsBackend)" in MAIN_JS
     assert "tts_backend: settings.ttsBackend" in MAIN_JS
     assert "tts_tuning: tuning" in MAIN_JS
     active = MAIN_JS.split("function activeTtsTuning", 1)[1].split("function updateRealtimeAudioSummary", 1)[0]
@@ -228,7 +229,8 @@ def test_realtime_audio_diagnostics_exposes_shared_safe_tuning_schema():
         "tuning-context-unlock",
     ):
         assert f'id="{control_id}"' in INDEX_HTML
-    assert "24 kHz PCM16" in INDEX_HTML
+    assert "Model / Realtime transport" in INDEX_HTML
+    assert "24 kHz / 16 kHz PCM16" in INDEX_HTML
     assert 'value="Full ICL"' in INDEX_HTML
     assert "Matched reference limit" in INDEX_HTML
     assert "These sampler values control speech-token variation and prosody. They do not change the chat LLM." in INDEX_HTML
@@ -268,7 +270,7 @@ def test_native_pcm_metrics_cover_first_phrase_pcm_playback_rtf_and_end_to_end()
     assert "detail?.end_to_end_ms" in MAIN_JS
     assert "gpu.freeMiB" in MAIN_JS
     assert "gpu.utilizationPercent" in MAIN_JS
-    assert 'this.port.postMessage({ kind: "started" })' in PLAYBACK_JS
+    assert 'this._diagnostic("started"' in PLAYBACK_JS
     assert "first_playback_ms" in CLIENT_JS
     assert "end_to_end_ms" in CLIENT_JS
 
@@ -281,6 +283,13 @@ def test_realtime_audio_diagnostics_show_paired_reference_truth_without_transcri
     assert "done.reference_limit_applied" in MAIN_JS
     assert "done.reference_pairing" in MAIN_JS
     assert "reference_transcript" not in MAIN_JS
+
+
+def test_realtime_audio_diagnostics_show_requested_effective_language_and_auto_support():
+    assert "done.requested_language" in MAIN_JS
+    assert "done.effective_language" in MAIN_JS
+    assert "done.language_auto_supported" in MAIN_JS
+    assert "Auto ${autoLanguageText}" in MAIN_JS
 
 
 def test_audio_cpp_proxy_is_incremental_and_candidate_labels_are_truthful():

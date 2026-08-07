@@ -63,6 +63,34 @@ _TRANSCRIPT_CONTROL_TEXT = (
     "user_transcript:",
     "assistant_response:",
 )
+_TRANSCRIPT_FAILURE_SENTINELS = frozenset(
+    {
+        "inaudible",
+        "unintelligible",
+        "garbled",
+        "audio unclear",
+        "unclear audio",
+        "audio unintelligible",
+        "unintelligible audio",
+        "audio garbled",
+        "garbled audio",
+        "audio was unclear",
+        "audio was unintelligible",
+        "audio was garbled",
+        "no speech",
+        "no speech detected",
+        "no intelligible speech",
+        "no intelligible speech detected",
+        "could not understand audio",
+        "could not understand the audio",
+        "unable to understand audio",
+        "unable to understand the audio",
+        "could not transcribe audio",
+        "could not transcribe the audio",
+        "transcription failed",
+        "transcription unavailable",
+    }
+)
 
 
 class GemmaAudioSTTHandler(BaseSTTHandler):
@@ -172,6 +200,19 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             runtime_config.local_pipeline.pop("assistant_language", None)
         audio = self._as_float32_mono(vad_audio.audio)
         duration_s = len(audio) / self.sample_rate if self.sample_rate else 0.0
+        absolute_audio = np.abs(audio)
+        rms = float(np.sqrt(np.mean(np.square(audio), dtype=np.float64))) if audio.size else 0.0
+        peak = float(np.max(absolute_audio)) if audio.size else 0.0
+        clipping_fraction = float(np.mean(absolute_audio >= 0.999)) if audio.size else 0.0
+        input_detail = {
+            "audio_s": round(duration_s, 3),
+            "rms": round(rms, 6),
+            "peak": round(peak, 6),
+            "near_silence": rms < 0.005,
+            "clipping": clipping_fraction > 0.001,
+            "clipping_fraction": round(clipping_fraction, 6),
+            "revision_count": max(1, int(getattr(vad_audio, "turn_revision", 0) or 0) + 1),
+        }
         logger.info(
             "Gemma audio direct request start turn=%s rev=%s audio=%.3fs",
             vad_audio.turn_id,
@@ -183,9 +224,9 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             vad_audio,
             "gemma",
             "request_start",
-            detail={"audio_s": round(duration_s, 3), "full_buffer_tts": full_buffer_tts},
+            detail={**input_detail, "full_buffer_tts": full_buffer_tts},
         )
-        self._emit_metric(vad_audio, "transcription", "captured", detail={"mode": "final"})
+        self._emit_metric(vad_audio, "transcription", "captured", detail={**input_detail, "mode": "final"})
         first = True
         failed_status: str | None = None
         terminal_error: str | None = None
@@ -289,21 +330,25 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         if session_instructions:
             system_parts.append(session_instructions)
         system_parts.append(
-            "Treat accepted user audio as an ordinary semantic user message. It may use any language, accent, or "
-            "code-switching; understand it directly and answer it or call an appropriate provided tool. Reply in "
-            "English by default unless the user or session instructions explicitly request another response language. "
+            "Treat accepted user audio as an ordinary semantic user message. Infer its likely intent from the whole "
+            "accepted turn and answer naturally or call an appropriate provided tool. It may use any language, accent, "
+            "or code-switching. Follow the language or languages naturally used in the current utterance unless the user "
+            "or session instructions request another response language. Do not mention transcription, audio quality, "
+            "garbling, attached audio, or internal audio processing unless the user explicitly asks about that topic. "
             "USER_TRANSCRIPT is optional display metadata and must never replace or gate the semantic response. "
+            "If exact words are unavailable, omit USER_TRANSCRIPT instead of filling it with a failure label. "
             "When available, use this plain-text shape:\n"
             "USER_TRANSCRIPT: <short transcript of what the user said>\n"
-            "ASSISTANT_LANGUAGE: <language name for the assistant response; use English by default>\n"
+            "ASSISTANT_LANGUAGE: <single language name for a monolingual spoken answer; Auto for a mixed-language "
+            "or otherwise unspecified spoken answer>\n"
             "ASSISTANT_RESPONSE: <your spoken answer>\n"
             "When a provided tool is needed, call it in the same response and never fabricate its result. Before the "
             "function call, provide one brief, natural acknowledgement whose wording fits the specific request and "
             "varies with the conversation; do not reuse a stock phrase. Put it in ASSISTANT_PREAMBLE: "
             "<acknowledgement>; plain ASSISTANT_RESPONSE text is also accepted for "
             "compatibility. Do not emit a result-dependent ASSISTANT_RESPONSE until the tool result is available. "
-            "Ask a follow-up only when the request itself lacks a detail needed to complete it. Do not wrap plain-text "
-            "responses in JSON or Markdown."
+            "Ask a brief, content-focused follow-up only when the request itself lacks a detail needed to complete it. "
+            "Do not wrap plain-text responses in JSON or Markdown."
         )
         user_content: list[dict[str, Any]] = []
         for image_url in self._conversation_image_urls(runtime_config):
@@ -589,7 +634,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 before, after = raw_text.split(_RESPONSE_MARKER, 1)
                 transcript = self._extract_transcript(before)
                 transcript_value = transcript
-                language_code = self._extract_assistant_language(before) or "English"
+                language_code = self._effective_assistant_language(before)
                 if transcript:
                     # Establish the user transcript before assistant chunks are
                     # forwarded, so the Realtime UI and conversation chronology
@@ -638,7 +683,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             detail={"mode": "final", "source": "primary"},
         )
         full_response = preamble or self._fallback_response_text(raw_text)
-        language_code = language_code or self._extract_assistant_language(raw_text) or "English"
+        language_code = language_code or self._effective_assistant_language(raw_text)
         if not transcript:
             # Transcript metadata is optional. Keep only native tool state in
             # context; ordinary transcript-less exchanges stay UI-only rather
@@ -688,7 +733,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
     ) -> Iterator[DirectAssistantResponse]:
         transcript = self._extract_transcript(text)
         tools = tools or []
-        language_code = self._extract_assistant_language(text) or "English"
+        language_code = self._effective_assistant_language(text)
         preamble = self._tool_preamble(text, tools) if tools else None
         self._emit_metric(
             vad_audio,
@@ -823,6 +868,9 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         normalized = " ".join(transcript.lower().split())
         if transcript.startswith("[") and transcript.endswith("]"):
             return None
+        failure_key = normalized.strip(" \t\r\n\"'`[]()<>.,!?;:")
+        if failure_key in _TRANSCRIPT_FAILURE_SENTINELS:
+            return None
         if any(control in normalized for control in _TRANSCRIPT_CONTROL_TEXT):
             return None
         if normalized.startswith(("system:", "assistant:", "response:", "user:")):
@@ -852,6 +900,18 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             return None
         value = match.group(1).strip().strip('"')
         return value if value and len(value) <= 40 else None
+
+    @staticmethod
+    def _effective_assistant_language(text: str) -> str:
+        """Return one turn-scoped TTS language without an implicit English pin.
+
+        A monolingual answer may name its language explicitly. Mixed-language
+        or otherwise unspecified output remains ``Auto`` so the selected Qwen3
+        clone backend can interpret the actual text rather than inheriting a
+        previous turn or the clone reference metadata.
+        """
+
+        return GemmaAudioSTTHandler._extract_assistant_language(text) or "Auto"
 
     @staticmethod
     def _extract_assistant_preamble(text: str) -> str | None:

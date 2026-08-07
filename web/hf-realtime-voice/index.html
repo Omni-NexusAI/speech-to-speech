@@ -237,7 +237,7 @@
                 <label class="diagnostics-tuning-check"><input id="tuning-context-unlock" type="checkbox">Unlock unsafe decoder-context editing</label>
                 <label>Clone mode<small class="layer-badge">fixed</small><input type="text" value="Full ICL" disabled></label>
                 <label>Crossfade (samples)<small class="layer-badge">inactive</small><input id="tuning-crossfade" type="number" value="0" disabled></label>
-                <label>Output transport<small class="layer-badge">fixed</small><input type="text" value="24 kHz PCM16" disabled></label>
+                    <label>Model / Realtime transport<small class="layer-badge">fixed</small><input type="text" value="24 kHz / 16 kHz PCM16" disabled></label>
               </div>
               <p class="diagnostics-audio-note diagnostics-context-warning" id="diagnostics-context-warning">Keep decoder context at the model-required 72 frames. Reducing it can cause progressive quality loss.</p>
             </fieldset>
@@ -581,6 +581,6 @@
       </div>
     </dialog>
 
-    <script type="module" src="main.js?v=25-config-ack"></script>
+  <script type="module" src="main.js?v=27-audible-lifecycle"></script>
   </body>
 </html>

@@ -75,6 +75,8 @@
 - Keep model inference controls separate from TTS controls, and place Voice directly beneath TTS Backend in the vertically scrolling settings layout.
 - Stop invalidates the active client before asynchronous teardown; closed-client mic, playback, tool, and WebSocket events must never change the idle UI or enter a replacement conversation.
 - Feed the exact generated playback PCM into the capture worklet as a non-audible reference; never substitute the static clone recording. Native browser AEC is the default. Adaptive uses only the SHA-verified, import-free bundled AEC3 module; any manifest, ABI, hash, compile, or worklet failure resolves truthfully to Native. Strict suspends uncertain upload through the echo tail without inserting zero PCM.
+- Keep one generation-tagged playback worklet FIFO across phrase chunks and same-turn tool continuations. Validated native audio.cpp playback primes Low Latency/Balanced/Quality at 800/1280/1760 ms and bounds a custom profile's resolved target to 2000 ms; Faster, Groxaxo, and buffered fallback remain immediate. Apply a new target only after `pipeline.config.updated`, preserve the snapshot already attached to queued responses, re-prime fully after a real underrun, flush a short ended stream, and reject stale-generation tails after a single clear. Retire completed response snapshots into a bounded tombstone set so long sessions do not leak memory or reopen late PCM.
+- Treat worklet `started` and `drained` as the exclusive audible/UI speaking lifecycle. Network PCM, transcript, content-part, and `response.done` events may advance protocol state or release response/tool locks, but must not claim or end audible playback.
 - Keep native `echoCancellation`, `noiseSuppression`, and `autoGainControl` enabled and expose requested/effective mode, module availability, calibration, reference wiring, and double-talk status in diagnostics. The response-length setting remains independent.
 - Persist delay, strict suppression, leakage, and double-talk calibration by microphone/output-device pair. Feed the worklet the active AudioContext output latency and keep Sonora's derived `aec3-output-evidence` label distinct from WebRTC's private internal double-talk state.
 
@@ -92,6 +94,7 @@
   explicit unsafe unlock before editing the 72-frame decoder context. Never
   send audio.cpp tuning to another TTS provider. Expanded metrics include LLM first stable phrase, TTS first PCM,
   first playback, synthesis RTF, end-to-end time, model/profile, GPU headroom,
+  requested/effective response language and verified provider Auto support,
   paired reference source/requested/used duration, limit-applied state,
   pairing mode, truthful delivery mode,
   requested/effective echo mode, verified AEC3 identity, device calibration,

@@ -111,6 +111,9 @@ def test_process_openai_api_uses_session_voice_and_yields_audio(monkeypatch):
     }
     done = next(kwargs for stage, status, kwargs in metrics if stage == "tts" and status == "done")
     assert "reference_pairing" not in done["detail"]
+    assert done["detail"]["requested_language"] == "Auto"
+    assert done["detail"]["effective_language"] is None
+    assert done["detail"]["language_auto_supported"] is False
     assert handler._last_tts_response_headers == {}
 
 
@@ -196,12 +199,19 @@ def test_process_audio_cpp_native_propagates_profile_and_latency_metrics(monkeyp
     )
     assert first_phrase["elapsed_ms"] >= 200
     assert request_start["elapsed_ms"] >= first_phrase["elapsed_ms"]
+    assert request_start["detail"]["requested_language"] == "Auto"
+    assert request_start["detail"]["effective_language"] == "Auto"
+    assert request_start["detail"]["language_auto_supported"] is True
     first_pcm = next(kwargs for stage, status, kwargs in metrics if stage == "tts" and status == "first_audio")
     assert first_pcm["detail"]["mode"] == "native_incremental_pcm"
     assert first_pcm["detail"]["first_pcm_ms"] >= 0
     assert first_pcm["detail"]["end_to_end_ms"] >= request_start["elapsed_ms"]
+    assert first_pcm["detail"]["language_auto_supported"] is True
     done = next(kwargs for stage, status, kwargs in metrics if stage == "tts" and status == "done")
     assert done["detail"]["rtf"] is not None
+    assert done["detail"]["requested_language"] == "Auto"
+    assert done["detail"]["effective_language"] == "Auto"
+    assert done["detail"]["language_auto_supported"] is True
     expected_reference = {
         "reference_source_seconds": 18.125,
         "reference_requested_limit_seconds": 12.0,
@@ -246,6 +256,74 @@ def test_openai_api_payload_preserves_explicit_multilingual_language():
 
     assert payload["input"] == "Guten Tag"
     assert payload["language"] == "German"
+
+
+def test_explicit_auto_language_is_not_replaced_by_script_detection():
+    text = "はい, I can help con eso."
+
+    assert Qwen3TTSHandler._api_language_name("Auto", text) == "Auto"
+
+
+@pytest.mark.parametrize(
+    ("provider", "supported"),
+    [
+        ("qwen3tts-audiocpp", True),
+        ("faster", False),
+        ("groxaxo", False),
+    ],
+)
+def test_provider_auto_language_support_is_reported_truthfully(provider, supported):
+    assert Qwen3TTSHandler._provider_auto_language_supported(provider) is supported
+
+
+def test_faster_adapter_patch_preserves_auto_instead_of_clone_reference_language():
+    patch = (
+        Path(__file__).resolve().parents[1]
+        / "integrations"
+        / "qwen3-tts-faster-language.patch"
+    ).read_text(encoding="utf-8")
+
+    assert patch.count('clone_language = req.language or "Auto"') == 2
+    assert 'else profile["language"]' not in patch
+
+
+def test_same_turn_tool_continuation_uses_saved_auto_language_and_clone_voice(monkeypatch):
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.should_listen = Event()
+    handler.cancel_scope = None
+    handler.speculative_turns = None
+    handler.backend = "openai_api"
+    handler.api_voice = "clone:16d9bb336799"
+    handler.api_fallback_voice = None
+    handler.blocksize = 512
+    handler.queue_in = Queue()
+    handler._last_tts_response_headers = {}
+    captured = {}
+
+    def _process_openai_api(text, voice, **kwargs):
+        captured.update(text=text, voice=voice, **kwargs)
+        yield np.zeros(512, dtype=np.int16)
+
+    handler._process_openai_api = _process_openai_api
+    handler._resolve_api_provider = lambda _runtime: (
+        "qwen3tts-audiocpp",
+        "http://127.0.0.1:8890/v1",
+        "qwen3-tts-1.7b-base-bf16",
+    )
+    handler._emit_metric = lambda *_args, **_kwargs: None
+    monkeypatch.setattr(qwen3_tts_module.console, "print", lambda *args, **kwargs: None)
+    runtime_config = RuntimeConfig()
+    runtime_config.session.audio.output.voice = "clone:code-switch"
+    runtime_config.local_pipeline.update(
+        tts_backend="qwen3tts-audiocpp",
+        assistant_language="Auto",
+    )
+
+    outputs = list(handler.process(TTSInput(text="Sí, it is ready.", runtime_config=runtime_config)))
+
+    assert len(outputs) == 1
+    assert captured["voice"] == "clone:code-switch"
+    assert captured["language"] == "Auto"
 
 
 def test_audio_cpp_buffered_payload_preserves_clone_and_disables_http_streaming():

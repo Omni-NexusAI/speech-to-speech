@@ -957,7 +957,13 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
 
     @staticmethod
     def _api_language_name(language: str | None, text: str = "") -> str:
-        if not language or str(language).strip().lower() == "auto":
+        if language is not None and str(language).strip().lower() == "auto":
+            # Explicit Auto is conversation language policy, not missing
+            # metadata. Preserve it for mixed-language/code-switched text so a
+            # clone profile's stored reference language cannot silently pin the
+            # current response.
+            return "Auto"
+        if not language:
             if any("\u0400" <= char <= "\u052f" for char in text):
                 return "Russian"
             if any("\u3040" <= char <= "\u30ff" for char in text):
@@ -974,6 +980,12 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             "french", "russian", "portuguese", "spanish", "italian",
         }
         return mapped.title() if mapped in supported else "Auto"
+
+    @staticmethod
+    def _provider_auto_language_supported(provider: str) -> bool:
+        """Advertise Auto only where its clone path is verified to preserve it."""
+
+        return str(provider).strip().lower() == "qwen3tts-audiocpp"
 
     @staticmethod
     def _runaway_budget_s(text: str) -> float:
@@ -1505,9 +1517,19 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         provider_model = getattr(self, "api_backend_model", None)
         if not language_code and runtime_config is not None:
             language_code = runtime_config.local_pipeline.get("assistant_language")
+        requested_language = str(language_code or "Auto")
         api_language = self._api_language_name(language_code, text)
         if self.backend == "openai_api":
             provider_name, provider_url, provider_model = self._resolve_api_provider(runtime_config)
+        language_auto_supported = self._provider_auto_language_supported(provider_name)
+        if self.backend == "openai_api":
+            effective_language = (
+                api_language
+                if api_language != "Auto" or language_auto_supported
+                else None
+            )
+        else:
+            effective_language = str(getattr(self, "language", "") or "") or None
         candidate_native = provider_name == "qwen3tts-audiocpp" and bool(
             getattr(self, "api_streaming_supported", False)
         )
@@ -1572,6 +1594,9 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                 "api_base_url": provider_url if self.backend == "openai_api" else None,
                 "model": provider_model,
                 "language": api_language,
+                "requested_language": requested_language,
+                "effective_language": effective_language,
+                "language_auto_supported": language_auto_supported,
                 "api_response_format": getattr(self, "api_response_format", None),
                 "chars": len(text),
                 "tts_profile_id": tts_tuning.get("profile_id") if isinstance(tts_tuning, dict) else None,
@@ -1625,6 +1650,9 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                         detail={
                             "backend": provider_name,
                             "model": provider_model,
+                            "requested_language": requested_language,
+                            "effective_language": effective_language,
+                            "language_auto_supported": language_auto_supported,
                             "profile_id": tts_tuning.get("profile_id") if isinstance(tts_tuning, dict) else None,
                             "mode": getattr(self, "_last_streaming_mode", intended_streaming_mode),
                             "first_pcm_ms": round(first_pcm_ms, 3),
@@ -1671,6 +1699,9 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                         "backend": provider_name,
                         "model": provider_model,
                         "voice": api_voice or self.api_voice,
+                        "requested_language": requested_language,
+                        "effective_language": effective_language,
+                        "language_auto_supported": language_auto_supported,
                         "reason": "barge-in/stop/replacement" if cancelled else "provider returned no audio",
                     },
                 )
@@ -1683,6 +1714,9 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                 detail={
                     "backend": provider_name,
                     "model": provider_model,
+                    "requested_language": requested_language,
+                    "effective_language": effective_language,
+                    "language_auto_supported": language_auto_supported,
                     "profile_id": tts_tuning.get("profile_id") if isinstance(tts_tuning, dict) else None,
                     "profile_revision": None,
                     "mode": getattr(self, "_last_streaming_mode", intended_streaming_mode),
@@ -1713,7 +1747,14 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                 "runaway_aborted",
                 tts_input,
                 elapsed_ms=(perf_counter() - start_s) * 1000,
-                detail={"backend": provider_name, "language": api_language, "error": str(e)},
+                detail={
+                    "backend": provider_name,
+                    "language": api_language,
+                    "requested_language": requested_language,
+                    "effective_language": effective_language,
+                    "language_auto_supported": language_auto_supported,
+                    "error": str(e),
+                },
             )
         except Exception as e:
             logger.error(f"Error during Qwen3-TTS generation: {e}", exc_info=True)
@@ -1722,7 +1763,14 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                 "failed",
                 tts_input,
                 elapsed_ms=(perf_counter() - start_s) * 1000,
-                detail={"backend": provider_name, "language": api_language, "error": str(e)},
+                detail={
+                    "backend": provider_name,
+                    "language": api_language,
+                    "requested_language": requested_language,
+                    "effective_language": effective_language,
+                    "language_auto_supported": language_auto_supported,
+                    "error": str(e),
+                },
             )
 
     def cancel_active(self) -> None:

@@ -127,10 +127,14 @@ def test_gemma_audio_payload_includes_instructions_history_tools_and_disables_th
     system_prompt = payload["messages"][0]["content"]
     assert "Always answer as TEST ROLE." in system_prompt
     assert "any language, accent, or code-switching" in system_prompt
-    assert "English by default" in system_prompt
+    assert "Follow the language or languages naturally used in the current utterance" in system_prompt
+    assert "Do not mention transcription, audio quality, garbling" in system_prompt
+    assert "unless the user explicitly asks about that topic" in system_prompt
+    assert "English by default" not in system_prompt
     assert "semantic intent is genuinely unclear" not in system_prompt
     assert "varies with the conversation" in system_prompt
     assert "Let me check that" not in system_prompt
+    assert "Could you say that another way" not in system_prompt
     assert payload["messages"][1:3] == [
         {"role": "user", "content": "Earlier question"},
         {"role": "assistant", "content": "Earlier answer"},
@@ -171,7 +175,7 @@ def test_final_transcript_accepts_multilingual_and_code_switched_text(transcript
     assert GemmaAudioSTTHandler._extract_transcript(text) == transcript
 
 
-def test_multilingual_user_audio_defaults_to_english_response_language():
+def test_multilingual_user_audio_without_a_language_marker_uses_auto():
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
     runtime_config = RuntimeConfig(chat=Chat(30))
@@ -191,8 +195,101 @@ def test_multilingual_user_audio_defaults_to_english_response_language():
 
     assert outputs[-1].transcript == "¿Dónde está la estación?"
     assert outputs[-1].text == "The station is two blocks ahead."
-    assert outputs[-1].language_code == "English"
-    assert runtime_config.local_pipeline["assistant_language"] == "English"
+    assert outputs[-1].language_code == "Auto"
+    assert runtime_config.local_pipeline["assistant_language"] == "Auto"
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_language"),
+    [
+        (
+            "USER_TRANSCRIPT: ¿Dónde está la estación?\n"
+            "ASSISTANT_LANGUAGE: Spanish\n"
+            "ASSISTANT_RESPONSE: La estación está a dos cuadras.",
+            "Spanish",
+        ),
+        (
+            "USER_TRANSCRIPT: Can you buscar la estación?\n"
+            "ASSISTANT_LANGUAGE: Auto\n"
+            "ASSISTANT_RESPONSE: Sí, it is two blocks ahead.",
+            "Auto",
+        ),
+    ],
+)
+def test_direct_audio_preserves_monolingual_or_auto_response_language(response, expected_language):
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    runtime_config = RuntimeConfig(chat=Chat(30))
+    vad_audio = SimpleNamespace(
+        runtime_config=runtime_config,
+        turn_id="turn_response_language",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+
+    outputs = list(handler._responses_from_text(response, vad_audio))
+
+    assert outputs[-1].language_code == expected_language
+    assert runtime_config.local_pipeline["assistant_language"] == expected_language
+
+
+@pytest.mark.parametrize(
+    "sentinel",
+    [
+        "[inaudible]",
+        "Unintelligible.",
+        "Audio was garbled.",
+        "No intelligible speech detected.",
+        "Transcription unavailable.",
+    ],
+)
+def test_failure_only_transcript_sentinels_are_rejected_exactly(sentinel):
+    text = f"USER_TRANSCRIPT: {sentinel}\nASSISTANT_RESPONSE: I will answer naturally."
+
+    assert GemmaAudioSTTHandler._extract_transcript(text) is None
+
+
+def test_transcript_failure_words_inside_real_user_content_are_preserved():
+    transcript = "Why does the recording sound garbled and unintelligible?"
+    text = f"USER_TRANSCRIPT: {transcript}\nASSISTANT_RESPONSE: I will explain."
+
+    assert GemmaAudioSTTHandler._extract_transcript(text) == transcript
+
+
+def test_failure_only_transcript_does_not_gate_response_or_tools():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    runtime_config = RuntimeConfig(chat=Chat(30))
+    vad_audio = SimpleNamespace(
+        runtime_config=runtime_config,
+        turn_id="turn_failure_sentinel",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+    tool = ResponseFunctionToolCall(
+        type="function_call",
+        name="web_search",
+        arguments='{"query":"current weather"}',
+        call_id="call_failure_sentinel",
+        id="fc_failure_sentinel",
+        status="completed",
+    )
+
+    outputs = list(
+        handler._responses_from_text(
+            "USER_TRANSCRIPT: Audio was unintelligible.\n"
+            "ASSISTANT_LANGUAGE: Auto\n"
+            "ASSISTANT_PREAMBLE: I'll check the current forecast.",
+            vad_audio,
+            tools=[tool],
+        )
+    )
+
+    assert outputs[-1].transcript is None
+    assert outputs[-1].text == "I'll check the current forecast."
+    assert outputs[-1].tools == [tool]
+    assert outputs[-1].language_code == "Auto"
+    assert runtime_config.local_pipeline["assistant_language"] == "Auto"
 
 
 def test_direct_audio_resets_a_previous_turn_language_before_generation():
@@ -217,6 +314,47 @@ def test_direct_audio_resets_a_previous_turn_language_before_generation():
     list(handler.process(vad_audio))
 
     assert "assistant_language" not in runtime_config.local_pipeline
+
+
+def test_accepted_turn_metrics_are_content_free_input_measurements():
+    metrics = Queue()
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(
+        model_name="gemma-test",
+        base_url="http://127.0.0.1:8818/v1",
+        stream=False,
+        text_output_queue=metrics,
+    )
+    runtime_config = RuntimeConfig(chat=Chat(30))
+    vad_audio = SimpleNamespace(
+        audio=np.asarray([0.0, 0.5, 1.0, -1.0], dtype=np.float32),
+        mode="final",
+        runtime_config=runtime_config,
+        turn_id="turn_content_free_metrics",
+        turn_revision=1,
+        created_at_s=0.0,
+    )
+    handler._iter_direct_responses = lambda *_args, **_kwargs: iter(
+        [DirectAssistantResponse(text="A private semantic answer.", is_final=True)]
+    )
+
+    list(handler.process(vad_audio))
+
+    events = []
+    while not metrics.empty():
+        events.append(metrics.get_nowait())
+    request_start = next(event for event in events if event.stage == "gemma" and event.status == "request_start")
+    captured = next(event for event in events if event.stage == "transcription" and event.status == "captured")
+    for detail in (request_start.detail, captured.detail):
+        assert detail["rms"] == 0.75
+        assert detail["peak"] == 1.0
+        assert detail["near_silence"] is False
+        assert detail["clipping"] is True
+        assert detail["clipping_fraction"] == 0.5
+        assert detail["revision_count"] == 2
+        assert "transcript" not in detail
+        assert "text" not in detail
+        assert "A private semantic answer" not in json.dumps(detail)
 
 
 def test_final_transcript_has_no_second_request_fallback():
@@ -583,7 +721,34 @@ def _sse_text(text: str) -> list[str]:
     return [f"data: {json.dumps({'choices': [{'delta': {'content': text}}]})}", "data: [DONE]"]
 
 
-def test_twelve_accepted_turns_make_one_primary_request_each_when_turn_nine_has_no_transcript():
+def test_streamed_mixed_response_without_language_marker_uses_auto():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
+    runtime_config = RuntimeConfig(chat=Chat(30))
+    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(
+        _sse_text(
+            "USER_TRANSCRIPT: Can you buscar la estación?\n"
+            "ASSISTANT_RESPONSE: Sí, it is two blocks ahead."
+        )
+    )
+    vad_audio = SimpleNamespace(
+        audio=np.zeros(1600, dtype=np.float32),
+        mode="final",
+        runtime_config=runtime_config,
+        turn_id="turn_streamed_auto",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+
+    outputs = list(handler.process(vad_audio))
+
+    spoken = [output for output in outputs if output.text]
+    assert "".join(output.text for output in spoken) == "Sí, it is two blocks ahead."
+    assert all(output.language_code == "Auto" for output in spoken)
+    assert runtime_config.local_pipeline["assistant_language"] == "Auto"
+
+
+def test_one_hundred_accepted_turns_make_one_primary_request_each_with_optional_transcripts():
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
     chat = Chat(30)
@@ -592,14 +757,14 @@ def test_twelve_accepted_turns_make_one_primary_request_each_when_turn_nine_has_
     def stream_request(_url, payload, *, api_key):
         turn = len(calls) + 1
         calls.append(payload)
-        prefix = "" if turn == 9 else f"USER_TRANSCRIPT: request {turn}\n"
+        prefix = "" if turn in {9, 37, 73, 96} else f"USER_TRANSCRIPT: request {turn}\n"
         return _FakeSSEStream(
             _sse_text(f"{prefix}ASSISTANT_LANGUAGE: English\nASSISTANT_RESPONSE: answer {turn}.")
         )
 
     handler._stream_request = stream_request
     all_outputs = []
-    for turn in range(1, 13):
+    for turn in range(1, 101):
         vad_audio = SimpleNamespace(
             audio=np.zeros(1600, dtype=np.float32),
             mode="final",
@@ -612,11 +777,10 @@ def test_twelve_accepted_turns_make_one_primary_request_each_when_turn_nine_has_
         all_outputs.append(outputs)
         assert "".join(output.text for output in outputs) == f"answer {turn}."
 
-    turn_nine_final = all_outputs[8][-1]
-    assert len(calls) == 12
-    assert turn_nine_final.transcript is None
-    assert all_outputs[9][-1].is_final is True
-    assert chat.stats()["turns"] == 11
+    assert len(calls) == 100
+    assert all(all_outputs[index - 1][-1].transcript is None for index in {9, 37, 73, 96})
+    assert all(output[-1].is_final is True for output in all_outputs)
+    assert chat.stats()["turns"] == 30
 
 
 @pytest.mark.parametrize(

@@ -13,7 +13,7 @@ On this Windows machine, the target TTS container for this framework is:
 - URL: `http://127.0.0.1:8881/v1`
 - endpoint: `/audio/speech`
 
-The example config defaults to `8881` and expects the `1.7B-Base` backend model. This container hardcodes `Qwen/Qwen3-TTS-12Hz-1.7B-Base` and exposes native clone PCM streaming. Its local server accepts an optional `language` value so multilingual requests do not inherit the profile's stored English language. The reproducible source patch is stored at `integrations/qwen3-tts-faster-language.patch`.
+The example config defaults to `8881` and expects the `1.7B-Base` backend model. This container hardcodes `Qwen/Qwen3-TTS-12Hz-1.7B-Base` and exposes native clone PCM streaming. Its local server accepts an optional `language` value and preserves explicit `Auto`, so multilingual requests do not inherit the clone reference's stored language. The reproducible source patch is stored at `integrations/qwen3-tts-faster-language.patch`; Realtime diagnostics continue to label Faster Auto support unverified until that exact adapter is rebuilt and probed.
 
 The Settings panel also lists the optional user-managed Groxaxo candidate on `http://127.0.0.1:8882/v1`. The UI reads `/v1/backend/models` and permits a new conversation only when Voice Studio already has `0.6B-Base` or `1.7B-Base` loaded. The pipeline never starts, stops, loads, unloads, switches, or silently falls back from that candidate.
 
@@ -110,7 +110,7 @@ Add `-Component frontend` or `-Component backend` to scope an action, and `-Open
 
 # Conversation context
 
-The local direct-audio mode keeps the latest 30 complete turns with `compact_history` disabled. System instructions live outside that bounded buffer. Progressive transcript previews are display-only. A validated primary transcript and its assistant response share session history; when transcript metadata is absent, the UI shows `[User audio]` without adding the placeholder or an assistant-only exchange to model history. Function calls and outputs remain retained for tool continuity. Accepted audio is semantic input in any language, accent, or code-switched form; replies default to English unless the user or session requests another language. Context diagnostics report counts and trimming events without logging conversation text.
+The local direct-audio mode keeps the latest 30 complete turns with `compact_history` disabled. System instructions live outside that bounded buffer. Progressive transcript previews are display-only. A validated primary transcript and its assistant response share session history; when transcript metadata is absent, the UI shows `[User audio]` without adding the placeholder or an assistant-only exchange to model history. Function calls and outputs remain retained for tool continuity. Accepted audio is semantic input in any language, accent, or code-switched form; replies follow the current utterance naturally, use an explicit session language when requested, and retain `Auto` for mixed or unspecified output. Context diagnostics report counts and trimming events without logging conversation text.
 
 # Tool follow-ups
 

@@ -19,7 +19,7 @@
              if req.response_format != "pcm":
                  raise HTTPException(400, "Streaming clone requests require response_format='pcm'")
  
-+            clone_language = req.language if req.language and req.language.lower() != "auto" else profile["language"]
++            clone_language = req.language or "Auto"
 +
              def _stream_generate():
                  first = True
@@ -36,7 +36,7 @@
          loop = asyncio.get_event_loop()
  
          def _generate():
-+            clone_language = req.language if req.language and req.language.lower() != "auto" else profile["language"]
++            clone_language = req.language or "Auto"
              wavs, sr = model.generate_voice_clone(
                  text=text,
 -                language=profile["language"],

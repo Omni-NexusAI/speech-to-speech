@@ -16,7 +16,7 @@
  * @typedef {"idle" | "connecting" | "queued" | "your-turn" | "listening" | "user-speaking" | "processing" | "ai-speaking" | "error"} AppState
  */
 
-import { S2sWsRealtimeClient } from "./ws/s2s-ws-client.js?v=13-config-ack";
+import { S2sWsRealtimeClient } from "./ws/s2s-ws-client.js?v=15-audible-lifecycle";
 import { $, truncateError, DEBUG } from "./ui/dom.js";
 import { ChatView } from "./ui/chat.js";
 import { Account } from "./ui/account.js";
@@ -499,6 +499,31 @@ function activeTtsTuning(backend = settings.ttsBackend) {
   return sessionTuning;
 }
 
+/** Browser-only playback snapshot paired with a pipeline config update. The
+ * backend acknowledgement remains the commit point; this object is never sent
+ * over the public Realtime WebSocket schema. */
+function activePlaybackConfig(backend = settings.ttsBackend) {
+  const provider = normalizeTtsProvider(backend);
+  if (provider !== AUDIO_CPP_PROVIDER) {
+    return { provider, nativeStreaming: false, profileId: "", resolvedPrimeMs: 0 };
+  }
+  const state = realtimeTuningState(provider);
+  const effective = effectiveCandidateTuning();
+  const firstBlockFrames = Number(effective.first_block_frames);
+  const resolvedPrimeMs = Number.isFinite(firstBlockFrames)
+    ? firstBlockFrames * 80
+    : 0;
+  const backendStatus = ttsBackendStatuses?.[provider];
+  return {
+    provider,
+    profileId: state.profile_id,
+    // Both engine capability and the direct chunk/header probe must agree.
+    nativeStreaming: backendStatus?.nativeStreaming === true
+      && candidateTuningResolved?.capabilities?.native_incremental_pcm === true,
+    resolvedPrimeMs,
+  };
+}
+
 function updateRealtimeAudioSummary() {
   if (!diagnosticsAudioSummary) return;
   const backend = settings.ttsBackend || "no provider";
@@ -579,7 +604,7 @@ async function resolveCandidateTuning(
   const firstMs = Number(effective.first_block_frames || 0) * 80;
   const steadyMs = Number(effective.steady_block_frames || 0) * 80;
   const native = !!resolved.capabilities?.native_incremental_pcm;
-  diagnosticsTuningStatus.textContent = `${resolved.profile?.name || resolved.profile?.id || "Profile"} · ${native ? "native incremental PCM" : "buffered fallback"} · first/steady ${firstMs}/${steadyMs} ms · 24 kHz PCM16.`;
+  diagnosticsTuningStatus.textContent = `${resolved.profile?.name || resolved.profile?.id || "Profile"} · ${native ? "native incremental PCM" : "buffered fallback"} · first/steady ${firstMs}/${steadyMs} ms · model 24 kHz PCM16 · Realtime transport 16 kHz.`;
   diagnosticsTuningNamedValues.textContent = `${resolved.profile?.name || profileId} · ${compactTuningSummary(resolved.profile || {})}`;
   diagnosticsTuningOverrideValues.textContent = compactTuningSummary(resolved.temporaryOverrides || {});
   diagnosticsTuningEffectiveValues.textContent = compactTuningSummary(effective);
@@ -591,10 +616,13 @@ async function resolveCandidateTuning(
 function applyCandidateTuningToLiveSession() {
   const tuning = activeTtsTuning();
   if (client && LIVE_STATES.has(currentState) && tuning) {
-    client.updateLocalPipeline({
-      tts_backend: AUDIO_CPP_PROVIDER,
-      tts_tuning: tuning,
-    });
+    client.updateLocalPipeline(
+      {
+        tts_backend: AUDIO_CPP_PROVIDER,
+        tts_tuning: tuning,
+      },
+      activePlaybackConfig(AUDIO_CPP_PROVIDER),
+    );
   }
 }
 
@@ -1748,8 +1776,11 @@ function renderDiagnostics() {
   const ttsDone = [...visibleMetrics].reverse().find((m) => m.stage === "tts" && m.status === "done");
   const llmFirstPhrase = [...visibleMetrics].reverse().find((m) => m.stage === "gemma" && m.status === "first_stable_phrase");
   const firstPlayback = [...visibleMetrics].reverse().find((m) => m.stage === "playback" && m.status === "first_audio");
+  const playbackQueue = [...visibleMetrics].reverse().find((m) => (
+    m.stage === "playback" && Number.isFinite(Number(m.detail?.prime_target_ms))
+  ));
   const responseDone = [...visibleMetrics].reverse().find((m) => m.stage === "response" && m.status === "done");
-  if (diagnosticsAudioMetrics && (ttsStart || ttsFirst || ttsDone || llmFirstPhrase || firstPlayback || responseDone)) {
+  if (diagnosticsAudioMetrics && (ttsStart || ttsFirst || ttsDone || llmFirstPhrase || firstPlayback || playbackQueue || responseDone)) {
     const start = ttsStart?.detail || {}; const first = ttsFirst?.detail || {}; const done = ttsDone?.detail || {};
     const selectedTtsStatus = ttsBackendStatuses[settings.ttsBackend];
     const gpu = done.gpu || selectedTtsStatus?.health?.backend?.runtime?.gpu_now;
@@ -1764,7 +1795,12 @@ function renderDiagnostics() {
       ? "limit status unknown"
       : done.reference_limit_applied ? "limit applied" : "limit not applied";
     const referencePairing = done.reference_pairing ?? "unknown pairing";
-    diagnosticsAudioMetrics.textContent = `Profile ${done.profile_id ?? start.tts_profile_id ?? "unknown"} · ${done.model ?? start.model ?? "unknown model"}\nMode: ${done.delivery_mode ?? done.mode ?? start.streaming_mode ?? "unknown"}\nLLM first stable phrase: ${firstPhraseMs} ms\nTTS first PCM: ${first.first_pcm_ms ?? ttsFirst?.elapsed_ms ?? "unknown"} ms · First playback: ${firstPlaybackMs} ms\nSynthesis RTF: ${done.rtf ?? "unknown"} · End-to-end: ${endToEndMs} ms\nGeneration: ${done.generation_ms ?? "unknown"} ms · Audio: ${done.audio_duration_ms ?? "unknown"} ms · GPU: ${gpuText}\nReference: source ${referenceSeconds(done.reference_source_seconds)} · requested ${referenceSeconds(done.reference_requested_limit_seconds)} · used ${referenceSeconds(done.reference_used_seconds)} · ${referenceLimit} · ${referencePairing}`;
+    const playback = playbackQueue?.detail || {};
+    const requestedLanguage = done.requested_language ?? first.requested_language ?? start.requested_language ?? "unknown";
+    const effectiveLanguage = done.effective_language ?? first.effective_language ?? start.effective_language ?? "unknown";
+    const autoLanguageSupport = done.language_auto_supported ?? first.language_auto_supported ?? start.language_auto_supported;
+    const autoLanguageText = autoLanguageSupport == null ? "unknown" : autoLanguageSupport ? "verified" : "not verified";
+    diagnosticsAudioMetrics.textContent = `Profile ${done.profile_id ?? start.tts_profile_id ?? "unknown"} · ${done.model ?? start.model ?? "unknown model"}\nMode: ${done.delivery_mode ?? done.mode ?? start.streaming_mode ?? "unknown"}\nLanguage: requested ${requestedLanguage} · effective ${effectiveLanguage} · Auto ${autoLanguageText}\nLLM first stable phrase: ${firstPhraseMs} ms\nTTS first PCM: ${first.first_pcm_ms ?? ttsFirst?.elapsed_ms ?? "unknown"} ms · First playback: ${firstPlaybackMs} ms\nPlayback: prime ${playback.prime_target_ms ?? 0} ms · queued ${Math.round(Number(playback.queued_ms || 0))} ms · underruns ${playback.underruns ?? 0} · re-primes ${playback.reprimes ?? 0} · stale ${playback.stale_chunks ?? 0}\nSynthesis RTF: ${done.rtf ?? "unknown"} · End-to-end: ${endToEndMs} ms\nGeneration: ${done.generation_ms ?? "unknown"} ms · Audio: ${done.audio_duration_ms ?? "unknown"} ms · GPU: ${gpuText}\nReference: source ${referenceSeconds(done.reference_source_seconds)} · requested ${referenceSeconds(done.reference_requested_limit_seconds)} · used ${referenceSeconds(done.reference_used_seconds)} · ${referenceLimit} · ${referencePairing}`;
   }
   const echo = [...visibleMetrics].reverse().find((m) => m.stage === "echo_guard");
   if (echo && diagnosticsAudioStatus) {
@@ -2285,13 +2321,16 @@ settingsForm.addEventListener("submit", async (event) => {
   if (client && LIVE_STATES.has(currentState)) {
     const tuning = activeTtsTuning(settings.ttsBackend);
     client.updateSession({ voice: settings.voice, instructions: effectiveInstructions() });
-    client.updateLocalPipeline({
-      full_buffer_tts: settings.fullBufferTts,
-      live_transcription: settings.liveTranscript,
-      max_response_tokens: settings.maxResponseTokens,
-      tts_backend: settings.ttsBackend,
-      ...(tuning ? { tts_tuning: tuning } : {}),
-    });
+    client.updateLocalPipeline(
+      {
+        full_buffer_tts: settings.fullBufferTts,
+        live_transcription: settings.liveTranscript,
+        max_response_tokens: settings.maxResponseTokens,
+        tts_backend: settings.ttsBackend,
+        ...(tuning ? { tts_tuning: tuning } : {}),
+      },
+      activePlaybackConfig(settings.ttsBackend),
+    );
     client.setEchoGuard(settings.echoGuard);
   }
   if (saved.ok) window.setTimeout(() => settingsModal.close(), 350);
@@ -2519,6 +2558,7 @@ async function doStart(audioContext = null) {
         : {}),
       model_endpoint: modelEndpointConfig(settings),
     },
+    playbackConfig: activePlaybackConfig(settings.ttsBackend),
     ...(audioContext ? { audioContext } : {}),
   });
   client = c;
