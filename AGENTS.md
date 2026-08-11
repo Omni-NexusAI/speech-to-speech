@@ -20,6 +20,7 @@
   is hidden from the UI, never starts another request, and never gates or
   replaces assistant text, tools, or the visual `[User audio]` fallback.
 - Context diagnostics report retained history tokens against the live llama.cpp context window; turn retention remains a separate 30-turn policy.
+- Model-level clarification-rate evidence uses the privacy-safe 100-turn direct-audio gate in `scripts/probe_clarification_rate.py`. It is separate from deterministic unit coverage and the managed WebSocket/tool gate, and may emit only aggregate counts, rates, booleans, timings, and error classes.
 - `scripts/local_realtime.ps1` is the managed background entry point; foreground launchers remain available for raw-console debugging.
 - Model provider selection is conversation-scoped. Remote completely replaces local Gemma operations without fallback; TTS selection remains independent.
 - One conversation may own only one model HTTP operation at a time. Barge-in cancels or detaches that generation within two seconds without ending the WebSocket session or clearing context.

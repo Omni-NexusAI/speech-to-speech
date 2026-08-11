@@ -11,6 +11,7 @@
 - Multilingual direct-audio coverage must prove there is no implicit English fallback, monolingual responses preserve their explicit language, mixed or unspecified responses retain `Auto`, stale turn language is cleared, and the effective language survives same-turn tool continuation. Exact failure-only transcript sentinels are absent metadata while legitimate user sentences containing the same words remain intact; neither case may change response or tool delivery.
 - Accepted-turn diagnostic coverage must prove duration, RMS, peak, near-silence, clipping, and revision count are emitted without transcript or response content. Shared and legacy LLM log tests must use secret sentinels to prove assistant and tool content never reaches logs. Provider metrics must distinguish requested/effective TTS language and report Auto support truthfully rather than inferring it from clone metadata.
 - The deterministic accepted-turn gate must exercise at least 100 turns and prove exactly one primary Gemma request per turn even when optional transcript metadata is absent. Model-level clarification-rate listening validation remains a separate live evidence gate.
+- Clarification-rate probe tests must prove the 100 normal turns are divided evenly across the five declared acoustic/language cohorts, every normal challenge and expected value is unique across retained history, meaningless input remains outside the normal denominator, SAPI receives explicit UTF-8 bytes through stdin and returns WAVs only in memory, a real Windows System.Speech runner accepts a multilingual fixture under the active process encoding, failed voice enumeration is isolated to a separate catalog process, and a clean synthesis child uses a fresh default synthesizer per scenario with false culture/alternate coverage when no safe match is available. Seeded noise is deterministic, multilingual fixtures survive an explicit UTF-8/codepoint round trip, clarification and garbling signals take precedence over recovered answer tokens, the exact managed loopback settings handoff rejects redirects before synthesis or model requests, production transcript-versus-memory precedence and historical serialization are reused, ambiguous semantic output fails closed, exact attempted/completed counts survive partial failures, one primary request is counted per accepted turn, and the CLI emits exactly one aggregate JSON object with empty stderr while restoring production logger state. Public success/failure output cannot contain utterances, audio, transcripts, responses, endpoint/model/voice identity, or credentials.
 - Cover final transcript persistence independently from the optional floating live bubble, display-only `[User audio]` fallback, single durable semantic user history, Unicode-safe output, tool acknowledgement after response close, and dynamic history-token/context-window diagnostics.
 - Cover immediate tool output/create ordering, session-scoped provider selection, Groxaxo Base-model detection, active-stream cancellation, and bounded TTS runaway handling.
 - Direct-audio tool tests must cover opaque, already-prefixed, missing, duplicate, streaming, and buffered llama.cpp call IDs. Preserve explicit `ASSISTANT_PREAMBLE` text exactly; omitted preambles execute silently without canned substitution or `ASSISTANT_RESPONSE` rewriting.
@@ -67,6 +68,14 @@
   invalid update, legacy provider normalization, and removal of foreign tuning
   when providers switch.
 - Keep live smoke testing documented separately from automated tests.
+- Content-free Realtime harness tests must prove configuration acknowledgement
+  precedes all PCM, the second spoken turn depends on the first, malformed tool
+  arguments cause no output/create side effect, function output acknowledgement
+  precedes exactly one tool-disabled follow-up create, required tool choice is
+  restored to automatic before the next turn, tool results survive a later spoken
+  turn, cancellation closes in protocol order, and recovery succeeds without
+  serializing any prompt, audio, transcript, response, tool value, endpoint,
+  model, voice, or credential.
 - Launcher/status regressions must reject transient container IDs and Docker
   lifecycle calls from speech-to-speech launchers while retaining the stable
   `qwen3-tts-faster` runtime identity.

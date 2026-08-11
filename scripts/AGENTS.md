@@ -30,6 +30,41 @@
   mapping. It must never persist or print memory, audio, prompts, response text,
   endpoints, models, or bearer keys, and it must never become runtime retry
   behavior.
+- Use `probe_realtime_context_tools.py` only as a content-free managed
+  WebSocket release gate. It synthesizes fixed spoken scenarios in memory with
+  Windows System.Speech, requires `pipeline.config.updated` before the first
+  PCM append, and validates contextual counting, one exact tool call/output/
+  follow-up transaction, and cancellation recovery in a single session. The
+  search turn temporarily requires a tool, its post-result create disables
+  recursive tools, and automatic tool choice is acknowledged again before the
+  next spoken turn. It reads the remote bearer only from
+  `S2S_REMOTE_MODEL_API_KEY`. Fixed non-sensitive fixture phrases remain
+  source-only; no runtime-generated or live prompt, audio, transcript,
+  response, tool value, endpoint/model/voice identity, or credential may be
+  persisted or emitted.
+- Use `probe_clarification_rate.py` only as the privacy-safe model-level
+  clarification-rate gate. It runs exactly 100 normal accepted direct-audio
+  turns across clear speech, hesitation, best-available installed voices,
+  deterministic moderate noise, and supported-language code-switching, plus a
+  separately reported meaningless cohort. Every normal turn uses a unique
+  deterministic numeric challenge and expected value so retained history
+  cannot answer a later cohort without attending to its current audio. It generates WAVs through Windows
+  System.Speech entirely in memory using explicit UTF-8 bytes on stdin plus a
+  UTF-8 PowerShell console input encoding, sends exactly one primary request per turn,
+  and reuses the production direct-audio payload, control parser, semantic
+  anchor, serializer, and 30-turn history contract. It reads the remote bearer
+  only from `S2S_REMOTE_MODEL_API_KEY` and may emit only aggregate counts,
+  rates, booleans, timings, exact attempted/completed request counts, and error
+  classes. Voice discovery uses a separate bounded PowerShell process because
+  failed enumeration may corrupt System.Speech process-wide; a clean synthesis
+  process then uses a fresh synthesizer per scenario, falls back to its default
+  voice, and reports culture/alternate coverage as false. Missing culture or
+  alternate voices fail full coverage truthfully; prompts, audio, transcripts, responses,
+  endpoints, models, voice identities, and credentials never reach public
+  stdout/stderr or temporary files. This controlled gate is not a WER, room/AEC, VAD, WebSocket,
+  tool-order, or open-ended conversation benchmark. Resolve model routing only
+  from the exact managed loopback `/api/ui-settings` response, reject redirects,
+  and validate that handoff before reading or using the remote credential.
 - Managed startup validates only Python and repository configuration. Missing
   Gemma or TTS services are status warnings; the launcher never inspects,
   starts, stops, or restarts model containers.
