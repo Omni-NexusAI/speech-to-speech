@@ -1054,33 +1054,10 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
 
     @classmethod
     def _tool_preamble(cls, text: str, tools: list[ResponseFunctionToolCall]) -> str | None:
-        """Return a spoken lead-in for every native tool call.
-
-        A model-provided acknowledgement is preferred, but tool execution must
-        never become silent just because the model omitted an optional marker.
-        """
+        """Return only an explicit model-provided native-tool lead-in."""
         if not tools:
             return None
-        preamble = cls._extract_assistant_preamble(text)
-        if preamble:
-            return preamble
-        response = _ASSISTANT_RESPONSE_RE.search(text)
-        if response:
-            value = " ".join(response.group(1).strip().split())
-            if value and len(value) <= 280:
-                return value
-        names = {tool.name for tool in tools}
-        seed = "|".join(f"{tool.name}:{tool.call_id or tool.id or ''}" for tool in tools)
-        if "camera_snapshot" in names:
-            choices = ("I'll take a closer look.", "Let me see what you're showing me.", "I'll check the camera view.")
-        elif "web_search" in names:
-            choices = ("I'll look that up.", "I'll check the latest information.", "I'll find that for you.")
-        else:
-            choices = ("I'll take care of that.", "I'll check on it.", "I'll look into it.")
-        index = 0
-        for char in seed:
-            index = (index * 33 + ord(char)) % len(choices)
-        return choices[index]
+        return cls._extract_assistant_preamble(text)
 
     @staticmethod
     def _fallback_response_text(text: str) -> str:

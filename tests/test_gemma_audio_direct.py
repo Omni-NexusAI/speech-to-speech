@@ -452,33 +452,23 @@ def test_optional_tool_preamble_is_extracted_without_becoming_response_metadata(
     assert GemmaAudioSTTHandler._fallback_response_text(text) == ""
 
 
-def test_tool_preamble_has_a_safe_fallback_when_the_model_omits_it():
+def test_tool_preamble_is_never_synthesized_or_rewritten():
     camera = ResponseFunctionToolCall(
         type="function_call", name="camera_snapshot", arguments="{}", call_id="call_camera", id="fc_camera", status="completed"
     )
     search = ResponseFunctionToolCall(
         type="function_call", name="web_search", arguments="{}", call_id="call_search", id="fc_search", status="completed"
     )
-    camera_preamble = GemmaAudioSTTHandler._tool_preamble("", [camera])
-    search_preamble = GemmaAudioSTTHandler._tool_preamble("", [search])
-    assert camera_preamble in {
-        "I'll take a closer look.",
-        "Let me see what you're showing me.",
-        "I'll check the camera view.",
-    }
-    assert search_preamble in {
-        "I'll look that up.",
-        "I'll check the latest information.",
-        "I'll find that for you.",
-    }
-    fallback_variants = {
+    assert GemmaAudioSTTHandler._tool_preamble("", [camera]) is None
+    assert GemmaAudioSTTHandler._tool_preamble("", [search]) is None
+    assert GemmaAudioSTTHandler._tool_preamble("ASSISTANT_RESPONSE: A substantive answer.", [search]) is None
+    assert (
         GemmaAudioSTTHandler._tool_preamble(
-            "",
-            [search.model_copy(update={"call_id": f"call_search_{index}", "id": f"fc_search_{index}"})],
+            "ASSISTANT_PREAMBLE: I'll check the latest information.",
+            [search],
         )
-        for index in range(9)
-    }
-    assert len(fallback_variants) > 1
+        == "I'll check the latest information."
+    )
 
 
 def test_tool_preamble_is_spoken_and_committed_before_the_function_call():
