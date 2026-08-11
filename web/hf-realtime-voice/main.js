@@ -243,7 +243,7 @@ async function restorePersistentSettings() {
     if (!response.ok) return;
     const payload = await response.json();
     if (!payload?.settings || typeof payload.settings !== "object") return;
-    // Preserve any page-session-only API key already present in this browser.
+    // Preserve any browser-local API key already present on this device.
     settings = { ...settings, ...payload.settings, modelApiKey: settings.modelApiKey };
     settings.ttsBackend = normalizeTtsProvider(settings.ttsBackend);
     settings.voiceByBackend = normalizeTtsProviderMap(

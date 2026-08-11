@@ -105,7 +105,7 @@
   explicit unsafe unlock before editing the 72-frame decoder context. Never
   send audio.cpp tuning to another TTS provider. Expanded metrics include LLM first stable phrase, TTS first PCM,
   first playback, synthesis RTF, end-to-end time, model/profile, GPU headroom,
-  requested/effective response language and verified provider Auto support,
+  requested/effective response language and declared provider Auto capability,
   paired reference source/requested/used duration, limit-applied state,
   pairing mode, truthful delivery mode,
   requested/effective echo mode, verified AEC3 identity, device calibration,

@@ -1023,7 +1023,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
 
     @staticmethod
     def _provider_auto_language_supported(provider: str) -> bool:
-        """Advertise Auto only where its clone path is verified to preserve it."""
+        """Advertise Auto only where the static provider capability declares it."""
 
         return str(provider).strip().lower() == "qwen3tts-audiocpp"
 

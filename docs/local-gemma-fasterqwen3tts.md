@@ -7,7 +7,7 @@ This fork keeps the upstream Realtime speech-to-speech framework intact while ad
 
 ## Services
 
-On this Windows machine, the target TTS container for this framework is:
+In the default local example configuration, the target TTS container is:
 
 - container: `qwen3-tts-faster`
 - URL: `http://127.0.0.1:8881/v1`

@@ -10,6 +10,7 @@ PLAYBACK_JS = (ROOT / "web" / "hf-realtime-voice" / "worklets" / "audio-playback
 REALTIME_README = (ROOT / "web" / "hf-realtime-voice" / "README.md").read_text(encoding="utf-8")
 REALTIME_CONTEXT = (ROOT / "web" / "hf-realtime-voice" / "CONTEXT.md").read_text(encoding="utf-8")
 REALTIME_SERVER = (ROOT / "web" / "hf-realtime-voice" / "server.py").read_text(encoding="utf-8")
+REALTIME_AGENTS = (ROOT / "web" / "hf-realtime-voice" / "AGENTS.md").read_text(encoding="utf-8")
 QWEN_HANDLER = (ROOT / "src" / "speech_to_speech" / "TTS" / "qwen3_tts_handler.py").read_text(
     encoding="utf-8"
 )
@@ -96,6 +97,10 @@ def test_remote_model_api_key_wording_matches_browser_local_storage_contract():
     assert "browser/device's `localStorage`" in normalized
     assert "excluded from UI-server persistence payloads" in normalized
     assert "browser-session state" not in normalized
+    assert "browser-local API key" in MAIN_JS
+    assert "page-session-only API key" not in MAIN_JS
+    assert "declared provider Auto capability" in REALTIME_AGENTS
+    assert "verified provider Auto support" not in REALTIME_AGENTS
 
 
 def test_camera_capability_depends_on_enabled_state_not_stream_readiness():
