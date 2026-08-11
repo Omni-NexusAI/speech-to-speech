@@ -12,6 +12,15 @@ from speech_to_speech.pipeline.messages import TTSInput
 from speech_to_speech.TTS.qwen3_tts_handler import Qwen3TTSHandler
 
 
+def _write_base_profile(library: Path, profile_id: str, name: str, task_type: str = "Base") -> None:
+    profile_dir = library / "profiles" / profile_id
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "meta.json").write_text(
+        json.dumps({"profile_id": profile_id, "name": name, "task_type": task_type}),
+        encoding="utf-8",
+    )
+
+
 def test_local_realtime_config_disables_compaction_for_chat_completions_backend():
     config_path = Path(__file__).resolve().parents[1] / "examples" / "local_gemma_fasterqwen3tts.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -21,9 +30,10 @@ def test_local_realtime_config_disables_compaction_for_chat_completions_backend(
     assert config["responses_api_compact_history"] is False
     assert config["responses_api_stream"] is True
     assert config["stream_batch_sentences"] == 1
+    assert config["qwen3_tts_api_voice"] is None
 
 
-def test_setup_openai_api_backend_skips_in_process_model_loading(monkeypatch):
+def test_setup_openai_api_backend_skips_in_process_model_loading(monkeypatch, tmp_path):
     def _setup_mlx(self, *args, **kwargs):
         raise AssertionError("openai-api should not use mlx")
 
@@ -34,14 +44,15 @@ def test_setup_openai_api_backend_skips_in_process_model_loading(monkeypatch):
     monkeypatch.setattr(Qwen3TTSHandler, "_setup_mlx", _setup_mlx)
     monkeypatch.setattr(Qwen3TTSHandler, "_setup_faster", _setup_faster)
     monkeypatch.setattr(Qwen3TTSHandler, "_ensure_openai_api_backend_model", lambda self: None)
+    monkeypatch.setenv("VOICE_LIBRARY_DIR", str(tmp_path))
 
     handler = object.__new__(Qwen3TTSHandler)
-    handler.setup(Event(), backend="openai-api")
+    handler.setup(Event(), backend="openai-api", api_voice="clone:explicit-voice")
 
     assert handler.backend == "openai_api"
     assert handler.device == "remote"
     assert handler.api_base_url == "http://127.0.0.1:8881/v1"
-    assert handler.api_voice == "clone:16d9bb336799"
+    assert handler.api_voice == "clone:explicit-voice"
     assert handler.api_fallback_voice is None
     assert handler.api_backend_model == "1.7B-Base"
     assert handler._audio_cpp_native_warm_streams == set()
@@ -53,16 +64,59 @@ def test_openai_api_payload_uses_streaming_pcm_and_clone_voice():
     handler = object.__new__(Qwen3TTSHandler)
     handler.api_model = "qwen3-tts"
 
-    payload = handler._openai_api_payload("hello", "clone:16d9bb336799")
+    payload = handler._openai_api_payload("hello", "clone:alpha-base-0001")
 
     assert payload == {
         "model": "qwen3-tts",
         "input": "hello",
-        "voice": "clone:16d9bb336799",
+        "voice": "clone:alpha-base-0001",
         "response_format": "pcm",
         "stream": True,
         "language": "Auto",
     }
+
+
+def test_openai_api_voice_library_uses_portable_default_and_env_override(monkeypatch, tmp_path):
+    handler = object.__new__(Qwen3TTSHandler)
+    monkeypatch.delenv("VOICE_LIBRARY_DIR", raising=False)
+
+    expected = Path.home() / ".speech-to-speech" / "qwen3-tts-voices"
+    assert qwen3_tts_module.DEFAULT_OPENAI_API_VOICE_LIBRARY_DIR == expected
+    assert handler._resolve_api_voice_library_dir(None) == expected
+    assert expected.relative_to(Path.home()) == Path(".speech-to-speech/qwen3-tts-voices")
+
+    override = tmp_path / "shared-voices"
+    monkeypatch.setenv("VOICE_LIBRARY_DIR", str(override))
+    assert handler._resolve_api_voice_library_dir(None) == override
+
+    configured = tmp_path / "configured-voices"
+    assert handler._resolve_api_voice_library_dir(str(configured)) == configured
+
+
+def test_openai_api_voice_uses_valid_selection_then_first_live_base_or_none(tmp_path):
+    _write_base_profile(tmp_path, "beta-base-0002", "Beta Voice")
+    _write_base_profile(tmp_path, "alpha-base-0001", "Alpha Voice")
+    _write_base_profile(tmp_path, "custom-voice-01", "Custom Voice", "CustomVoice")
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.api_voice_library_dir = tmp_path
+    handler.api_voice = None
+
+    (tmp_path / "selected_profile.json").write_text(
+        json.dumps({"profile_id": "beta-base-0002"}), encoding="utf-8"
+    )
+    assert handler._resolve_api_voice(None, None) == "clone:beta-base-0002"
+
+    (tmp_path / "selected_profile.json").write_text(
+        json.dumps({"profile_id": "stale-base-0099"}), encoding="utf-8"
+    )
+    assert handler._resolve_api_voice(None, None) == "clone:alpha-base-0001"
+
+    empty = object.__new__(Qwen3TTSHandler)
+    empty.api_voice_library_dir = tmp_path / "empty"
+    empty.api_voice = None
+    assert empty._resolve_api_voice(None, None) is None
+    with pytest.raises(RuntimeError, match="No live Base clone profile"):
+        empty._require_api_voice(None)
 
 
 def test_process_openai_api_uses_session_voice_and_yields_audio(monkeypatch):
@@ -71,7 +125,7 @@ def test_process_openai_api_uses_session_voice_and_yields_audio(monkeypatch):
     handler.cancel_scope = None
     handler.speculative_turns = None
     handler.backend = "openai_api"
-    handler.api_voice = "clone:16d9bb336799"
+    handler.api_voice = "clone:alpha-base-0001"
     handler.api_fallback_voice = None
     handler.blocksize = 512
     handler.queue_in = Queue()
@@ -252,7 +306,7 @@ def test_openai_api_payload_preserves_explicit_multilingual_language():
     handler = object.__new__(Qwen3TTSHandler)
     handler.api_model = "qwen3-tts"
 
-    payload = handler._openai_api_payload("Guten Tag", "clone:16d9bb336799", "German")
+    payload = handler._openai_api_payload("Guten Tag", "clone:alpha-base-0001", "German")
 
     assert payload["input"] == "Guten Tag"
     assert payload["language"] == "German"
@@ -293,7 +347,7 @@ def test_same_turn_tool_continuation_uses_saved_auto_language_and_clone_voice(mo
     handler.cancel_scope = None
     handler.speculative_turns = None
     handler.backend = "openai_api"
-    handler.api_voice = "clone:16d9bb336799"
+    handler.api_voice = "clone:alpha-base-0001"
     handler.api_fallback_voice = None
     handler.blocksize = 512
     handler.queue_in = Queue()
@@ -357,7 +411,7 @@ def test_audio_cpp_buffered_payload_uses_resident_provider_model():
 
 def test_audio_cpp_does_not_retry_faster_fallback(monkeypatch):
     handler = object.__new__(Qwen3TTSHandler)
-    handler.api_fallback_voice = "clone:16d9bb336799"
+    handler.api_fallback_voice = "clone:alpha-base-0001"
     handler._api_voice_for_backend = lambda value: value
     calls = []
 
@@ -963,7 +1017,7 @@ def test_streaming_tts_runaway_is_aborted_and_closed(monkeypatch):
     monkeypatch.setattr(qwen3_tts_module, "CancellableAsyncByteStream", lambda *_args, **_kwargs: response)
 
     with pytest.raises(qwen3_tts_module.TTSRunawayError):
-        list(handler._stream_openai_api_voice("short reply", "clone:16d9bb336799"))
+        list(handler._stream_openai_api_voice("short reply", "clone:alpha-base-0001"))
 
     assert response.closed is True
 
@@ -1134,14 +1188,14 @@ def test_ensure_openai_api_backend_model_uses_fixed_faster_pcm_streaming_when_ad
 
 
 def test_api_voice_for_backend_maps_clone_id_to_profile_name(tmp_path):
-    profile_dir = tmp_path / "profiles" / "16d9bb336799"
+    profile_dir = tmp_path / "profiles" / "alpha-base-0001"
     profile_dir.mkdir(parents=True)
     (profile_dir / "meta.json").write_text(
-        json.dumps({"profile_id": "16d9bb336799", "name": "J.A.R.V.I.S", "task_type": "Base"}),
+        json.dumps({"profile_id": "alpha-base-0001", "name": "Alpha Voice", "task_type": "Base"}),
         encoding="utf-8",
     )
     handler = object.__new__(Qwen3TTSHandler)
     handler.api_voice_library_dir = tmp_path
 
-    assert handler._api_voice_for_backend("clone:16d9bb336799") == "clone:J.A.R.V.I.S"
+    assert handler._api_voice_for_backend("clone:alpha-base-0001") == "clone:Alpha Voice"
     assert handler._api_voice_for_backend("clone:missing") == "clone:missing"

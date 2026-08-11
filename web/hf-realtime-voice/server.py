@@ -111,8 +111,6 @@ PUBLIC_UI_SETTING_KEYS = {
     "voiceByBackend",
     "ttsProfileByBackend",
 }
-DEFAULT_QWEN3_VOICE_ID = "16d9bb336799"
-DEFAULT_QWEN3_VOICE = f"clone:{DEFAULT_QWEN3_VOICE_ID}"
 TTS_BACKENDS = {
     "faster": {
         "endpoint": "http://127.0.0.1:8881/v1", "requiredModel": "1.7B-Base",
@@ -154,7 +152,7 @@ def _normalize_tts_provider_settings(payload: dict[str, Any]) -> dict[str, Any]:
 DEFAULT_VOICE_LIBRARY_DIR = Path(
     os.environ.get(
         "VOICE_LIBRARY_DIR",
-        r"C:\Users\yepyy\Documents\Codex\2026-05-24\files-mentioned-by-the-user-i\qwen3-tts-candidate\voice_library_from_original",
+        str(Path.home() / ".speech-to-speech" / "qwen3-tts-voices"),
     )
 ).expanduser()
 
@@ -528,7 +526,7 @@ def _load_base_clone_profiles(library_dir: Path) -> list[dict]:
             }
         )
 
-    voices.sort(key=lambda item: (item["id"] != DEFAULT_QWEN3_VOICE_ID, item["name"].lower()))
+    voices.sort(key=lambda item: (item["name"].casefold(), item["id"].casefold()))
     return voices
 
 
@@ -577,19 +575,25 @@ def _write_profile(directory: Path, profile: dict[str, Any]) -> None:
     (directory / "meta.json").write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
 
 
-def _profile_response(library_dir: Path) -> dict[str, Any]:
+def _selected_base_voice(library_dir: Path, voices: list[dict[str, Any]]) -> str | None:
+    available = {str(profile["id"]): str(profile["voice"]) for profile in voices}
     selected_path = library_dir / "selected_profile.json"
-    selected = DEFAULT_QWEN3_VOICE_ID
     try:
-        selected = str(json.loads(selected_path.read_text(encoding="utf-8")).get("profile_id") or selected)
-    except (OSError, json.JSONDecodeError):
-        pass
+        selected = json.loads(selected_path.read_text(encoding="utf-8"))
+        profile_id = str(selected.get("profile_id") or "").strip()
+    except (OSError, json.JSONDecodeError, AttributeError):
+        profile_id = ""
+    return available.get(profile_id) or (str(voices[0]["voice"]) if voices else None)
+
+
+def _profile_response(library_dir: Path) -> dict[str, Any]:
+    voices = _load_base_clone_profiles(library_dir)
     return {
-        "defaultVoice": DEFAULT_QWEN3_VOICE,
-        "selectedVoice": f"clone:{selected}",
+        "defaultVoice": str(voices[0]["voice"]) if voices else None,
+        "selectedVoice": _selected_base_voice(library_dir, voices),
         "libraryDir": str(library_dir),
         "writable": os.access(library_dir, os.W_OK),
-        "voices": _load_base_clone_profiles(library_dir),
+        "voices": voices,
     }
 
 
@@ -635,7 +639,7 @@ async def _backend_voice_inventory(backend: str) -> dict[str, Any]:
         "reachable": False,
         "writable": config.get("profileMode") in {"local", "remote"},
         "management": config.get("profileMode"),
-        "defaultVoice": DEFAULT_QWEN3_VOICE if backend == "faster" else None,
+        "defaultVoice": None,
         "selectedVoice": None,
         "voices": [],
     }
@@ -664,10 +668,10 @@ async def _backend_voice_inventory(backend: str) -> dict[str, Any]:
                 }
                 reconciled = [item for item in local if str(item.get("name") or "").casefold() in live_names]
                 base["voices"] = reconciled
-                profile_state = _profile_response(DEFAULT_VOICE_LIBRARY_DIR)
-                base["selectedVoice"] = profile_state["selectedVoice"]
-                if not any(item["voice"] == DEFAULT_QWEN3_VOICE for item in reconciled) and reconciled:
-                    base["defaultVoice"] = reconciled[0]["voice"]
+                base["defaultVoice"] = reconciled[0]["voice"] if reconciled else None
+                base["selectedVoice"] = _selected_base_voice(DEFAULT_VOICE_LIBRARY_DIR, reconciled)
+                if not reconciled:
+                    base["error"] = "No live Base clone profiles are available from FasterQwen3TTS."
             else:
                 base["voices"] = remote_voices
                 base["writable"] = False
@@ -842,8 +846,6 @@ def edit_qwen3_profile(profile_id: str, req: ProfileEditRequest):
 
 @app.delete("/api/qwen3/profiles/{profile_id}")
 def delete_qwen3_profile(profile_id: str):
-    if profile_id == DEFAULT_QWEN3_VOICE_ID:
-        raise HTTPException(status_code=409, detail="The configured J.A.R.V.I.S default profile cannot be deleted.")
     library_dir = DEFAULT_VOICE_LIBRARY_DIR
     _ensure_profile_library_writable(library_dir)
     profile_dir = _profile_path(library_dir, profile_id)
@@ -868,6 +870,7 @@ async def local_pipeline():
     """Best-effort live description of the local runtime backing the UI."""
     gemma_base = os.environ.get("GEMMA_AUDIO_BASE_URL", "http://127.0.0.1:8818/v1").rstrip("/")
     tts_base = os.environ.get("QWEN3_TTS_API_BASE_URL", "http://127.0.0.1:8881/v1").rstrip("/")
+    profile_state = _profile_response(DEFAULT_VOICE_LIBRARY_DIR)
     status = {
         "mode": "local-direct-audio",
         "vad": {"name": "Silero VAD", "device": "CPU", "sampleRate": 16000},
@@ -877,7 +880,8 @@ async def local_pipeline():
             "backend": "qwen3-tts-faster",
             "apiModel": "qwen3-tts",
             "model": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-            "voice": DEFAULT_QWEN3_VOICE,
+            "voice": profile_state["selectedVoice"],
+            "voiceAvailable": bool(profile_state["selectedVoice"]),
             "container": "qwen3-tts-faster",
         },
         "tools": {"serper": bool(SERPER_KEY), "camera": True},

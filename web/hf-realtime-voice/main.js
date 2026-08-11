@@ -24,7 +24,7 @@ import { $, truncateError, DEBUG } from "./ui/dom.js";
 import { ChatView } from "./ui/chat.js?v=3-tool-privacy";
 import { Account } from "./ui/account.js";
 
-const DEFAULT_VOICE = "clone:16d9bb336799";
+const DEFAULT_VOICE = "";
 const DEFAULT_INSTRUCTIONS =
   "You are a friendly voice assistant. " +
   "Keep replies short, warm, and spoken. Avoid long monologues.";
@@ -144,7 +144,7 @@ function loadSettings() {
   return {
     directUrl: localStorage.getItem(STORAGE_KEYS.directUrl) || "http://127.0.0.1:8765",
     voice: storedVoice,
-    voiceByBackend: { faster: DEFAULT_VOICE, ...voiceByBackend, [normalizedBackend]: storedVoice },
+    voiceByBackend: { ...voiceByBackend, [normalizedBackend]: storedVoice },
     ttsProfileByBackend,
     instructions: localStorage.getItem(STORAGE_KEYS.instructions) || DEFAULT_INSTRUCTIONS,
     noiseGate: loadGateThreshold(),
@@ -1169,6 +1169,7 @@ function renderVoiceOptions() {
     option.selected = true;
     inputVoice.append(option);
     inputVoice.disabled = true;
+    syncSelectedProfileEditor();
     return;
   }
 
@@ -1216,14 +1217,14 @@ function syncSelectedProfileEditor() {
   profileLibraryStatus.textContent = profileLibraryWritable
     ? `Changes persist only to the selected ${settings.ttsBackend} clone library.`
     : "The selected backend is inventory-only here; use its own Voice Studio for profile changes.";
-  for (const button of [profileCreateBtn, profileSaveBtn, profileDeleteBtn, profileImportBtn]) {
-    button.disabled = !profileLibraryWritable;
-  }
+  profileCreateBtn.disabled = !profileLibraryWritable;
+  profileImportBtn.disabled = !profileLibraryWritable;
+  profileSaveBtn.disabled = !profileLibraryWritable || !profile;
+  profileDeleteBtn.disabled = !profileLibraryWritable || !profile;
   if (!profile) return;
   inputProfileName.value = profile.name || "";
   inputProfileRefText.value = profile.ref_text || "";
   inputProfileLanguage.value = profile.language || "Auto";
-  profileDeleteBtn.disabled = !profileLibraryWritable || profile.id === DEFAULT_VOICE.replace("clone:", "");
 }
 
 async function qwen3Json(url, options = {}) {
@@ -1238,7 +1239,7 @@ async function qwen3Json(url, options = {}) {
 
 function applyVoiceProfilePayload(payload, backend = settings.ttsBackend) {
   if (backend !== settings.ttsBackend || (payload.backend && payload.backend !== backend)) return;
-  defaultVoice = payload.defaultVoice || DEFAULT_VOICE;
+  defaultVoice = payload.defaultVoice || "";
   voiceProfiles = Array.isArray(payload.voices) ? payload.voices : [];
   profileLibraryWritable = !!payload.writable;
   const liveVoices = new Set(voiceProfiles.map((profile) => profile.voice));
@@ -1249,6 +1250,10 @@ function applyVoiceProfilePayload(payload, backend = settings.ttsBackend) {
       ? saved
       : (liveVoices.has(providerSelected) ? providerSelected : (liveVoices.has(defaultVoice) ? defaultVoice : voiceProfiles[0].voice));
     settings.voiceByBackend = { ...(settings.voiceByBackend || {}), [backend]: settings.voice };
+  } else {
+    settings.voice = "";
+    settings.voiceByBackend = { ...(settings.voiceByBackend || {}), [backend]: "" };
+    void saveSettings(settings);
   }
   renderVoiceOptions();
 }
@@ -2136,16 +2141,14 @@ async function fetchVoiceProfiles() {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const json = await res.json();
     if (request !== voiceInventoryRequest || backend !== settings.ttsBackend) return;
+    if (json?.reachable === false) throw new Error("Voice backend unavailable");
     applyVoiceProfilePayload(json, backend);
     return;
   } catch (err) {
     if (request !== voiceInventoryRequest || backend !== settings.ttsBackend) return;
     console.warn(`[ui] failed to load ${backend} clone voices:`, err);
-    defaultVoice = DEFAULT_VOICE;
-    voiceProfiles = [];
-    profileLibraryWritable = false;
+    clearVoiceProfileOptions(backend, `${backend} voice inventory unavailable; saved selection retained`);
   }
-  renderVoiceOptions();
 }
 
 async function refreshFasterModelInventory() {
@@ -2248,9 +2251,8 @@ profileDeleteBtn.addEventListener("click", async () => {
   if (!profile || !window.confirm(`Delete clone profile ${profile.name}?`)) return;
   try {
     const payload = await qwen3Json(`api/tts/backends/${encodeURIComponent(settings.ttsBackend)}/profiles/${encodeURIComponent(profile.id)}`, { method: "DELETE" });
-    if (settings.voice === profile.voice) settings.voice = defaultVoice;
-    saveSettings(settings);
     applyVoiceProfilePayload(payload);
+    saveSettings(settings);
     profileLibraryStatus.textContent = "Clone profile deleted.";
   } catch (err) { profileLibraryStatus.textContent = err instanceof Error ? err.message : String(err); }
 });

@@ -21,7 +21,7 @@
   "qwen3_tts_backend": "openai-api",
   "qwen3_tts_api_base_url": "http://127.0.0.1:8881/v1",
   "qwen3_tts_api_model": "qwen3-tts",
-  "qwen3_tts_api_voice": "clone:16d9bb336799",
+  "qwen3_tts_api_voice": null,
   "qwen3_tts_api_fallback_voice": null,
   "qwen3_tts_api_backend_model": "1.7B-Base",
   "qwen3_tts_api_sample_rate": 24000,

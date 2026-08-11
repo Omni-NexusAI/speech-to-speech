@@ -61,15 +61,12 @@ MAX_COALESCED_TTS_CHARS = 420
 DEFAULT_MLX_STREAMING_CHUNK_SIZE = 4
 DEFAULT_QWEN3_TTS_MAX_NEW_TOKENS = 1536
 DEFAULT_OPENAI_API_BASE_URL = "http://127.0.0.1:8881/v1"
-DEFAULT_OPENAI_API_VOICE = "clone:16d9bb336799"
+DEFAULT_OPENAI_API_VOICE: str | None = None
 DEFAULT_OPENAI_API_BACKEND_MODEL = "1.7B-Base"
 DEFAULT_GROXAXO_API_BASE_URL = "http://127.0.0.1:8882/v1"
 DEFAULT_AUDIO_CPP_API_BASE_URL = "http://127.0.0.1:8890/v1"
 AUDIO_CPP_NATIVE_COLD_FIRST_PCM_BUDGET_S = 45.0
-DEFAULT_OPENAI_API_VOICE_LIBRARY_DIR = (
-    r"C:\Users\yepyy\Documents\Codex\2026-05-24\files-mentioned-by-the-user-i"
-    r"\qwen3-tts-candidate\voice_library_from_original"
-)
+DEFAULT_OPENAI_API_VOICE_LIBRARY_DIR = Path.home() / ".speech-to-speech" / "qwen3-tts-voices"
 MIN_QWEN3_TTS_UTTERANCE_TOKENS = 360
 VALID_MLX_QUANTIZATION_SUFFIXES = ("bf16", "4bit", "6bit", "8bit")
 VALID_FASTER_BACKENDS = ("ggml", "torch", "openai-api")
@@ -148,7 +145,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         api_base_url: str = DEFAULT_OPENAI_API_BASE_URL,
         api_key: str | None = None,
         api_model: str = "qwen3-tts",
-        api_voice: str = DEFAULT_OPENAI_API_VOICE,
+        api_voice: str | None = DEFAULT_OPENAI_API_VOICE,
         api_fallback_voice: str | None = None,
         api_backend_model: str = DEFAULT_OPENAI_API_BACKEND_MODEL,
         api_voice_library_dir: str | None = None,
@@ -180,10 +177,10 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.api_base_url = (os.getenv("QWEN3_TTS_API_BASE_URL") or api_base_url).rstrip("/")
         self.api_key = api_key or os.getenv("QWEN3_TTS_API_KEY")
         self.api_model = api_model
-        self.api_voice = api_voice
         self.api_fallback_voice = api_fallback_voice
         self.api_backend_model = api_backend_model
         self.api_voice_library_dir = self._resolve_api_voice_library_dir(api_voice_library_dir)
+        self.api_voice = api_voice or self._selected_api_voice()
         self.api_response_format = "pcm"
         self.api_streaming_supported = False
         self.api_sample_rate = int(api_sample_rate)
@@ -725,7 +722,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
 
     def _resolve_api_voice(
         self, runtime_config: RuntimeConfig | None, response: RealtimeResponseCreateParams | None
-    ) -> str:
+    ) -> str | None:
         if response and response.audio and response.audio.output and response.audio.output.voice:
             return str(response.audio.output.voice)
         if runtime_config is not None:
@@ -733,7 +730,16 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             output = audio.output if audio is not None else None
             if output is not None and output.voice:
                 return str(output.voice)
-        return self.api_voice
+        return self.api_voice or self._selected_api_voice()
+
+    @staticmethod
+    def _require_api_voice(voice: str | None) -> str:
+        if voice:
+            return voice
+        raise RuntimeError(
+            "No live Base clone profile is available for the selected TTS backend. "
+            "Create or import a profile, select one, or pass an explicit qwen3_tts_api_voice."
+        )
 
     def _openai_api_payload(
         self,
@@ -845,6 +851,40 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
     def _resolve_api_voice_library_dir(self, configured: str | None) -> Path:
         value = configured or os.getenv("VOICE_LIBRARY_DIR") or DEFAULT_OPENAI_API_VOICE_LIBRARY_DIR
         return Path(value).expanduser()
+
+    def _available_api_base_voices(self) -> list[tuple[str, str]]:
+        profiles_dir = self.api_voice_library_dir / "profiles"
+        voices: list[tuple[str, str]] = []
+        for meta_path in profiles_dir.glob("*/meta.json") if profiles_dir.is_dir() else ():
+            try:
+                profile = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                logger.warning("Skipping unreadable Qwen3-TTS voice profile metadata: %s", meta_path)
+                continue
+            if profile.get("task_type") != "Base":
+                continue
+            profile_id = str(profile.get("profile_id") or meta_path.parent.name).strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", profile_id):
+                continue
+            name = str(profile.get("name") or profile_id).strip()
+            voices.append((profile_id, name))
+        return sorted(voices, key=lambda item: (item[1].casefold(), item[0].casefold()))
+
+    def _selected_api_voice(self) -> str | None:
+        voices = self._available_api_base_voices()
+        if not voices:
+            return None
+        available = {profile_id for profile_id, _name in voices}
+        try:
+            selected = json.loads(
+                (self.api_voice_library_dir / "selected_profile.json").read_text(encoding="utf-8")
+            )
+            profile_id = str(selected.get("profile_id") or "").strip()
+        except (OSError, json.JSONDecodeError, AttributeError):
+            profile_id = ""
+        if profile_id in available:
+            return f"clone:{profile_id}"
+        return f"clone:{voices[0][0]}"
 
     def _api_voice_for_backend(self, voice: str) -> str:
         if not voice.startswith("clone:"):
@@ -1521,6 +1561,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         api_language = self._api_language_name(language_code, text)
         if self.backend == "openai_api":
             provider_name, provider_url, provider_model = self._resolve_api_provider(runtime_config)
+            api_voice = self._require_api_voice(api_voice)
         language_auto_supported = self._provider_auto_language_supported(provider_name)
         if self.backend == "openai_api":
             effective_language = (

@@ -757,10 +757,10 @@ def test_openai_payload_preserves_multilingual_text_unchanged():
     handler.api_response_format = "pcm"
     text = "Guten Morgen. \u041f\u0440\u0438\u0432\u0435\u0442. \u3053\u3093\u306b\u3061\u306f\u3002"
 
-    payload = handler._openai_api_payload(text, "clone:16d9bb336799")
+    payload = handler._openai_api_payload(text, "clone:alpha-base-0001")
 
     assert payload["input"] == text
-    assert payload["voice"] == "clone:16d9bb336799"
+    assert payload["voice"] == "clone:alpha-base-0001"
     assert payload["stream"] is True
 
 

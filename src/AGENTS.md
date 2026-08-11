@@ -29,6 +29,13 @@
 - Keep `--stt gemma-audio` as the local direct-audio bypass mode; it must not load Parakeet or another ASR model.
 - Keep `--qwen3_tts_backend openai-api` as an external server mode for Dockerized FasterQwen3TTS; it must not import or initialize in-process FasterQwen3TTS.
 - In `openai-api` mode, default to `http://127.0.0.1:8881/v1`, require `1.7B-Base`, and accept clone voices as `clone:<profile_id>`.
+- Resolve the shared clone library from `VOICE_LIBRARY_DIR`; when it is unset,
+  use the portable user path `~/.speech-to-speech/qwen3-tts-voices`. Never
+  embed a developer checkout as a product default.
+- Do not embed a clone identity as the OpenAI-compatible TTS default. Preserve
+  an explicit voice override; otherwise resolve a valid `selected_profile.json`,
+  then the first authoritative live Base profile, and fail truthfully if the
+  library has none.
 - The `qwen3-tts-faster` API resolves clones by stable profile ID or display name and advertises native PCM streaming through `/health`; the adapter must stream each PCM chunk immediately when that capability is present.
 - Prefer additive backend options over removing upstream handlers.
 - Keep audio exchanged with the Realtime client as PCM16 and route through the existing pipeline queues.

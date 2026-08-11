@@ -1,108 +1,117 @@
 # Context glossary
 
-Canonical terms for this space. A glossary, not a spec — it defines what words mean,
-not how anything is built. Keep design/implementation detail in `DESIGN.md` and the
-code.
+Canonical terms for the current local and hosted Realtime browser surface. This
+file defines vocabulary; implementation contracts live in `AGENTS.md` and
+`DESIGN.md`.
 
-## Speech-to-speech demo
-The product: a voice conversation you have with a model by tapping the orb and
-talking. "The demo" and "the space" refer to this same thing. It runs on Hugging
-Face's open `speech-to-speech` backend.
+## Local Realtime UI
 
-## The pipeline
-The ordered path a turn travels, from your voice to the orb's reply. Order is
-meaningful — each stage consumes the previous one's output:
+The browser application served by the managed frontend, normally at
+`http://127.0.0.1:7862`. It is a client of the repository's Realtime WebSocket,
+not a second speech backend.
 
-`you speak → VAD → STT → VLM → TTS → orb replies`
+## Pipeline
 
-- **VAD** — voice activity detection. Decides *when* you are speaking, so the system
-  knows a turn has started and ended. Model: silero-vad.
-- **STT** — speech to text. Transcribes your speech into words. Model:
-  nvidia/parakeet-tdt-1.1b.
-- **VLM** — the vision-language model that composes the reply. Served via Cerebras.
-  Model: google/gemma-4-31B-it.
-- **TTS** — text to speech. Speaks the reply back in the chosen voice. Model:
-  Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice.
+The current local turn path:
 
-## Builder
-A Hugging Face user credited with making the space, shown by HF username. Current
-builders: tfrere, A-Mahla and andito. Distinct from the *models'* authors (nvidia, google,
-Qwen, snakers4), who are credited per pipeline stage.
+`microphone → browser capture/AEC → VAD → Gemma direct audio → optional tools → selected Qwen3-TTS provider → playback worklet`
 
-## Powered by
-The infrastructure running the pipeline, named in the about panel: Hugging Face
-Inference Endpoints (hosting) and Cerebras (LLM inference). Distinct from "built by"
-(the people) and from the model authors (who trained each model).
+- **VAD** decides when an utterance is accepted. It is the only audio-admission
+  boundary for the direct-audio path.
+- **Gemma direct audio** sends the accepted utterance to the conversation's
+  selected local or remote OpenAI-compatible audio model without requiring an
+  STT transcript first.
+- **TTS** speaks stable assistant phrases through FasterQwen3TTS, the
+  user-managed Groxaxo provider, or the isolated audio.cpp candidate.
+
+## Accepted user turn
+
+One VAD-completed utterance admitted to Gemma. A cumulative VAD revision may
+replace the same logical turn, but it must not create another semantic history
+entry or another final response.
+
+## Semantic user anchor
+
+The single history item reserved for an accepted user turn before assistant or
+tool state. Validated transcript text has first precedence, bounded validated
+same-response `USER_MEMORY` has second precedence, and historical `input_audio`
+is retained when neither text field is safe. The browser's `[User audio]` label
+is a separate display-only representation.
+
+## Configuration acknowledgement
+
+The matching `pipeline.config.updated` event that commits model provider, TTS
+provider, clone, and tuning for a conversation. Microphone upload waits for the
+initial acknowledgement. Later changes apply only after acknowledgement and do
+not mutate already queued speech.
+
+## Model provider
+
+The conversation-scoped Gemma endpoint. **Local** uses the configured local
+llama.cpp service. **Remote** uses one explicit OpenAI-compatible endpoint and
+never silently falls back to Local.
+
+## TTS provider
+
+The conversation-scoped speech service, independent from the model provider:
+
+- **FasterQwen3TTS** is the stable clone-only default.
+- **Groxaxo** is user-managed and selectable only while compatible and ready.
+- **audio.cpp** is the opt-in candidate with private profiles and experimental
+  native PCM.
+
+## Base clone profile
+
+A voice-cloning identity backed by a reference WAV, exact paired transcript,
+and Base task metadata. Inventories are provider-scoped. A profile visible in
+one provider is not borrowed by another provider.
+
+## Native incremental PCM
+
+audio.cpp delivery that produces multiple verified PCM chunks before the
+synthesis request completes. A capability flag alone is not proof. A request
+that lacks the exact native header or enough chunks remains **buffered
+fallback**.
+
+## Adaptive safe-start
+
+The browser's native audio.cpp playback policy. Cold playback uses the full
+first-plus-steady block ceiling; learned warm playback uses content-free logical
+decoder-block arrival evidence. It is unrelated to the **Adaptive** echo mode.
+
+## Echo modes
+
+- **Native** uses browser AEC and is the default.
+- **Adaptive** uses the authenticated AEC3 worklet when available and otherwise
+  resolves to Native.
+- **Strict** withholds uncertain capture through the echo tail instead of
+  manufacturing silence.
+
+The echo reference is exact scheduled playback PCM, never a clone reference
+recording.
 
 ## Tool
-A function the model can call mid-conversation to do something the pipeline
-can't do on its own (look something up, look through the camera). Tools are
-declared to the backend in the session config; the model decides when to call
-one. Distinct from the *pipeline stages* (VAD/STT/VLM/TTS), which always run.
 
-## Tool executor
-The client-side component that runs a tool when the model calls it and returns
-the result to the backend, so the model can speak the answer. It is the missing
-half of the round-trip: the backend already emits the call, the executor runs it
-and replies. Distinct from the *tool* itself (the thing being run).
+A model-requested browser function. Web search and camera snapshot are the
+current tools. Arguments are schema-validated before execution, output is
+acknowledged before one post-tool response is created, and the tool call/result
+remain ordered inside the originating semantic turn.
 
-## Web search tool
-A tool that looks something up on the web for the model. The model calls it with
-a query; the tool executor forwards the query to the search proxy and returns the
-results as the tool result. Activates only when a search key is available.
+## Camera snapshot
 
-## Camera snapshot tool
-A tool that lets the model look through the user's webcam. While enabled, a live
-self-view is shown in the page (bottom-left); when the model calls the tool, the
-executor captures a frame and sends it to the model as an image so the VLM can
-see it. Distinct from the *preview* (what the user sees) and the *snapshot* (the
-single frame sent to the model).
+One point-in-time frame captured only by a real tool call. Preview is not a
+snapshot, and a question about the current view or a change requires a fresh
+call. Every invocation receives a distinct durable visible card.
 
-## Search proxy
-The same-origin server route (`/search`) that holds the search key and calls the
-external search provider on the client's behalf, so the key never reaches the
-browser. Lives in the same container as the page. Distinct from the *s2s backend*
-(the separate load-balanced speech-to-speech service).
+## Hosted session
 
-## Tools panel
-The dialog opened from the "Tools" button in the top-right, holding one switch per
-tool (and the web-search key status). Turning a switch on/off declares or removes
-that tool on the live session. Distinct from *Settings* (connection, voice,
-instructions) and the *About panel* (project info).
+The optional Hugging Face deployment path in which the UI server proxies a
+load-balancer `/session` request and returns a signed Realtime WebSocket URL.
+This is separate from the managed local direct WebSocket at `8765`.
 
-## Identity block
-The top-left corner of the topbar (replacing the old wordmark): the demo name, a
-one-line blurb, and the "powered by" / "built by" credits, shown directly rather
-than hidden behind a click.
+## Diagnostics
 
-## About panel
-The popup opened from the (i) icon to the right of the identity block. Holds the
-general introduction to the speech-to-speech project (with a repo link) and the
-pipeline. Identity itself now lives in the corner, not here.
-
-## Queue
-The line of users waiting for a free conversation slot when every compute is
-busy. You join the queue instead of being turned away; you leave it by reaching
-the front or by giving up. Distinct from a *session* (an actual live
-conversation) — being in the queue is not yet talking, and time spent waiting
-never counts against your usage limit.
-
-## Ticket
-Your held place in the queue. Created when you join, it is what the demo checks
-to tell you your position and to notice if you have left. A ticket is not a
-session: it only promises a spot in line, not a compute.
-
-## Position
-How many people are ahead of you in the queue, shown while you wait ("You're #3
-in line"). It only ever counts down. Distinct from an *estimated wait* — the
-demo shows position, never a time, because wait time is unpredictable.
-
-## Claim
-The moment you reach the front and a free slot becomes yours — the queue hands
-off to a real session and the conversation begins. This is also the point where
-your usage limit first starts to matter (never while waiting).
-
-## At capacity
-The state where the queue itself is full, so new users can't even join the line
-and are asked to try again shortly. Distinct from simply *busy* (all computes
-taken but the queue still has room to wait in).
+Content-free runtime, queue, latency, context-size, provider, language, and echo
+telemetry. Diagnostics may report counts, timings, states, and bounded reasons;
+they never log prompt, transcript, semantic memory, tool values, response text,
+audio, credentials, or raw adaptive-playback identities.

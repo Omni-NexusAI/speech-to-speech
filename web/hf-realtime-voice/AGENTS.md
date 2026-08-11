@@ -36,6 +36,13 @@
   Reconcile Faster's live voices with its configured writable library, use the
   candidate-private audio.cpp profile API, and keep Groxaxo inventory-only
   unless its existing API explicitly advertises safe mutation support.
+- Resolve the shared Faster clone library from `VOICE_LIBRARY_DIR`; when it is
+  unset, use `~/.speech-to-speech/qwen3-tts-voices`, matching the pipeline
+  handler. A missing portable library is an empty inventory, never permission
+  to borrow profiles from another provider or a developer checkout.
+- No clone is privileged or undeletable. Preserve an explicit backend-scoped
+  selection; otherwise use a valid `selected_profile.json`, then the first live
+  Base profile, and clear/disable voice state when the inventory is empty.
 - Treat each selected backend's current no-store inventory as authoritative;
   do not hide a live audio.cpp profile merely because another provider uses the
   same ID. Clear and disable the voice selector before awaiting a backend
@@ -64,8 +71,8 @@
   Faster/Groxaxo automatically.
 - Persist local UI preferences (including the selected TTS backend) atomically
   through `/api/ui-settings` so an environment/browser reset can restore them.
-  Never retain model or service API keys there; those remain browser-session
-  settings.
+  Never retain model or service API keys there; those remain in browser-local
+  device storage and are excluded from every UI-server persistence payload.
 - General provider validation checks health, resident model, capabilities,
   selected clone presence, and a short synthesis without changing model
   residency. Persist and retrieve results by backend/model/clone so switching
@@ -73,7 +80,8 @@
   experimental audio.cpp still requires explicit validation.
 - Persist non-secret backend endpoints, prompts, selected backend, and
   per-backend clone selections atomically through server-managed runtime state.
-  Await saves in the Settings UI and keep all API keys browser-session-only.
+  Await saves in the Settings UI and keep all API keys in browser-local device
+  storage only, excluded from every UI-server persistence payload and response.
 - Keep model inference controls separate from TTS controls, and place Voice directly beneath TTS Backend in the vertically scrolling settings layout.
 - Stop invalidates the active client before asynchronous teardown; closed-client mic, playback, tool, and WebSocket events must never change the idle UI or enter a replacement conversation.
 - Feed the exact generated playback PCM into the capture worklet as a non-audible reference; never substitute the static clone recording. Native browser AEC is the default. Adaptive uses only the SHA-verified, import-free bundled AEC3 module; any manifest, ABI, hash, compile, or worklet failure resolves truthfully to Native. Strict suspends uncertain upload through the echo tail without inserting zero PCM.

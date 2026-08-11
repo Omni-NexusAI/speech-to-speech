@@ -17,11 +17,15 @@ The example config defaults to `8881` and expects the `1.7B-Base` backend model.
 
 The Settings panel also lists the optional user-managed Groxaxo candidate on `http://127.0.0.1:8882/v1`. The UI reads `/v1/backend/models` and permits a new conversation only when Voice Studio already has `0.6B-Base` or `1.7B-Base` loaded. The pipeline never starts, stops, loads, unloads, switches, or silently falls back from that candidate.
 
-Gemma should be launched with the local llama.cpp settings from `C:\llama.cpp\launch_gemma-4-12B-it-qat-MTP.ps1`, with context reduced to 16k. This repo includes a wrapper:
+Gemma should be launched with the repository wrapper at a 16k context. Pass the local llama.cpp installation explicitly so the documented setup remains portable:
 
 ```powershell
 $env:GEMMA_API_KEY = '<local llama-server key>'
-.\scripts\launch_gemma_4_12b_16k.ps1
+.\scripts\launch_gemma_4_12b_16k.ps1 `
+  -LlamaCppDir '<path-to-llama.cpp>' `
+  -ModelPath '<path-to-gemma-model.gguf>' `
+  -DraftModelPath '<path-to-gemma-draft-model.gguf>' `
+  -MmprojPath '<path-to-gemma-mmproj.gguf>'
 ```
 
 Do not run Gemma/llama.cpp tests while the local server is being rebuilt.
@@ -86,11 +90,16 @@ The realtime backend and UI can start while local Gemma is unavailable. Local en
 - A VAD soft endpoint waits 250 ms before launching Gemma. The seven-second continuation horizon is anchored to the first soft endpoint and never slides forward. Continuations require 192 ms of confirmed speech and are bounded to eight revisions or 30 seconds of combined audio; a bound starts a new turn without dropping the new fragment.
 - Direct audio, optional previews, and post-tool generation share one model-operation coordinator. Only one request can occupy the selected Local or Remote endpoint; optional previews are dropped while it is busy. VAD is the sole audio-admission boundary: transcript metadata comes only from the primary request and cannot reject audio, trigger another request, suppress an answer, or block a tool call.
 - Direct and post-tool timeouts close the active stream, emit one failed completion, release response ownership, and resume listening without canned speech. Post-tool responses use streamed Chat Completions and dispatch the first complete sentence to TTS. A barge-in actively closes the obsolete stream; if transport shutdown exceeds two seconds, that generation is detached and its late output is rejected without ending the conversation.
-- Tool responses may include a model-generated `ASSISTANT_PREAMBLE`. It is spoken and retained before the native function call; when it is omitted, a request-specific varied per-tool fallback keeps the tool call audible without reusing one stock phrase.
+- Tool responses may include a model-generated `ASSISTANT_PREAMBLE`. It is spoken and retained before the native function call; when it is omitted, the tool executes silently without a fallback or substituted preamble.
 - Faster on `8881` is the default. Groxaxo on `8882` remains user-managed, and the isolated audio.cpp candidate on `8890` is opt-in after explicit validation. A Settings provider change is conversation-scoped and takes effect on the next conversation.
-- Voice defaults to `clone:16d9bb336799`, displayed as `J.A.R.V.I.S`.
+- An explicit voice setting wins. Otherwise Faster uses a valid
+  `selected_profile.json`, then the first live `Base` clone in its authoritative
+  library. With no live Base clone, Realtime reports voice unavailable and does
+  not start a conversation.
 - The realtime UI lists only live `Base` clone profiles from the selected backend. Faster reads its configured `profiles/*/meta.json` library, audio.cpp resolves its private candidate library, and Groxaxo remains inventory-only unless its API advertises safe mutation support.
-- The realtime session stores clone IDs, but the frozen `qwen3-tts-faster` API looks up clones by profile name, so the adapter maps `clone:16d9bb336799` to `clone:J.A.R.V.I.S` before calling `/v1/audio/speech`.
+- The realtime session stores clone IDs, while the frozen `qwen3-tts-faster` API
+  looks up clones by profile name. The adapter resolves the selected profile's
+  current metadata before calling `/v1/audio/speech`.
 - Pretrained Qwen voices are intentionally hidden for this local test path.
 - All three OpenAI-compatible TTS providers receive `stream: true`, `response_format: pcm`, their selected backend-scoped clone ID, and an explicit assistant language when Gemma supplies one. Cyrillic, Japanese, Korean, and Chinese script detection is a fallback only. audio.cpp uses native incremental PCM only after its live capability and chunk probe succeed; otherwise it reports and uses the cancellable buffered fallback.
 - TTS streams are cancelled on Stop/disconnect and aborted when they exceed `min(60s, max(12s, 3x estimated speech duration + 5s))`.

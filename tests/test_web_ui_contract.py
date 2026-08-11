@@ -7,6 +7,95 @@ CLIENT_JS = (ROOT / "web" / "hf-realtime-voice" / "ws" / "s2s-ws-client.js").rea
 CHAT_JS = (ROOT / "web" / "hf-realtime-voice" / "ui" / "chat.js").read_text(encoding="utf-8")
 MIC_CAPTURE_JS = (ROOT / "web" / "hf-realtime-voice" / "worklets" / "mic-capture.js").read_text(encoding="utf-8")
 PLAYBACK_JS = (ROOT / "web" / "hf-realtime-voice" / "worklets" / "audio-playback.js").read_text(encoding="utf-8")
+REALTIME_README = (ROOT / "web" / "hf-realtime-voice" / "README.md").read_text(encoding="utf-8")
+REALTIME_CONTEXT = (ROOT / "web" / "hf-realtime-voice" / "CONTEXT.md").read_text(encoding="utf-8")
+REALTIME_SERVER = (ROOT / "web" / "hf-realtime-voice" / "server.py").read_text(encoding="utf-8")
+QWEN_HANDLER = (ROOT / "src" / "speech_to_speech" / "TTS" / "qwen3_tts_handler.py").read_text(
+    encoding="utf-8"
+)
+QWEN_ARGUMENTS = (
+    ROOT / "src" / "speech_to_speech" / "arguments_classes" / "qwen3_tts_arguments.py"
+).read_text(encoding="utf-8")
+ROOT_AGENTS = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+LOCAL_REALTIME_GUIDE = (ROOT / "docs" / "local-gemma-fasterqwen3tts.md").read_text(encoding="utf-8")
+LOCAL_REALTIME_EXAMPLE = (ROOT / "examples" / "local_gemma_fasterqwen3tts.json").read_text(encoding="utf-8")
+HOSTING_ADR = (
+    ROOT / "web" / "hf-realtime-voice" / "docs" / "adr" / "0001-docker-space-with-search-proxy.md"
+).read_text(encoding="utf-8")
+GEMMA_LAUNCHER = (ROOT / "scripts" / "launch_gemma_4_12b_16k.ps1").read_text(
+    encoding="utf-8"
+)
+
+
+def test_realtime_docs_describe_current_direct_audio_and_acknowledgement_contracts():
+    assert "Gemma direct audio" in REALTIME_README
+    assert "pipeline.config.updated" in REALTIME_README
+    assert "Base clone profiles" in REALTIME_README
+    assert "VOICE_LIBRARY_DIR" in REALTIME_README
+    assert "Gemma direct audio" in REALTIME_CONTEXT
+    assert "Configuration acknowledgement" in REALTIME_CONTEXT
+    assert "historical scope" in HOSTING_ADR
+
+    for stale_claim in (
+        "Same load balancer, same",
+        "Aiden, Ryan, Dylan",
+        "nvidia/parakeet-tdt-1.1b",
+        "google/gemma-4-31B-it",
+        "front-end, audio pipeline, and s2s handshake are untouched",
+    ):
+        assert stale_claim not in REALTIME_README
+        assert stale_claim not in REALTIME_CONTEXT
+        assert stale_claim not in HOSTING_ADR
+
+
+def test_realtime_voice_default_is_live_inventory_driven_and_has_no_privileged_clone():
+    retired_profile_id = "16d9" + "bb336799"
+    retired_profile_name = "J.A.R." + "V.I.S"
+    product_surfaces = (
+        MAIN_JS,
+        INDEX_HTML,
+        REALTIME_SERVER,
+        QWEN_HANDLER,
+        QWEN_ARGUMENTS,
+        ROOT_AGENTS,
+        LOCAL_REALTIME_GUIDE,
+        LOCAL_REALTIME_EXAMPLE,
+    )
+    for surface in product_surfaces:
+        assert retired_profile_id not in surface
+        assert retired_profile_name not in surface
+
+    assert 'const DEFAULT_VOICE = "";' in MAIN_JS
+    assert 'DEFAULT_OPENAI_API_VOICE: str | None = None' in QWEN_HANDLER
+    assert 'default=None' in QWEN_ARGUMENTS.split("qwen3_tts_api_voice", 1)[1].split(")", 1)[0]
+    assert "selected_profile.json" in QWEN_HANDLER
+    assert "selected_profile.json" in REALTIME_SERVER
+    privileged_delete_message = "configured J.A.R." + "V.I.S default profile cannot be deleted"
+    assert privileged_delete_message not in REALTIME_SERVER
+    assert 'profile.id === DEFAULT_VOICE.replace("clone:", "")' not in MAIN_JS
+    assert "profileDeleteBtn.disabled = !profileLibraryWritable || !profile" in MAIN_JS
+    assert "profileCreateBtn.disabled = !profileLibraryWritable" in MAIN_JS
+
+
+def test_gemma_launcher_has_no_workstation_path_defaults():
+    for variable in (
+        "LLAMA_CPP_DIR",
+        "GEMMA_MODEL_PATH",
+        "GEMMA_DRAFT_MODEL_PATH",
+        "GEMMA_MMPROJ_PATH",
+    ):
+        assert f"$env:{variable}" in GEMMA_LAUNCHER
+    for parameter in ("$LlamaCppDir", "$ModelPath", "$DraftModelPath", "$MmprojPath"):
+        assert parameter in GEMMA_LAUNCHER
+    assert "C:\\llama.cpp" not in GEMMA_LAUNCHER
+    assert "D:\\LMStudio\\Models" not in GEMMA_LAUNCHER
+
+
+def test_remote_model_api_key_wording_matches_browser_local_storage_contract():
+    normalized = " ".join(REALTIME_README.split())
+    assert "browser/device's `localStorage`" in normalized
+    assert "excluded from UI-server persistence payloads" in normalized
+    assert "browser-session state" not in normalized
 
 
 def test_camera_capability_depends_on_enabled_state_not_stream_readiness():
@@ -80,7 +169,7 @@ def test_native_v3_is_the_migrated_default_and_echo_ui_is_truthful():
     assert 'const EXPECTED_UI_API_VERSION = 20;' in MAIN_JS
     assert "Do not reuse a stock " in MAIN_JS
     assert "Let me check that" not in MAIN_JS
-    assert 'src="main.js?v=30-adaptive-safe-start"' in INDEX_HTML
+    assert 'src="main.js?v=31-live-voice-default"' in INDEX_HTML
     assert '"./ws/s2s-ws-client.js?v=18-adaptive-safe-start"' in MAIN_JS
     assert '"./ui/chat.js?v=3-tool-privacy"' in MAIN_JS
     assert "loadAec3Worklet(ctx)" in CLIENT_JS
@@ -250,6 +339,22 @@ def test_voice_inventory_is_live_backend_scoped_and_never_leaves_stale_ids_visib
     assert "clearVoiceProfileOptions(backend)" in fetcher
     assert 'placeholder.value = ""' in MAIN_JS
     assert "request !== voiceInventoryRequest || backend !== settings.ttsBackend" in fetcher
+    unreachable_guard = 'if (json?.reachable === false) throw new Error("Voice backend unavailable");'
+    assert unreachable_guard in fetcher
+    assert fetcher.index(unreachable_guard) < fetcher.index("applyVoiceProfilePayload(json, backend)")
+    failure_branch = fetcher.split("} catch (err) {", 1)[1]
+    assert 'settings.voice = "";' not in failure_branch
+    assert "saved selection retained" in failure_branch
+    renderer = MAIN_JS.split("function renderVoiceOptions()", 1)[1].split(
+        "function clearVoiceProfileOptions", 1
+    )[0]
+    assert 'settings.voice = "";' not in renderer
+    applier = MAIN_JS.split("function applyVoiceProfilePayload", 1)[1].split(
+        "async function selectVoiceProfile", 1
+    )[0]
+    empty_inventory = applier.split("} else {", 1)[1]
+    assert 'settings.voice = "";' in empty_inventory
+    assert "void saveSettings(settings);" in empty_inventory
 
 
 def test_realtime_audio_follows_live_grids_and_is_collapsed_by_default():

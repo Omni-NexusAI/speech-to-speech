@@ -37,6 +37,15 @@
   per-backend selection restore/fallback, contextual mutation permissions,
   identity-scoped validation, atomic non-secret persistence, and model-free
   launcher/handler construction.
+- Voice-library tests must prove both the pipeline handler and HFRT server use
+  the same portable `~/.speech-to-speech/qwen3-tts-voices` fallback while
+  preserving `VOICE_LIBRARY_DIR` as the explicit shared override.
+- Gemma launcher tests must reject workstation path defaults and require the
+  llama.cpp, main-model, draft-model, and mmproj locations to come from explicit
+  parameters or environment variables.
+- Default-voice tests must cover valid `selected_profile.json`, deterministic
+  first-live-Base fallback, explicit overrides, empty-library failure, stale UI
+  clearing, and deletion of whichever profile currently happens to be selected.
 - Candidate inventory tests must mirror the selected candidate's uncached live
   inventory without cross-filtering IDs against Faster or another provider.
   Buffered cancellation tests

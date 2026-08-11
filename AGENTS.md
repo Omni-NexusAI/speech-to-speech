@@ -31,14 +31,15 @@
 - The local fast-test path intentionally skips Parakeet/transcription with `--stt gemma-audio` and sends completed audio turns directly to the local Gemma audio model.
 - Speech output defaults to the existing Dockerized FasterQwen3TTS-compatible OpenAI API on `8881`; the optional Groxaxo candidate on `8882` is user-managed and must never be started, stopped, or switched by this repo.
 - The custom path defaults to local inference. Explicit private-LAN remote endpoints are allowed, but no automatic cloud or local fallback should be introduced.
-- For Gemma 4 12B tests, use the settings from `C:\llama.cpp\launch_gemma-4-12B-it-qat-MTP.ps1` with context reduced to 16k; this repo provides `scripts\launch_gemma_4_12b_16k.ps1` for that.
+- For Gemma 4 12B tests, use `scripts\launch_gemma_4_12b_16k.ps1` with a 16k context and pass the local llama.cpp installation, main model, draft model, and mmproj through explicit path parameters or environment variables; never publish workstation-specific path defaults.
 - The target TTS service is the stable Docker container name `qwen3-tts-faster` on `http://127.0.0.1:8881/v1`; container IDs are transient after authorized rebuilds and must not be used by lifecycle scripts.
 - Qwen3 clone output must use the `1.7B-Base` backend model by default; the `qwen3-tts-faster` API exposes native incremental PCM16 clone streaming while preserving buffered formats for non-streaming requests.
 - The isolated audio.cpp Qwen3-TTS candidate remains opt-in at `8890`/`8891`: its `qwen3tts-audiocpp` provider is selected only after explicit health, resident-model, private Base-profile, and speech validation. Use native incremental PCM only when the running engine advertises it and a direct chunk probe verifies it; otherwise label and retain the cancellable buffered-phrase fallback. It never changes Faster or Groxaxo lifecycle.
 - Faster clone requests carry an explicit assistant language when known; keep the reproducible local server patch under `integrations/` in sync with the rebuilt image.
 - The realtime UI exposes live `Base` clone profiles from the selected TTS
-  backend and retains one valid selection per backend. Faster keeps
-  `clone:16d9bb336799` (`J.A.R.V.I.S`) as its default.
+  backend and retains one valid selection per backend. An explicit voice wins;
+  otherwise use a valid `selected_profile.json`, then the first authoritative
+  live Base profile, or a truthful unavailable state when none exists.
 - Managed HFRT startup is model-independent: missing Gemma or TTS endpoints are
   warnings, and repository launchers never manage external model containers.
 - Do not test Gemma/llama.cpp while the local Gemma server is being rebuilt.

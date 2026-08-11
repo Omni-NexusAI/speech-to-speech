@@ -23,18 +23,34 @@ def _load_ui_server_module():
             pass
 
 
+def test_voice_library_uses_portable_default_and_env_override(tmp_path, monkeypatch):
+    monkeypatch.delenv("VOICE_LIBRARY_DIR", raising=False)
+    server = _load_ui_server_module()
+    expected = Path.home() / ".speech-to-speech" / "qwen3-tts-voices"
+
+    assert server.DEFAULT_VOICE_LIBRARY_DIR == expected
+    assert server.DEFAULT_VOICE_LIBRARY_DIR.relative_to(Path.home()) == Path(
+        ".speech-to-speech/qwen3-tts-voices"
+    )
+
+    override = tmp_path / "shared-voices"
+    monkeypatch.setenv("VOICE_LIBRARY_DIR", str(override))
+    overridden_server = _load_ui_server_module()
+    assert overridden_server.DEFAULT_VOICE_LIBRARY_DIR == override
+
+
 def test_load_base_clone_profiles_filters_to_base_profiles(tmp_path):
     server = _load_ui_server_module()
     profiles = tmp_path / "profiles"
-    base = profiles / "16d9bb336799"
+    base = profiles / "alpha-base-0001"
     custom = profiles / "not-base"
     base.mkdir(parents=True)
     custom.mkdir()
     (base / "meta.json").write_text(
         json.dumps(
             {
-                "profile_id": "16d9bb336799",
-                "name": "J.A.R.V.I.S",
+                "profile_id": "alpha-base-0001",
+                "name": "Alpha Voice",
                 "task_type": "Base",
                 "created_at": "2026-05-28T05:29:38Z",
                 "ref_text": "Systems are now fully operational.",
@@ -52,9 +68,9 @@ def test_load_base_clone_profiles_filters_to_base_profiles(tmp_path):
 
     assert voices == [
         {
-            "id": "16d9bb336799",
-            "voice": "clone:16d9bb336799",
-            "name": "J.A.R.V.I.S",
+            "id": "alpha-base-0001",
+            "voice": "clone:alpha-base-0001",
+            "name": "Alpha Voice",
             "task_type": "Base",
             "created_at": "2026-05-28T05:29:38Z",
             "ref_text": "Systems are now fully operational.",
@@ -65,14 +81,14 @@ def test_load_base_clone_profiles_filters_to_base_profiles(tmp_path):
 
 def test_audio_cpp_inventory_matches_candidate_live_backend_without_cross_filtering(tmp_path, monkeypatch):
     server = _load_ui_server_module()
-    _base_profile(tmp_path, "16d9bb336799")
+    _base_profile(tmp_path, "alpha-base-0001")
     _base_profile(tmp_path, "47a4e1ef5258")
     monkeypatch.setattr(server, "DEFAULT_VOICE_LIBRARY_DIR", tmp_path)
     payload = {
-        "defaultVoice": "clone:16d9bb336799",
+        "defaultVoice": "clone:alpha-base-0001",
         "selectedVoice": "clone:776a491528c9",
         "voices": [
-            {"id": "16d9bb336799", "voice": "clone:16d9bb336799", "name": "Faster copy", "task_type": "Base"},
+            {"id": "alpha-base-0001", "voice": "clone:alpha-base-0001", "name": "Faster copy", "task_type": "Base"},
             {"id": "22fb07ef3a80", "voice": "clone:22fb07ef3a80", "name": "Candidate A", "task_type": "Base"},
             {"id": "47a4e1ef5258", "voice": "clone:47a4e1ef5258", "name": "Faster copy 2", "task_type": "Base"},
             {"id": "776a491528c9", "voice": "clone:776a491528c9", "name": "Candidate B", "task_type": "Base"},
@@ -82,12 +98,12 @@ def test_audio_cpp_inventory_matches_candidate_live_backend_without_cross_filter
     scoped = server._scope_audio_cpp_profile_response(payload)
 
     assert [profile["voice"] for profile in scoped["voices"]] == [
-        "clone:16d9bb336799",
+        "clone:alpha-base-0001",
         "clone:22fb07ef3a80",
         "clone:47a4e1ef5258",
         "clone:776a491528c9",
     ]
-    assert scoped["defaultVoice"] == "clone:16d9bb336799"
+    assert scoped["defaultVoice"] == "clone:alpha-base-0001"
     assert scoped["selectedVoice"] == "clone:776a491528c9"
 
 
@@ -106,14 +122,14 @@ def test_live_backend_voice_inventory_disables_http_caching(monkeypatch):
     assert response.headers["pragma"] == "no-cache"
 
 
-def _base_profile(library: Path, profile_id: str = "16d9bb336799") -> None:
+def _base_profile(library: Path, profile_id: str = "alpha-base-0001", name: str = "Alpha Voice") -> None:
     profile_dir = library / "profiles" / profile_id
     profile_dir.mkdir(parents=True)
     (profile_dir / "ref_audio.wav").write_bytes(b"RIFF\x00\x00\x00\x00WAVE")
     (profile_dir / "meta.json").write_text(
         json.dumps({
             "profile_id": profile_id,
-            "name": "J.A.R.V.I.S",
+            "name": name,
             "task_type": "Base",
             "language": "Auto",
             "ref_text": "Original reference.",
@@ -123,13 +139,47 @@ def _base_profile(library: Path, profile_id: str = "16d9bb336799") -> None:
     )
 
 
+def test_profile_response_prefers_valid_selection_then_first_live_base_or_none(tmp_path):
+    server = _load_ui_server_module()
+    _base_profile(tmp_path, "beta-base-0002", "Beta Voice")
+    _base_profile(tmp_path, "alpha-base-0001", "Alpha Voice")
+    selected_path = tmp_path / "selected_profile.json"
+
+    selected_path.write_text(json.dumps({"profile_id": "beta-base-0002"}), encoding="utf-8")
+    selected = server._profile_response(tmp_path)
+    assert selected["defaultVoice"] == "clone:alpha-base-0001"
+    assert selected["selectedVoice"] == "clone:beta-base-0002"
+
+    selected_path.write_text(json.dumps({"profile_id": "stale-base-0099"}), encoding="utf-8")
+    fallback = server._profile_response(tmp_path)
+    assert fallback["defaultVoice"] == "clone:alpha-base-0001"
+    assert fallback["selectedVoice"] == "clone:alpha-base-0001"
+
+    empty = server._profile_response(tmp_path / "empty")
+    assert empty["defaultVoice"] is None
+    assert empty["selectedVoice"] is None
+    assert empty["voices"] == []
+
+
+def test_selected_profile_can_be_deleted_without_a_privileged_identity(tmp_path, monkeypatch):
+    server = _load_ui_server_module()
+    _base_profile(tmp_path)
+    monkeypatch.setattr(server, "DEFAULT_VOICE_LIBRARY_DIR", tmp_path)
+    server.select_qwen3_profile(server.ProfileSelectRequest(profile_id="alpha-base-0001"))
+
+    deleted = server.delete_qwen3_profile("alpha-base-0001")
+
+    assert deleted["voices"] == []
+    assert deleted["selectedVoice"] is None
+
+
 def test_clone_profile_management_persists_to_configured_library(tmp_path, monkeypatch):
     server = _load_ui_server_module()
     _base_profile(tmp_path)
     monkeypatch.setattr(server, "DEFAULT_VOICE_LIBRARY_DIR", tmp_path)
 
     created = server.create_qwen3_profile(
-        server.ProfileCreateRequest(name="Copied", ref_text="Copied reference.", source_profile_id="16d9bb336799")
+        server.ProfileCreateRequest(name="Copied", ref_text="Copied reference.", source_profile_id="alpha-base-0001")
     )
     copied = next(profile for profile in created["voices"] if profile["name"] == "Copied")
     assert (tmp_path / "profiles" / copied["id"] / "ref_audio.wav").is_file()

@@ -1,11 +1,19 @@
 # Convert the static Space into a Docker app with a search proxy
 
+## Status
+
+Accepted for the hosted Space packaging decision. This ADR records why the
+static Space became a Docker app with same-origin secret handling. The browser
+and Realtime pipeline evolved afterward; `../../README.md` and
+`../../CONTEXT.md` define the current local direct-audio, configuration-
+acknowledgement, provider, and playback behavior.
+
 To give the model a web search tool, the executor (which runs in the browser of a
 public Space) needs a search key. A `sdk: static` Space serves files as-is with no
 runtime process, so it cannot hold a secret the browser uses without exposing it.
 We convert the Space from `sdk: static` to `sdk: docker`: a single container runs a
-small server (FastAPI + uvicorn) that both serves the existing front-end *unchanged*
-and exposes a same-origin `/search` proxy holding `SERPER_API_KEY` server-side. The
+small server (FastAPI + uvicorn) that serves the front-end
+and exposes a same-origin `/api/search` proxy holding `SERPER_API_KEY` server-side. The
 whole app lives in that one container; the s2s speech-to-speech backend stays the
 separate load-balanced service it already is.
 
@@ -23,7 +31,9 @@ separate load-balanced service it already is.
 
 - Deployment is no longer static: there is a Dockerfile and a server process; the
   README front-matter changes from `sdk: static` to `sdk: docker`.
-- The client calls `/search` same-origin; the server reads the key from env. A user
+- The client calls `/api/search` same-origin; the server reads the key from env. A user
   may still supply their own key as a fallback, sent per-request to the proxy.
-- The front-end, audio pipeline, and s2s handshake are untouched — only the hosting
-  shape and the new route are added.
+- At the time of this decision, the hosting conversion itself required no audio
+  or Realtime-protocol change. That historical scope is not a claim that the
+  current front-end or handshake remains identical to the original static
+  Space.

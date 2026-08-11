@@ -54,7 +54,7 @@ def test_release_defaults_match_responses_api_parakeet_qwen3_realtime_profile():
     assert qwen3_args.qwen3_tts_ref_audio is None
     assert qwen3_args.qwen3_tts_mlx_quantization == "6bit"
     assert qwen3_args.qwen3_tts_api_base_url == "http://127.0.0.1:8881/v1"
-    assert qwen3_args.qwen3_tts_api_voice == "clone:16d9bb336799"
+    assert qwen3_args.qwen3_tts_api_voice is None
     assert qwen3_args.qwen3_tts_api_backend_model == "1.7B-Base"
 
 
