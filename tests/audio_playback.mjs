@@ -24,6 +24,7 @@ assert.ok(Processor, "audio-playback worklet registered");
 
 function createProcessor(generation = 0) {
   const processor = new Processor();
+  processor.testInputSamples = new Map();
   processor.port.onmessage({
     data: { kind: "config", inputRate: 1000, generation },
   });
@@ -37,14 +38,37 @@ function message(processor, data) {
 function audio(processor, values, {
   generation = 0,
   primeMs = 0,
+  ceilingMs = primeMs,
   streamId = "",
+  inputSampleOffset = undefined,
+  inputSampleCount = undefined,
 } = {}) {
+  const expectedOffset = processor.testInputSamples.get(streamId) || 0;
+  const offset = inputSampleOffset ?? expectedOffset;
+  const count = inputSampleCount ?? values.length;
   message(processor, {
     kind: "audio",
     samples: Float32Array.from(values),
     generation,
     primeMs,
+    ceilingMs,
+    targetSamples: Math.ceil(primeMs),
+    ceilingSamples: Math.ceil(ceilingMs),
+    inputSampleOffset: offset,
+    inputSampleCount: count,
     streamId,
+  });
+  if (generation === processor._generation && offset === expectedOffset && count === values.length) {
+    processor.testInputSamples.set(streamId, expectedOffset + count);
+  }
+}
+
+function end(processor, { generation = 0, streamId = "", inputSamples = undefined } = {}) {
+  message(processor, {
+    kind: "end",
+    generation,
+    streamId,
+    inputSamples: inputSamples ?? (processor.testInputSamples.get(streamId) || 0),
   });
 }
 
@@ -81,7 +105,7 @@ function kinds(processor, kind) {
   const phraseB = [0.4, 0.5, 0.6];
   audio(processor, phraseA, { streamId: "response-preamble" });
   audio(processor, phraseB, { streamId: "response-preamble" });
-  message(processor, { kind: "end", generation: 0, streamId: "response-preamble" });
+  end(processor, { streamId: "response-preamble" });
   assert.deepEqual(
     [...render(processor, 2)],
     [...Float32Array.from(phraseA.slice(0, 2))],
@@ -89,7 +113,7 @@ function kinds(processor, kind) {
   // The tool-result response starts while the preamble's PCM is still queued.
   // It must append to that queue instead of being rejected by the prior end.
   audio(processor, [0.7, 0.8], { streamId: "response-tool-result" });
-  message(processor, { kind: "end", generation: 0, streamId: "response-tool-result" });
+  end(processor, { streamId: "response-tool-result" });
   assert.deepEqual(
     [...render(processor, 6)],
     [...Float32Array.from([...phraseA.slice(2), ...phraseB, 0.7, 0.8])],
@@ -98,13 +122,18 @@ function kinds(processor, kind) {
   assert.equal(kinds(processor, "drained").length, 1);
   assert.equal(kinds(processor, "underrun").length, 0);
   assert.deepEqual(
+    kinds(processor, "stream_drained").map((entry) => entry.streamId),
+    ["response-preamble"],
+    "the prior response is retired at its exact FIFO boundary",
+  );
+  assert.deepEqual(
     kinds(processor, "started").map((entry) => entry.streamId),
     ["response-preamble", "response-tool-result"],
     "continuous tool continuation reports each response only when its first sample renders",
   );
 
   audio(processor, [0.9], { generation: 0, primeMs: 0, streamId: "response-later" });
-  message(processor, { kind: "end", generation: 0, streamId: "response-later" });
+  end(processor, { streamId: "response-later" });
   assert.deepEqual([...render(processor, 1)], [...Float32Array.from([0.9])]);
 }
 
@@ -117,11 +146,7 @@ function kinds(processor, kind) {
     primeMs: 4,
     streamId: "response-low-latency",
   });
-  message(processor, {
-    kind: "end",
-    generation: 0,
-    streamId: "response-low-latency",
-  });
+  end(processor, { streamId: "response-low-latency" });
   render(processor, 2);
   audio(processor, [0.5, 0.6], {
     primeMs: 8,
@@ -183,8 +208,8 @@ function kinds(processor, kind) {
   const processor = createProcessor();
   audio(processor, [0.25, 0.5, 0.75], { primeMs: 800 });
   assert.deepEqual([...render(processor, 2)], [0, 0]);
-  message(processor, { kind: "end", generation: 0 });
-  message(processor, { kind: "end", generation: 0 });
+  end(processor);
+  end(processor);
   assert.deepEqual([...render(processor, 3)], [...Float32Array.from([0.25, 0.5, 0.75])]);
   render(processor, 1);
   assert.equal(kinds(processor, "drained").length, 1);
@@ -211,7 +236,7 @@ function kinds(processor, kind) {
   audio(processor, [0.9], { generation: 0, primeMs: 0 });
   assert.equal(kinds(processor, "stale_chunk_rejected").length, 1);
   audio(processor, [0.6], { generation: 1, primeMs: 0 });
-  message(processor, { kind: "end", generation: 1 });
+  end(processor, { generation: 1 });
   assert.deepEqual([...render(processor, 1)], [...Float32Array.from([0.6])]);
 }
 
@@ -223,6 +248,61 @@ function kinds(processor, kind) {
   assert.deepEqual([...render(replacement, 4)], [0, 0, 0, 0]);
   audio(replacement, [0.2], { primeMs: 0 });
   assert.deepEqual([...render(replacement, 1)], [...Float32Array.from([0.2])]);
+}
+
+// A learned warm target may start below the cold first+steady ceiling, while a
+// genuine underrun re-primes to that full ceiling. Coalescing both codec blocks
+// into one transport chunk is valid evidence and never trims its head.
+{
+  const processor = createProcessor();
+  const coalesced = Array.from({ length: 8 }, (_, index) => (index + 1) / 10);
+  audio(processor, coalesced, { primeMs: 3, ceilingMs: 8, streamId: "response-warm" });
+  assert.deepEqual(
+    [...render(processor, 9)],
+    [...Float32Array.from(coalesced), 0],
+    "warm startup renders every coalesced input sample before underrunning",
+  );
+  assert.equal(kinds(processor, "started").length, 1);
+  assert.equal(kinds(processor, "underrun").at(-1).primeTargetMs, 8);
+  audio(processor, [0.2, 0.3, 0.4, 0.5], {
+    primeMs: 3,
+    ceilingMs: 8,
+    streamId: "response-warm",
+  });
+  assert.deepEqual([...render(processor, 2)], [0, 0]);
+  audio(processor, [0.6, 0.7, 0.8, 0.9], {
+    primeMs: 3,
+    ceilingMs: 8,
+    streamId: "response-warm",
+  });
+  assert.equal(kinds(processor, "reprimed").at(-1).primeTargetMs, 8);
+}
+
+// Exact sample offsets/counts reject duplication or gaps before either can
+// enter the audible FIFO.
+{
+  const processor = createProcessor();
+  audio(processor, [0.1, 0.2], { streamId: "response-accounted" });
+  audio(processor, [0.9], {
+    streamId: "response-accounted",
+    inputSampleOffset: 1,
+  });
+  assert.equal(kinds(processor, "stale_chunk_rejected").at(-1).reason, "input_sample_mismatch");
+  end(processor, { streamId: "response-accounted" });
+  assert.deepEqual([...render(processor, 2)], [...Float32Array.from([0.1, 0.2])]);
+}
+
+// An ended response remains a tombstone across later same-generation streams;
+// an old tail cannot become the active stream again.
+{
+  const processor = createProcessor();
+  audio(processor, [0.1], { streamId: "response-ended" });
+  end(processor, { streamId: "response-ended" });
+  audio(processor, [0.2], { streamId: "response-next" });
+  audio(processor, [0.9], { streamId: "response-ended" });
+  assert.equal(kinds(processor, "stale_chunk_rejected").at(-1).reason, "audio_after_stream_end");
+  end(processor, { streamId: "response-next" });
+  assert.deepEqual([...render(processor, 2)], [...Float32Array.from([0.1, 0.2])]);
 }
 
 console.log("continuous generation-safe audio playback tests passed");

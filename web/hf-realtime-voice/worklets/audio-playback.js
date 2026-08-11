@@ -11,9 +11,11 @@
  *
  *   main -> worklet:
  *     { kind: "config", inputRate, generation }          startup
- *     { kind: "audio", samples, generation, primeMs,
- *       streamId }                                      every PCM chunk
- *     { kind: "end", generation, streamId }             idempotent stream flush
+ *     { kind: "audio", samples, generation, primeMs, ceilingMs,
+ *       targetSamples, ceilingSamples, inputSampleOffset,
+ *       inputSampleCount, streamId }                     every PCM chunk
+ *     { kind: "end", generation, streamId,
+ *       inputSamples }                                   idempotent stream flush
  *     { kind: "clear", generation, reason }             cancellation boundary
  *
  *   worklet -> main:
@@ -32,6 +34,7 @@
 
 const STATS_INTERVAL_FRAMES = 12000;
 const MAX_PRIME_MS = 2000;
+const MAX_ENDED_STREAM_IDS = 512;
 
 function _generation(value, fallback) {
   const number = Number(value);
@@ -43,6 +46,15 @@ function _primeMs(value) {
   return Number.isFinite(number) ? Math.max(0, Math.min(MAX_PRIME_MS, number)) : 0;
 }
 
+function _sampleCount(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
+}
+
+function _samplesForMs(milliseconds, rate) {
+  return Math.max(0, Math.ceil((_primeMs(milliseconds) * rate) / 1000));
+}
+
 class AudioPlaybackProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
@@ -51,7 +63,8 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
     // match the actual WebSocket transport if that message is delayed.
     this._inputRate = 16000;
     this._stepRatio = this._inputRate / sampleRate;
-    /** @type {{ samples: Float32Array, primeMs: number, streamId: string }[]} */
+    /** @type {{ samples: Float32Array, primeMs: number, ceilingMs: number,
+     * targetSamples: number, ceilingSamples: number, streamId: string }[]} */
     this._queue = [];
     this._readIdx = 0;
     this._fracPos = 0;
@@ -60,9 +73,13 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
     this._generation = 0;
     this._lastClearedGeneration = -1;
     this._primeTargetMs = 0;
+    this._primeCeilingMs = 0;
+    this._primeTargetSamples = 0;
+    this._primeCeilingSamples = 0;
     this._ended = false;
     this._activeStreamId = "";
     this._endedStreamId = "";
+    this._endedStreamIds = new Set();
     this._drainReported = true;
     this._waitingAfterUnderrun = false;
     this._startPending = false;
@@ -74,6 +91,9 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
     this._reprimes = 0;
     this._staleChunks = 0;
     this._clears = 0;
+    this._totalInputSamples = 0;
+    /** @type {Map<string, number>} */
+    this._streamInputSamples = new Map();
 
     this.port.onmessage = (event) => {
       const data = event.data;
@@ -114,7 +134,13 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
       kind,
       generation: this._generation,
       queuedMs: this._queuedMs(),
+      queuedSamples: this._queuedSamples(),
       primeTargetMs: this._primeTargetMs,
+      primeCeilingMs: this._primeCeilingMs,
+      targetSamples: this._primeTargetSamples,
+      ceilingSamples: this._primeCeilingSamples,
+      inputSamples: this._streamInputSamples.get(this._activeStreamId) || 0,
+      totalInputSamples: this._totalInputSamples,
       state: this._state,
       underruns: this._underruns,
       reprimes: this._reprimes,
@@ -142,7 +168,23 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
     if (!(data.samples instanceof Float32Array) || data.samples.length === 0) return;
     const streamId = String(data.streamId || "");
     const chunkPrimeMs = _primeMs(data.primeMs);
-    if (streamId && streamId === this._endedStreamId) {
+    const chunkCeilingMs = Math.max(chunkPrimeMs, _primeMs(data.ceilingMs));
+    const chunkTargetSamples = _sampleCount(
+      data.targetSamples,
+      _samplesForMs(chunkPrimeMs, this._inputRate),
+    );
+    const chunkCeilingSamples = Math.max(
+      chunkTargetSamples,
+      _sampleCount(data.ceilingSamples, _samplesForMs(chunkCeilingMs, this._inputRate)),
+    );
+    const inputSampleCount = _sampleCount(data.inputSampleCount, data.samples.length);
+    const expectedOffset = this._streamInputSamples.get(streamId) || 0;
+    const inputSampleOffset = _sampleCount(data.inputSampleOffset, expectedOffset);
+    if (inputSampleCount !== data.samples.length || inputSampleOffset !== expectedOffset) {
+      this._reject("audio", receivedGeneration, "input_sample_mismatch");
+      return;
+    }
+    if (streamId && this._endedStreamIds.has(streamId)) {
       this._reject("audio", receivedGeneration, "audio_after_stream_end");
       return;
     }
@@ -152,6 +194,9 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
     // drained, reopen the same FIFO and append it without clearing or re-priming.
     if (this._state === "idle") {
       this._primeTargetMs = chunkPrimeMs;
+      this._primeCeilingMs = chunkCeilingMs;
+      this._primeTargetSamples = chunkTargetSamples;
+      this._primeCeilingSamples = chunkCeilingSamples;
       this._ended = false;
       this._drainReported = false;
       this._waitingAfterUnderrun = false;
@@ -162,13 +207,25 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
       this._ended = false;
       if (this._state === "priming" && this._queuedSamples() === 0) {
         this._primeTargetMs = chunkPrimeMs;
+        this._primeCeilingMs = chunkCeilingMs;
+        this._primeTargetSamples = chunkTargetSamples;
+        this._primeCeilingSamples = chunkCeilingSamples;
       }
     } else if (this._ended) {
       this._reject("audio", receivedGeneration, "audio_after_stream_end");
       return;
     }
 
-    this._queue.push({ samples: data.samples, primeMs: chunkPrimeMs, streamId });
+    this._queue.push({
+      samples: data.samples,
+      primeMs: chunkPrimeMs,
+      ceilingMs: chunkCeilingMs,
+      targetSamples: chunkTargetSamples,
+      ceilingSamples: chunkCeilingSamples,
+      streamId,
+    });
+    this._streamInputSamples.set(streamId, expectedOffset + inputSampleCount);
+    this._totalInputSamples += inputSampleCount;
     this._maybeStart(false);
   }
 
@@ -179,14 +236,31 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
       return;
     }
     const streamId = String(data.streamId || "");
-    if (streamId && streamId === this._endedStreamId) return;
+    if (streamId && this._endedStreamIds.has(streamId)) return;
     if (streamId && this._activeStreamId && streamId !== this._activeStreamId) {
       this._reject("end", receivedGeneration, "inactive_stream");
       return;
     }
     if (this._ended) return;
+    const reportedInputSamples = _sampleCount(
+      data.inputSamples,
+      this._streamInputSamples.get(streamId) || 0,
+    );
+    if (reportedInputSamples !== (this._streamInputSamples.get(streamId) || 0)) {
+      this._reject("end", receivedGeneration, "input_sample_mismatch");
+      return;
+    }
     this._ended = true;
     this._endedStreamId = streamId;
+    if (streamId) {
+      this._endedStreamIds.delete(streamId);
+      this._endedStreamIds.add(streamId);
+      while (this._endedStreamIds.size > MAX_ENDED_STREAM_IDS) {
+        const oldest = this._endedStreamIds.values().next().value;
+        if (!oldest) break;
+        this._endedStreamIds.delete(oldest);
+      }
+    }
     if (this._queuedSamples() === 0) {
       this._markDrained();
       return;
@@ -219,11 +293,18 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
     this._ended = false;
     this._activeStreamId = "";
     this._endedStreamId = "";
+    this._endedStreamIds.clear();
     this._drainReported = true;
     this._waitingAfterUnderrun = false;
     this._startPending = false;
     this._startWasReprime = false;
     this._startingStreamId = "";
+    this._primeTargetMs = 0;
+    this._primeCeilingMs = 0;
+    this._primeTargetSamples = 0;
+    this._primeCeilingSamples = 0;
+    this._totalInputSamples = 0;
+    this._streamInputSamples.clear();
     this._clears += 1;
     this._diagnostic("cleared", { reason });
     if (hadUndrainedPlayback) {
@@ -240,8 +321,7 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
 
   _maybeStart(force) {
     if (this._state !== "priming" || this._queuedSamples() === 0) return;
-    const queuedMs = this._queuedMs();
-    if (!force && this._primeTargetMs > 0 && queuedMs + 1e-6 < this._primeTargetMs) return;
+    if (!force && this._queuedSamples() < this._primeTargetSamples) return;
 
     const reprime = this._waitingAfterUnderrun;
     if (reprime) this._reprimes += 1;
@@ -250,7 +330,10 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
     this._startPending = true;
     this._startWasReprime = reprime;
     this._startingStreamId = this._queue[0]?.streamId || this._activeStreamId;
-    this._diagnostic(reprime ? "reprimed" : "primed", { forced: !!force });
+    this._diagnostic(reprime ? "reprimed" : "primed", {
+      forced: !!force,
+      streamId: this._startingStreamId,
+    });
   }
 
   /** Linear-interpolated read at the current fractional position. */
@@ -283,11 +366,21 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
       this._readIdx -= this._queue[0].samples.length;
       this._queue.shift();
       if (this._queue.length > 0 && this._queue[0].streamId !== completedStream) {
+        const completedInputSamples = this._streamInputSamples.get(completedStream) || 0;
+        this._diagnostic("stream_drained", {
+          streamId: completedStream,
+          inputSamples: completedInputSamples,
+          continued: true,
+        });
+        this._streamInputSamples.delete(completedStream);
         // The new response already carries the config snapshot that was
         // acknowledged when it was created. It becomes the re-prime policy only
         // after playback crosses its FIFO boundary; older queued PCM remains on
         // the target it started with.
         this._primeTargetMs = this._queue[0].primeMs;
+        this._primeCeilingMs = this._queue[0].ceilingMs;
+        this._primeTargetSamples = this._queue[0].targetSamples;
+        this._primeCeilingSamples = this._queue[0].ceilingSamples;
         // The FIFO remains continuous across tool/result responses, but report
         // the exact point at which the next response's first sample is rendered.
         // This is bookkeeping only: it does not pause or re-prime playback.
@@ -306,10 +399,12 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
     if (this._state !== "playing") return;
     this._state = "priming";
     this._waitingAfterUnderrun = true;
+    this._primeTargetMs = this._primeCeilingMs;
+    this._primeTargetSamples = this._primeCeilingSamples;
     this._startPending = false;
     this._startingStreamId = "";
     this._underruns += 1;
-    this._diagnostic("underrun");
+    this._diagnostic("underrun", { streamId: this._activeStreamId });
   }
 
   _markDrained() {
@@ -323,6 +418,7 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
     if (this._drainReported) return;
     this._drainReported = true;
     this._diagnostic("drained", { streamId });
+    this._streamInputSamples.delete(streamId);
   }
 
   process(_, outputs) {

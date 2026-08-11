@@ -19,7 +19,7 @@
 import {
   S2sWsRealtimeClient,
   prepareToolArgumentsForBrowser,
-} from "./ws/s2s-ws-client.js?v=17-tool-privacy";
+} from "./ws/s2s-ws-client.js?v=18-adaptive-safe-start";
 import { $, truncateError, DEBUG } from "./ui/dom.js";
 import { ChatView } from "./ui/chat.js?v=3-tool-privacy";
 import { Account } from "./ui/account.js";
@@ -512,22 +512,50 @@ function activeTtsTuning(backend = settings.ttsBackend) {
 function activePlaybackConfig(backend = settings.ttsBackend) {
   const provider = normalizeTtsProvider(backend);
   if (provider !== AUDIO_CPP_PROVIDER) {
-    return { provider, nativeStreaming: false, profileId: "", resolvedPrimeMs: 0 };
+    return {
+      provider,
+      nativeStreaming: false,
+      profileId: "",
+      profileRevision: "",
+      model: "",
+      clone: settings.voice || "",
+      firstBlockFrames: 0,
+      steadyBlockFrames: 0,
+      resolvedPrimeMs: 0,
+      outputRate: 16000,
+    };
   }
   const state = realtimeTuningState(provider);
   const effective = effectiveCandidateTuning();
   const firstBlockFrames = Number(effective.first_block_frames);
+  const steadyBlockFrames = Number(effective.steady_block_frames);
   const resolvedPrimeMs = Number.isFinite(firstBlockFrames)
     ? firstBlockFrames * 80
     : 0;
   const backendStatus = ttsBackendStatuses?.[provider];
+  const profileDocument = candidateTuningProfileDocument?.profiles?.[state.profile_id] || {};
   return {
     provider,
     profileId: state.profile_id,
+    profileRevision: candidateTuningResolved?.profile?.revision
+      ?? candidateTuningResolved?.revision
+      ?? profileDocument.revision
+      ?? "",
+    model: effective.model || backendStatus?.currentModel || backendStatus?.requiredModel || "",
+    clone: settings.voice || "",
     // Both engine capability and the direct chunk/header probe must agree.
     nativeStreaming: backendStatus?.nativeStreaming === true
       && candidateTuningResolved?.capabilities?.native_incremental_pcm === true,
+    firstBlockFrames: Number.isSafeInteger(firstBlockFrames) && firstBlockFrames > 0
+      ? firstBlockFrames
+      : 0,
+    steadyBlockFrames: Number.isSafeInteger(steadyBlockFrames) && steadyBlockFrames > 0
+      ? steadyBlockFrames
+      : 0,
     resolvedPrimeMs,
+    // The Realtime WebSocket contract carries 16 kHz PCM to the browser even
+    // though audio.cpp's native transport is 24 kHz before server resampling.
+    outputRate: 16000,
   };
 }
 

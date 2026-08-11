@@ -89,8 +89,14 @@
  * @typedef {Object} PlaybackConfig
  * @property {string} [provider]
  * @property {string} [profileId]
+ * @property {string | number} [profileRevision]
+ * @property {string} [model]
+ * @property {string} [clone]
  * @property {boolean} [nativeStreaming]
  * @property {number} [resolvedPrimeMs]
+ * @property {number} [firstBlockFrames]
+ * @property {number} [steadyBlockFrames]
+ * @property {number} [outputRate]
  *
  * @typedef {Object} ToolDef
  * @property {"function"} type
@@ -136,6 +142,14 @@ const MIC_CHUNK_MS = 40;
 export const PIPELINE_CONFIG_ACK_TIMEOUT_MS = 15_000;
 export const MAX_PLAYBACK_PRIME_MS = 2_000;
 const MAX_PLAYBACK_RESPONSE_TOMBSTONES = 512;
+export const PLAYBACK_LEARNING_VERSION = 1;
+export const PLAYBACK_LEARNING_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
+export const MAX_PLAYBACK_LEARNING_SIGNATURES = 16;
+export const PLAYBACK_GAP_WINDOW = 8;
+const PLAYBACK_LEARNING_STORAGE_KEY = "s2s.playback.safe-start.v1";
+const AUDIO_CPP_CODEC_FRAME_MS = 80;
+const PLAYBACK_WARM_FIRST_MARGIN_MS = 160;
+const PLAYBACK_WARM_GAP_MARGIN_MS = 64;
 export const AUDIO_CPP_PLAYBACK_PRIME_MS = Object.freeze({
   "low-latency": 800,
   balanced: 1280,
@@ -333,6 +347,327 @@ export function resolvePlaybackPrimeMs(config = {}, hint = {}) {
     : Number.isFinite(overrideFrames) ? overrideFrames * 80 : 0;
   return Math.max(0, Math.min(MAX_PLAYBACK_PRIME_MS, resolved));
 }
+
+function _positiveInteger(value) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number > 0 ? number : 0;
+}
+
+function _identityString(value) {
+  return typeof value === "string" ? value.trim() : String(value ?? "").trim();
+}
+
+function _runtimePlaybackIdentity(runtime) {
+  if (!_isPlainObject(runtime)) return "";
+  const apiVersion = _identityString(runtime.api_version);
+  const startedAt = _identityString(runtime.started_at_utc);
+  const pid = _positiveInteger(runtime.pid);
+  if (!apiVersion || !startedAt || !pid) return "";
+  const build = _identityString(
+    runtime.git_commit || runtime.commit || runtime.build_id || runtime.build || runtime.image,
+  );
+  return JSON.stringify([apiVersion, startedAt, pid, build]);
+}
+
+/**
+ * Build the exact immutable identity used for adaptive safe-start learning.
+ * Fields absent from the server acknowledgement remain conservative: the
+ * acknowledgement is the commit barrier, while model/clone/runtime/rate come
+ * from the already validated browser snapshot.
+ *
+ * @param {Record<string, any>} config
+ * @param {PlaybackConfig} hint
+ * @param {string} runtimeIdentity
+ * @param {boolean} ackMatched
+ */
+export function resolveAdaptivePlaybackSignature(
+  config = {},
+  hint = {},
+  runtimeIdentity = "",
+  ackMatched = true,
+) {
+  const provider = _normalisePlaybackProvider(config.tts_backend || hint.provider);
+  const nativeStreaming = hint.nativeStreaming === true;
+  const profileId = _normaliseProfileId(config.tts_tuning?.profile_id || hint.profileId);
+  const hintedProfileId = _normaliseProfileId(hint.profileId);
+  const profileMatches = !profileId || !hintedProfileId || profileId === hintedProfileId;
+  const firstBlockFrames = _positiveInteger(
+    hint.firstBlockFrames ?? config.tts_tuning?.overrides?.first_block_frames,
+  );
+  const steadyBlockFrames = _positiveInteger(
+    hint.steadyBlockFrames ?? config.tts_tuning?.overrides?.steady_block_frames,
+  );
+  const acknowledgedFirst = _positiveInteger(config.tts_tuning?.overrides?.first_block_frames);
+  const acknowledgedSteady = _positiveInteger(config.tts_tuning?.overrides?.steady_block_frames);
+  const overrideMatches = (
+    (!acknowledgedFirst || acknowledgedFirst === firstBlockFrames)
+    && (!acknowledgedSteady || acknowledgedSteady === steadyBlockFrames)
+  );
+  const outputRate = _positiveInteger(hint.outputRate || OUTPUT_SAMPLE_RATE);
+  const model = _identityString(hint.model);
+  const clone = _identityString(hint.clone);
+  const profileRevision = _identityString(hint.profileRevision);
+  const firstMs = firstBlockFrames * AUDIO_CPP_CODEC_FRAME_MS;
+  const eligible = provider === "qwen3tts-audiocpp" && nativeStreaming;
+  const hasCompleteFramePair = firstBlockFrames > 0 && steadyBlockFrames > 0;
+  const framedCeilingMs = hasCompleteFramePair
+    ? (firstBlockFrames + steadyBlockFrames) * AUDIO_CPP_CODEC_FRAME_MS
+    : 0;
+  const valid = eligible
+    && ackMatched
+    && profileMatches
+    && overrideMatches
+    && !!model
+    && !!clone
+    && !!profileId
+    && !!profileRevision
+    && !!runtimeIdentity
+    && hasCompleteFramePair
+    && outputRate > 0;
+  const namedConservativeCeiling = AUDIO_CPP_PLAYBACK_PRIME_MS[profileId];
+  const conservativeCeilingMs = Number.isFinite(namedConservativeCeiling)
+    ? namedConservativeCeiling
+    : MAX_PLAYBACK_PRIME_MS;
+  const ceilingMs = eligible
+    ? Math.max(0, Math.min(
+      MAX_PLAYBACK_PRIME_MS,
+      valid ? framedCeilingMs : conservativeCeilingMs,
+    ))
+    : 0;
+  const fields = Object.freeze({
+    provider,
+    model,
+    clone,
+    profileId,
+    profileRevision,
+    firstBlockFrames,
+    steadyBlockFrames,
+    nativeStreaming,
+    outputRate,
+    runtimeIdentity,
+  });
+  return Object.freeze({
+    valid,
+    eligible,
+    key: valid ? JSON.stringify(Object.values(fields)) : "",
+    fields,
+    firstMs: Math.min(ceilingMs, firstMs),
+    steadyMs: steadyBlockFrames * AUDIO_CPP_CODEC_FRAME_MS,
+    ceilingMs,
+  });
+}
+
+function _nearestRankP95(values) {
+  if (!values.length) return 0;
+  const ordered = [...values].sort((left, right) => left - right);
+  return ordered[Math.max(0, Math.ceil(ordered.length * 0.95) - 1)];
+}
+
+function _safeLocalStorage() {
+  try {
+    return globalThis.localStorage || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Versioned, bounded, content-free adaptive safe-start learning. */
+export class AdaptivePlaybackPolicyStore {
+  /** @param {{ storage?: Storage | null, now?: () => number }} [options] */
+  constructor(options = {}) {
+    this._storage = options.storage === undefined ? _safeLocalStorage() : options.storage;
+    this._now = typeof options.now === "function" ? options.now : () => Date.now();
+    /** @type {Map<string, Record<string, any>>} */
+    this._records = new Map();
+    this._load();
+  }
+
+  _load() {
+    let payload;
+    try {
+      payload = JSON.parse(this._storage?.getItem(PLAYBACK_LEARNING_STORAGE_KEY) || "null");
+    } catch {
+      return;
+    }
+    if (!_isPlainObject(payload)
+        || payload.version !== PLAYBACK_LEARNING_VERSION
+        || !Array.isArray(payload.entries)) return;
+    const now = this._now();
+    for (const entry of payload.entries.slice(0, MAX_PLAYBACK_LEARNING_SIGNATURES)) {
+      if (!_isPlainObject(entry)
+          || typeof entry.key !== "string"
+          || !entry.key
+          || entry.key.length > 4096
+          || !Number.isFinite(entry.expiresAt)
+          || entry.expiresAt <= now) continue;
+      const gaps = Array.isArray(entry.gaps)
+        ? entry.gaps
+          .filter((gap) => Number.isFinite(gap) && gap > 0)
+          .slice(-PLAYBACK_GAP_WINDOW)
+        : [];
+      const fullPrimeCleanCount = Math.max(
+        0,
+        Math.min(2, Number(entry.fullPrimeCleanCount) || 0),
+      );
+      const disabled = entry.disabled === true;
+      this._records.set(entry.key, {
+        key: entry.key,
+        gaps,
+        fullPrimeCleanCount,
+        // Treat storage as untrusted input. Warm eligibility is derived from
+        // the two clean-response evidence counter, never from a persisted flag.
+        warmEligible: !disabled && fullPrimeCleanCount >= 2,
+        disabled,
+        recoveryCleanCount: Math.max(0, Math.min(3, Number(entry.recoveryCleanCount) || 0)),
+        lastUsed: Number.isFinite(entry.lastUsed) ? entry.lastUsed : now,
+        expiresAt: entry.expiresAt,
+      });
+    }
+    this._prune(now);
+  }
+
+  _prune(now = this._now()) {
+    for (const [key, record] of this._records) {
+      if (!Number.isFinite(record.expiresAt) || record.expiresAt <= now) this._records.delete(key);
+    }
+    const ordered = [...this._records.values()].sort((left, right) => right.lastUsed - left.lastUsed);
+    for (const record of ordered.slice(MAX_PLAYBACK_LEARNING_SIGNATURES)) {
+      this._records.delete(record.key);
+    }
+  }
+
+  _persist() {
+    this._prune();
+    try {
+      this._storage?.setItem(PLAYBACK_LEARNING_STORAGE_KEY, JSON.stringify({
+        version: PLAYBACK_LEARNING_VERSION,
+        entries: [...this._records.values()].sort((left, right) => right.lastUsed - left.lastUsed),
+      }));
+    } catch {
+      // Storage is an optimization only; private/blocked modes stay conservative.
+    }
+  }
+
+  _record(signatureKey) {
+    const now = this._now();
+    let record = this._records.get(signatureKey);
+    if (!record) {
+      record = {
+        key: signatureKey,
+        gaps: [],
+        fullPrimeCleanCount: 0,
+        warmEligible: false,
+        disabled: false,
+        recoveryCleanCount: 0,
+        lastUsed: now,
+        expiresAt: now + PLAYBACK_LEARNING_TTL_MS,
+      };
+      this._records.set(signatureKey, record);
+    }
+    record.lastUsed = now;
+    record.expiresAt = now + PLAYBACK_LEARNING_TTL_MS;
+    return record;
+  }
+
+  /** @param {ReturnType<typeof resolveAdaptivePlaybackSignature>} signature */
+  policy(signature) {
+    if (!signature.eligible) {
+      return Object.freeze({
+        learning: false,
+        signatureKey: "",
+        mode: "immediate",
+        targetMs: 0,
+        ceilingMs: 0,
+        firstMs: 0,
+        gapP95Ms: 0,
+        firstBlockSamples: 0,
+        steadyBlockSamples: 0,
+        jitterMarginMs: PLAYBACK_WARM_GAP_MARGIN_MS,
+        fallbackReason: "non_native_or_buffered",
+      });
+    }
+    if (!signature.valid) {
+      return Object.freeze({
+        learning: false,
+        signatureKey: "",
+        mode: "conservative",
+        targetMs: signature.ceilingMs,
+        ceilingMs: signature.ceilingMs,
+        firstMs: signature.firstMs,
+        gapP95Ms: 0,
+        firstBlockSamples: 0,
+        steadyBlockSamples: 0,
+        jitterMarginMs: PLAYBACK_WARM_GAP_MARGIN_MS,
+        fallbackReason: "signature_incomplete_or_unordered",
+      });
+    }
+    const record = this._record(signature.key);
+    const warm = record.warmEligible && !record.disabled;
+    const gapP95Ms = _nearestRankP95(record.gaps);
+    const warmTarget = Math.max(
+      signature.firstMs + PLAYBACK_WARM_FIRST_MARGIN_MS,
+      gapP95Ms + PLAYBACK_WARM_GAP_MARGIN_MS,
+    );
+    const policy = Object.freeze({
+      learning: true,
+      signatureKey: signature.key,
+      mode: warm ? "warm" : (record.disabled ? "recovery" : "cold"),
+      targetMs: warm ? Math.min(signature.ceilingMs, warmTarget) : signature.ceilingMs,
+      ceilingMs: signature.ceilingMs,
+      firstMs: signature.firstMs,
+      gapP95Ms,
+      firstBlockSamples: Math.ceil(
+        (signature.fields.firstBlockFrames * AUDIO_CPP_CODEC_FRAME_MS
+          * signature.fields.outputRate) / 1_000,
+      ),
+      steadyBlockSamples: Math.ceil(
+        (signature.fields.steadyBlockFrames * AUDIO_CPP_CODEC_FRAME_MS
+          * signature.fields.outputRate) / 1_000,
+      ),
+      jitterMarginMs: PLAYBACK_WARM_GAP_MARGIN_MS,
+      fallbackReason: warm
+        ? "learned_block_cadence"
+        : (record.disabled ? "underrun_recovery" : "cold_evidence"),
+    });
+    this._persist();
+    return policy;
+  }
+
+  /**
+   * @param {ReturnType<AdaptivePlaybackPolicyStore["policy"]>} policy
+   * @param {{ gaps?: number[], underrun?: boolean, cleanFullPrime?: boolean }} observation
+   */
+  record(policy, observation = {}) {
+    if (!policy.learning || !policy.signatureKey) return;
+    const record = this._record(policy.signatureKey);
+    const gaps = Array.isArray(observation.gaps)
+      ? observation.gaps.filter((gap) => Number.isFinite(gap) && gap > 0)
+      : [];
+    record.gaps = [...record.gaps, ...gaps].slice(-PLAYBACK_GAP_WINDOW);
+    if (observation.underrun) {
+      record.disabled = true;
+      record.warmEligible = false;
+      record.fullPrimeCleanCount = 0;
+      record.recoveryCleanCount = 0;
+      this._persist();
+      return;
+    }
+    const cleanFullPrime = observation.cleanFullPrime === true;
+    if (record.disabled) {
+      record.recoveryCleanCount = cleanFullPrime ? record.recoveryCleanCount + 1 : 0;
+      if (record.recoveryCleanCount >= 3) {
+        record.disabled = false;
+        record.warmEligible = true;
+        record.fullPrimeCleanCount = 2;
+        record.recoveryCleanCount = 0;
+      }
+    } else if (!record.warmEligible) {
+      record.fullPrimeCleanCount = cleanFullPrime ? record.fullPrimeCleanCount + 1 : 0;
+      if (record.fullPrimeCleanCount >= 2) record.warmEligible = true;
+    }
+    this._persist();
+  }
+}
 const DEFAULT_ECHO_CALIBRATION = Object.freeze({
   delayMs: 0,
   suppressionStrength: 0.65,
@@ -422,17 +757,37 @@ export class S2sWsRealtimeClient extends EventTarget {
     this._playbackGeneration = 0;
     this._playbackGenerationInvalidated = false;
     this._playbackPrimeMs = 0;
+    this._playbackCeilingMs = 0;
+    this._playbackRuntimeIdentity = "";
+    this._playbackLearning = new AdaptivePlaybackPolicyStore();
+    this._playbackClock = () => performance.now();
+    this._playbackTurnSerial = 0;
+    this._activePlaybackTurn = null;
+    this._anonymousPlaybackResponseId = "";
+    this._anonymousPlaybackSerial = 0;
+    this._acknowledgedPlaybackSignature = resolveAdaptivePlaybackSignature({}, {}, "", false);
+    this._lastAcknowledgedPipelineConfig = {};
     /** @type {PlaybackConfig} */
     this._acknowledgedPlaybackConfig = {
       provider: "",
       profileId: "",
+      profileRevision: "",
+      model: "",
+      clone: "",
       nativeStreaming: false,
       resolvedPrimeMs: 0,
+      firstBlockFrames: 0,
+      steadyBlockFrames: 0,
+      outputRate: OUTPUT_SAMPLE_RATE,
     };
     /** @type {{ expectedProvider: string, expectedProfile: string, hint: PlaybackConfig }[]} */
     this._pendingPlaybackConfigs = [];
-    /** @type {Map<string, { generation: number, primeMs: number, ended: boolean }>} */
+    /** @type {Map<string, Record<string, any>>} */
     this._playbackByResponse = new Map();
+    /** @type {Map<string, Record<string, any>>} Completed network responses awaiting worklet drain. */
+    this._completedPlaybackResponses = new Map();
+    /** @type {Set<string>} Response IDs observed through response.created and not yet terminal. */
+    this._openPlaybackResponseIds = new Set();
     /** @type {Set<string>} Bounded completed/cancelled response IDs. */
     this._stalePlaybackResponses = new Set();
     /** @type {GainNode | null} */
@@ -561,14 +916,14 @@ export class S2sWsRealtimeClient extends EventTarget {
   _applyAcknowledgedPlaybackConfig(config) {
     const provider = _normalisePlaybackProvider(config.tts_backend);
     const profileId = _normaliseProfileId(config.tts_tuning?.profile_id);
-    let pendingIndex = this._pendingPlaybackConfigs.findIndex((pending) => (
+    const pendingIndex = this._pendingPlaybackConfigs.findIndex((pending) => (
       pending.expectedProvider === provider
       && (!pending.expectedProfile || pending.expectedProfile === profileId)
     ));
-    if (pendingIndex < 0 && this._pendingPlaybackConfigs.length === 1) pendingIndex = 0;
+    const orderedAck = pendingIndex === 0;
     const pending = pendingIndex >= 0
-      ? this._pendingPlaybackConfigs.splice(pendingIndex, 1)[0]
-      : null;
+      ? this._pendingPlaybackConfigs.splice(0, pendingIndex + 1).at(-1)
+      : this._pendingPlaybackConfigs.shift() || null;
     const canReuseAcknowledged = provider === this._acknowledgedPlaybackConfig.provider;
     const hint = {
       ...(canReuseAcknowledged ? this._acknowledgedPlaybackConfig : {}),
@@ -576,9 +931,19 @@ export class S2sWsRealtimeClient extends EventTarget {
       provider,
       profileId: profileId || pending?.hint?.profileId || "",
     };
-    const primeMs = resolvePlaybackPrimeMs(config, hint);
+    const previousKey = this._acknowledgedPlaybackSignature.key;
+    const signature = resolveAdaptivePlaybackSignature(
+      config,
+      hint,
+      this._playbackRuntimeIdentity,
+      orderedAck,
+    );
+    const policy = this._playbackLearning.policy(signature);
     this._acknowledgedPlaybackConfig = hint;
-    this._playbackPrimeMs = primeMs;
+    this._acknowledgedPlaybackSignature = signature;
+    this._lastAcknowledgedPipelineConfig = { ...config };
+    this._playbackPrimeMs = policy.targetMs;
+    this._playbackCeilingMs = policy.ceilingMs;
     this.dispatchEvent(new CustomEvent("pipeline-metric", {
       detail: {
         stage: "playback",
@@ -588,32 +953,184 @@ export class S2sWsRealtimeClient extends EventTarget {
           provider,
           profile_id: hint.profileId || null,
           native_streaming: hint.nativeStreaming === true,
-          prime_target_ms: primeMs,
+          prime_target_ms: policy.targetMs,
+          prime_ceiling_ms: policy.ceilingMs,
+          cold_ceiling_ms: policy.ceilingMs,
+          effective_target_ms: policy.targetMs,
+          safe_start_mode: policy.mode,
+          latest_logical_block_gap_ms: null,
+          logical_block_gap_p95_ms: policy.gapP95Ms,
+          jitter_margin_ms: policy.jitterMarginMs,
+          fallback_reason: policy.fallbackReason,
+          signature_valid: signature.valid,
+          signature_reset: !!previousKey && previousKey !== signature.key,
           acknowledged: true,
         },
       },
     }));
   }
 
-  /** @param {string} responseId */
-  _playbackSnapshot(responseId) {
+  _freezePlaybackTurnPolicy() {
+    this._playbackTurnSerial += 1;
+    const policy = this._playbackLearning.policy(this._acknowledgedPlaybackSignature);
+    this._activePlaybackTurn = Object.freeze({
+      id: this._playbackTurnSerial,
+      generation: this._playbackGeneration,
+      policy,
+    });
+    this._anonymousPlaybackResponseId = "";
+    return this._activePlaybackTurn;
+  }
+
+  _conservativePlaybackPolicy() {
+    const signature = this._acknowledgedPlaybackSignature;
+    if (!signature.eligible) {
+      return Object.freeze({
+        learning: false,
+        signatureKey: "",
+        mode: "immediate",
+        targetMs: 0,
+        ceilingMs: 0,
+        firstMs: 0,
+        gapP95Ms: 0,
+        firstBlockSamples: 0,
+        steadyBlockSamples: 0,
+        jitterMarginMs: PLAYBACK_WARM_GAP_MARGIN_MS,
+        fallbackReason: "non_native_or_buffered",
+      });
+    }
+    return Object.freeze({
+      learning: false,
+      signatureKey: "",
+      mode: "conservative",
+      targetMs: signature.ceilingMs,
+      ceilingMs: signature.ceilingMs,
+      firstMs: signature.firstMs,
+      gapP95Ms: 0,
+      firstBlockSamples: 0,
+      steadyBlockSamples: 0,
+      jitterMarginMs: PLAYBACK_WARM_GAP_MARGIN_MS,
+      fallbackReason: "response_identity_unordered",
+    });
+  }
+
+  /** @param {string} responseId @param {boolean} [ordered] */
+  _playbackSnapshot(responseId, ordered = true) {
     if (responseId) {
-      const existing = this._playbackByResponse.get(responseId);
+      const existing = this._playbackByResponse.get(responseId)
+        || this._completedPlaybackResponses.get(responseId);
       if (existing) return existing;
     }
+    const turn = this._activePlaybackTurn;
+    const identityOrdered = ordered
+      && !!turn
+      && turn.generation === this._playbackGeneration;
+    const policy = identityOrdered ? turn.policy : this._conservativePlaybackPolicy();
+    const targetSamples = Math.ceil((policy.targetMs * OUTPUT_SAMPLE_RATE) / 1_000);
+    const ceilingSamples = Math.ceil((policy.ceilingMs * OUTPUT_SAMPLE_RATE) / 1_000);
     const snapshot = {
       generation: this._playbackGeneration,
-      primeMs: this._playbackPrimeMs,
+      turnId: turn?.id || 0,
+      policy,
+      primeMs: policy.targetMs,
+      ceilingMs: policy.ceilingMs,
+      targetSamples,
+      ceilingSamples,
       ended: false,
+      inputSamples: 0,
+      chunkCount: 0,
+      gaps: [],
+      logicalBlockCount: 0,
+      nextLogicalBoundarySamples: policy.firstBlockSamples,
+      lastLogicalBlockAt: null,
+      latestLogicalBlockGapMs: null,
+      ordered: identityOrdered,
+      networkDone: false,
+      responseStatus: "",
+      workletDrained: false,
+      forcedShort: false,
+      underrun: false,
+      cancelled: false,
+      learningRecorded: false,
     };
     if (responseId) this._playbackByResponse.set(responseId, snapshot);
     return snapshot;
+  }
+
+  /** @param {string} responseId */
+  _resolvePlaybackResponseId(responseId) {
+    if (typeof responseId === "string" && responseId) return responseId;
+    if (!this._anonymousPlaybackResponseId) {
+      this._anonymousPlaybackSerial += 1;
+      this._anonymousPlaybackResponseId = (
+        `anonymous-${this._playbackGeneration}-${this._playbackTurnSerial}-${this._anonymousPlaybackSerial}`
+      );
+    }
+    return this._anonymousPlaybackResponseId;
+  }
+
+  /** @param {string} responseId */
+  _markPlaybackResponseUnordered(responseId) {
+    const resolvedId = this._resolvePlaybackResponseId(responseId);
+    const snapshot = this._playbackSnapshot(resolvedId, false);
+    snapshot.ordered = false;
+    snapshot.policy = this._conservativePlaybackPolicy();
+    snapshot.primeMs = snapshot.policy.targetMs;
+    snapshot.ceilingMs = snapshot.policy.ceilingMs;
+    snapshot.targetSamples = Math.ceil((snapshot.primeMs * OUTPUT_SAMPLE_RATE) / 1_000);
+    snapshot.ceilingSamples = Math.ceil((snapshot.ceilingMs * OUTPUT_SAMPLE_RATE) / 1_000);
+    snapshot.gaps = [];
+    snapshot.logicalBlockCount = 0;
+    snapshot.nextLogicalBoundarySamples = 0;
+    snapshot.lastLogicalBlockAt = null;
+    snapshot.latestLogicalBlockGapMs = null;
+    return { responseId: resolvedId, snapshot };
+  }
+
+  /** @param {string} responseId */
+  _finalizePlaybackLearning(responseId) {
+    const snapshot = this._playbackByResponse.get(responseId)
+      || this._completedPlaybackResponses.get(responseId);
+    if (!snapshot || !snapshot.networkDone || !snapshot.workletDrained) return;
+    if (!snapshot.learningRecorded) {
+      snapshot.learningRecorded = true;
+      const cleanFullPrime = (
+        snapshot.ordered
+        && snapshot.responseStatus === "completed"
+        && !snapshot.cancelled
+        && !snapshot.underrun
+        && !snapshot.forcedShort
+        && snapshot.policy.targetMs >= snapshot.policy.ceilingMs
+        && snapshot.inputSamples >= snapshot.ceilingSamples
+      );
+      if (snapshot.ordered
+          && snapshot.responseStatus === "completed"
+          && !snapshot.cancelled
+          && !snapshot.underrun
+          && !snapshot.forcedShort) {
+        this._playbackLearning.record(snapshot.policy, {
+          gaps: snapshot.gaps,
+          cleanFullPrime,
+        });
+      }
+    }
+    this._completedPlaybackResponses.delete(responseId);
   }
 
   /** Retain a bounded tombstone so late PCM cannot recreate a current snapshot. */
   /** @param {string} responseId */
   _retirePlaybackResponse(responseId) {
     if (!responseId) return;
+    const snapshot = this._playbackByResponse.get(responseId);
+    if (snapshot) {
+      this._completedPlaybackResponses.delete(responseId);
+      this._completedPlaybackResponses.set(responseId, snapshot);
+      while (this._completedPlaybackResponses.size > MAX_PLAYBACK_RESPONSE_TOMBSTONES) {
+        const oldest = this._completedPlaybackResponses.keys().next().value;
+        if (!oldest) break;
+        this._completedPlaybackResponses.delete(oldest);
+      }
+    }
     this._playbackByResponse.delete(responseId);
     this._stalePlaybackResponses.delete(responseId);
     this._stalePlaybackResponses.add(responseId);
@@ -634,6 +1151,7 @@ export class S2sWsRealtimeClient extends EventTarget {
       kind: "end",
       generation: snapshot.generation,
       streamId: responseId,
+      inputSamples: snapshot.inputSamples,
     });
   }
 
@@ -643,6 +1161,11 @@ export class S2sWsRealtimeClient extends EventTarget {
     if (this._playbackGenerationInvalidated) return;
     this._playbackGeneration += 1;
     this._playbackGenerationInvalidated = true;
+    this._activePlaybackTurn = null;
+    this._anonymousPlaybackResponseId = "";
+    for (const snapshot of [...this._playbackByResponse.values(), ...this._completedPlaybackResponses.values()]) {
+      if (snapshot.generation < this._playbackGeneration) snapshot.cancelled = true;
+    }
     this._playbackNode?.port.postMessage({
       kind: "clear",
       generation: this._playbackGeneration,
@@ -938,7 +1461,7 @@ export class S2sWsRealtimeClient extends EventTarget {
 
     // The worklets live at the repo root, one level up from this module.
     const base = new URL("../worklets/", import.meta.url);
-    await ctx.audioWorklet.addModule(new URL("audio-playback.js?v=15-audible-lifecycle", base).href);
+    await ctx.audioWorklet.addModule(new URL("audio-playback.js?v=16-adaptive-safe-start", base).href);
     const aec3 = await loadAec3Worklet(ctx);
     if (!aec3.available) {
       await ctx.audioWorklet.addModule(new URL("mic-capture.js?v=12-aec3-fallback", base).href);
@@ -1113,7 +1636,12 @@ export class S2sWsRealtimeClient extends EventTarget {
         && data?.kind !== "stale_chunk_rejected") return;
     const queueDetail = {
       queued_ms: Number(data?.queuedMs || 0),
+      queued_samples: Number(data?.queuedSamples || 0),
       prime_target_ms: Number(data?.primeTargetMs || 0),
+      prime_ceiling_ms: Number(data?.primeCeilingMs || 0),
+      target_samples: Number(data?.targetSamples || 0),
+      ceiling_samples: Number(data?.ceilingSamples || 0),
+      input_samples: Number(data?.inputSamples || 0),
       generation: Number.isSafeInteger(generation) ? generation : this._playbackGeneration,
       state: data?.state || "unknown",
       underruns: Number(data?.underruns || 0),
@@ -1121,8 +1649,21 @@ export class S2sWsRealtimeClient extends EventTarget {
       stale_chunks: Number(data?.staleChunks || 0),
       clears: Number(data?.clears || 0),
     };
+    const streamId = typeof data?.streamId === "string" ? data.streamId : "";
+    const snapshot = streamId
+      ? this._playbackByResponse.get(streamId) || this._completedPlaybackResponses.get(streamId)
+      : null;
+    queueDetail.safe_start_mode = snapshot?.policy?.mode || null;
+    queueDetail.turn_id = snapshot?.turnId || null;
+    queueDetail.cold_ceiling_ms = snapshot?.policy?.ceilingMs ?? Number(data?.primeCeilingMs || 0);
+    queueDetail.effective_target_ms = snapshot?.policy?.targetMs ?? Number(data?.primeTargetMs || 0);
+    queueDetail.latest_logical_block_gap_ms = snapshot?.latestLogicalBlockGapMs ?? null;
+    queueDetail.logical_block_gap_p95_ms = snapshot?.gaps?.length
+      ? _nearestRankP95(snapshot.gaps)
+      : (snapshot?.policy?.gapP95Ms ?? 0);
+    queueDetail.jitter_margin_ms = snapshot?.policy?.jitterMarginMs ?? PLAYBACK_WARM_GAP_MARGIN_MS;
+    queueDetail.fallback_reason = snapshot?.policy?.fallbackReason || "playback_snapshot_unavailable";
     if (data?.kind === "started") {
-      const streamId = typeof data.streamId === "string" ? data.streamId : "";
       if (streamId && !this._stalePlaybackResponses.has(streamId)) {
         this._heardResponses.add(streamId);
       }
@@ -1160,10 +1701,28 @@ export class S2sWsRealtimeClient extends EventTarget {
       return;
     }
     if (data?.kind === "underrun") {
+      if (snapshot) {
+        snapshot.underrun = true;
+        if (!snapshot.learningRecorded) {
+          this._playbackLearning.record(snapshot.policy, {
+            gaps: snapshot.gaps,
+            underrun: true,
+          });
+          snapshot.learningRecorded = true;
+        }
+      }
       this.dispatchEvent(new CustomEvent("pipeline-metric", {
         detail: { stage: "playback", status: "underrun", source: "browser", detail: queueDetail },
       }));
       return;
+    }
+    if ((data?.kind === "primed" || data?.kind === "reprimed") && snapshot && data.forced) {
+      snapshot.forcedShort = true;
+    }
+    if ((data?.kind === "stream_drained" || data?.kind === "drained") && snapshot) {
+      snapshot.workletDrained = true;
+      if (data.cleared) snapshot.cancelled = true;
+      this._finalizePlaybackLearning(streamId);
     }
     if (data?.kind === "drained") {
       this._aiSpeaking = false;
@@ -1174,7 +1733,7 @@ export class S2sWsRealtimeClient extends EventTarget {
         this._setStatus(this._responseActive() ? "processing" : "connected");
       }
     }
-    if (["primed", "reprimed", "drained", "cleared", "stale_chunk_rejected"].includes(data?.kind)) {
+    if (["primed", "reprimed", "stream_drained", "drained", "cleared", "stale_chunk_rejected"].includes(data?.kind)) {
       this.dispatchEvent(new CustomEvent("pipeline-metric", {
         detail: {
           stage: "playback",
@@ -1261,6 +1820,21 @@ export class S2sWsRealtimeClient extends EventTarget {
         break;
 
       case "pipeline.runtime":
+        {
+          const runtimeIdentity = _runtimePlaybackIdentity(event.runtime);
+          if (this._playbackRuntimeIdentity && runtimeIdentity !== this._playbackRuntimeIdentity) {
+            this._acknowledgedPlaybackSignature = resolveAdaptivePlaybackSignature(
+              this._lastAcknowledgedPipelineConfig,
+              this._acknowledgedPlaybackConfig,
+              runtimeIdentity,
+              false,
+            );
+            const conservative = this._playbackLearning.policy(this._acknowledgedPlaybackSignature);
+            this._playbackPrimeMs = conservative.targetMs;
+            this._playbackCeilingMs = conservative.ceilingMs;
+          }
+          this._playbackRuntimeIdentity = runtimeIdentity;
+        }
         this.dispatchEvent(new CustomEvent("backend-runtime", { detail: event.runtime || {} }));
         break;
 
@@ -1278,6 +1852,7 @@ export class S2sWsRealtimeClient extends EventTarget {
 
       case "input_audio_buffer.speech_stopped":
         this._playbackGenerationInvalidated = false;
+        this._freezePlaybackTurnPolicy();
         if (this._status === "user-speaking") this._setStatus("processing");
         this._speechStoppedAtMs = performance.now();
         this._firstPlaybackReported = false;
@@ -1292,9 +1867,22 @@ export class S2sWsRealtimeClient extends EventTarget {
         // (this confirms either our create or a server-initiated one).
         this._openResponses++;
         this._createInFlight = false;
-        this._playbackSnapshot(
-          typeof event.response?.id === "string" ? event.response.id : "",
-        );
+        {
+          const rawResponseId = typeof event.response?.id === "string" ? event.response.id : "";
+          if (!rawResponseId) this._anonymousPlaybackResponseId = "";
+          const responseId = this._resolvePlaybackResponseId(rawResponseId);
+          const ordered = !!rawResponseId
+            && !this._openPlaybackResponseIds.has(responseId)
+            && !this._stalePlaybackResponses.has(responseId)
+            && this._openPlaybackResponseIds.size === 0;
+          if (ordered) {
+            this._openPlaybackResponseIds.add(responseId);
+            this._playbackSnapshot(responseId, true);
+          } else {
+            this._openPlaybackResponseIds.add(responseId);
+            this._markPlaybackResponseUnordered(responseId);
+          }
+        }
         if (this._status === "connected" || this._status === "user-speaking") {
           this._setStatus("processing");
         }
@@ -1317,9 +1905,13 @@ export class S2sWsRealtimeClient extends EventTarget {
 
       case "response.audio.done":
       case "response.output_audio.done": {
-        const rid = typeof (event.response_id ?? event.response?.id) === "string"
+        const rawRid = typeof (event.response_id ?? event.response?.id) === "string"
           ? (event.response_id ?? event.response?.id)
           : "";
+        const rid = this._resolvePlaybackResponseId(rawRid);
+        if (!rawRid || !this._openPlaybackResponseIds.has(rid)) {
+          this._markPlaybackResponseUnordered(rid);
+        }
         this._finishPlaybackResponse(rid);
         break;
       }
@@ -1343,11 +1935,16 @@ export class S2sWsRealtimeClient extends EventTarget {
         // drop a cancelled response's transcript and commit a completed one.
         const status = event.response?.status ?? "completed";
         const responseId = event.response?.id ?? "";
-        const responsePlayback = responseId
-          ? this._playbackByResponse.get(responseId)
+        const playbackResponseId = this._resolvePlaybackResponseId(responseId);
+        if (!responseId || !this._openPlaybackResponseIds.has(playbackResponseId)) {
+          this._markPlaybackResponseUnordered(playbackResponseId);
+        }
+        this._openPlaybackResponseIds.delete(playbackResponseId);
+        const responsePlayback = playbackResponseId
+          ? this._playbackByResponse.get(playbackResponseId)
           : null;
-        const responseRetired = responseId
-          ? this._stalePlaybackResponses.has(responseId)
+        const responseRetired = playbackResponseId
+          ? this._stalePlaybackResponses.has(playbackResponseId)
           : false;
         if (status === "cancelled" || status === "canceled") {
           // Barge-in already advanced the generation. Do not clear the new turn
@@ -1359,7 +1956,13 @@ export class S2sWsRealtimeClient extends EventTarget {
         } else if (!responseRetired) {
           // Some compatible peers omit output_audio.done. Keep the end flush
           // idempotent and use response.done as the terminal fallback.
-          this._finishPlaybackResponse(responseId);
+          this._finishPlaybackResponse(playbackResponseId);
+        }
+        if (responsePlayback) {
+          responsePlayback.networkDone = true;
+          responsePlayback.responseStatus = status;
+          responsePlayback.cancelled = status === "cancelled" || status === "canceled";
+          responsePlayback.forcedShort = responsePlayback.inputSamples < responsePlayback.targetSamples;
         }
         const endToEndMs = this._speechStoppedAtMs == null
           ? null
@@ -1392,7 +1995,8 @@ export class S2sWsRealtimeClient extends EventTarget {
         this.dispatchEvent(new CustomEvent("response-finished", {
           detail: { responseId, status, audible, transcript },
         }));
-        this._retirePlaybackResponse(responseId);
+        this._retirePlaybackResponse(playbackResponseId);
+        this._finalizePlaybackLearning(playbackResponseId);
         if (!this._responseActive()) this._resolveResponseIdleWaiters();
         // The slot is free now — replay a queued create (e.g. a tool follow-up
         // that arrived while this response was still running).
@@ -1582,7 +2186,9 @@ export class S2sWsRealtimeClient extends EventTarget {
   _pushAudioDelta(b64, responseId = "") {
     if (!this._playbackNode) return;
     if (!b64) return;
-    if (responseId && this._stalePlaybackResponses.has(responseId)) {
+    const rawResponseId = responseId;
+    const resolvedResponseId = this._resolvePlaybackResponseId(rawResponseId);
+    if (resolvedResponseId && this._stalePlaybackResponses.has(resolvedResponseId)) {
       this.dispatchEvent(new CustomEvent("pipeline-metric", {
         detail: {
           stage: "playback",
@@ -1593,7 +2199,10 @@ export class S2sWsRealtimeClient extends EventTarget {
       }));
       return;
     }
-    const snapshot = this._playbackSnapshot(responseId);
+    const knownOrderedResponse = !!rawResponseId && this._openPlaybackResponseIds.has(resolvedResponseId);
+    const snapshot = knownOrderedResponse
+      ? this._playbackSnapshot(resolvedResponseId, true)
+      : this._markPlaybackResponseUnordered(resolvedResponseId).snapshot;
     if (snapshot.ended) {
       this.dispatchEvent(new CustomEvent("pipeline-metric", {
         detail: {
@@ -1609,20 +2218,83 @@ export class S2sWsRealtimeClient extends EventTarget {
       }));
       return;
     }
+    if (snapshot.generation !== this._playbackGeneration) {
+      this.dispatchEvent(new CustomEvent("pipeline-metric", {
+        detail: {
+          stage: "playback",
+          status: "stale_chunk_rejected",
+          source: "browser",
+          detail: {
+            reason: "generation_mismatch",
+            generation: snapshot.generation,
+            current_generation: this._playbackGeneration,
+          },
+        },
+      }));
+      return;
+    }
     const bytes = base64ToBytes(b64);
+    if (bytes.byteLength === 0 || bytes.byteLength % 2 !== 0) {
+      snapshot.ordered = false;
+      this.dispatchEvent(new CustomEvent("pipeline-metric", {
+        detail: {
+          stage: "playback",
+          status: "stale_chunk_rejected",
+          source: "browser",
+          detail: { reason: "invalid_pcm_length", current_generation: this._playbackGeneration },
+        },
+      }));
+      return;
+    }
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     const samples = new Float32Array(bytes.byteLength / 2);
     for (let i = 0; i < samples.length; i++) {
       const s = view.getInt16(i * 2, true);
       samples[i] = s < 0 ? s / 0x8000 : s / 0x7fff;
     }
+    const inputSampleOffset = snapshot.inputSamples;
+    snapshot.inputSamples += samples.length;
+    snapshot.chunkCount += 1;
+    const nextBoundary = snapshot.nextLogicalBoundarySamples;
+    const steadyBlockSamples = snapshot.policy.steadyBlockSamples;
+    if (snapshot.policy.learning
+        && nextBoundary > 0
+        && steadyBlockSamples > 0
+        && snapshot.inputSamples >= nextBoundary) {
+      const boundariesCrossed = 1 + Math.floor(
+        (snapshot.inputSamples - nextBoundary) / steadyBlockSamples,
+      );
+      snapshot.logicalBlockCount += boundariesCrossed;
+      snapshot.nextLogicalBoundarySamples += boundariesCrossed * steadyBlockSamples;
+      // A coalesced transport chunk can contain several complete decoder
+      // blocks. It contributes one arrival timestamp, never artificial zero or
+      // packet-sized gaps between those boundaries.
+      const now = this._playbackClock();
+      if (Number.isFinite(snapshot.lastLogicalBlockAt)) {
+        const gap = now - snapshot.lastLogicalBlockAt;
+        if (Number.isFinite(gap) && gap > 0) {
+          snapshot.gaps = [...snapshot.gaps, gap].slice(-PLAYBACK_GAP_WINDOW);
+          snapshot.latestLogicalBlockGapMs = gap;
+        }
+      }
+      snapshot.lastLogicalBlockAt = now;
+    }
     this._playbackNode.port.postMessage({
       kind: "audio",
       samples,
       generation: snapshot.generation,
       primeMs: snapshot.primeMs,
-      streamId: responseId,
+      ceilingMs: snapshot.ceilingMs,
+      targetSamples: snapshot.targetSamples,
+      ceilingSamples: snapshot.ceilingSamples,
+      inputSampleOffset,
+      inputSampleCount: samples.length,
+      streamId: resolvedResponseId,
     }, [samples.buffer]);
+    // A clear is idempotent only until a genuinely new current-generation
+    // stream is accepted. Non-mic replacements must re-arm Stop/barge-in so
+    // their queued samples can be cleared independently of the prior response.
+    this._playbackGenerationInvalidated = false;
   }
 
   /** @param {CloseEvent} ev */
@@ -1967,7 +2639,11 @@ export class S2sWsRealtimeClient extends EventTarget {
     this._micAnalyser = null;
     this._outAnalyser = null;
     this._pendingPlaybackConfigs.length = 0;
+    this._activePlaybackTurn = null;
+    this._anonymousPlaybackResponseId = "";
     this._playbackByResponse.clear();
+    this._completedPlaybackResponses.clear();
+    this._openPlaybackResponseIds.clear();
     this._stalePlaybackResponses.clear();
     this._heardResponses.clear();
     this._setStatus("closed");

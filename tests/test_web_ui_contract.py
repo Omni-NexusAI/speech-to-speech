@@ -80,12 +80,12 @@ def test_native_v3_is_the_migrated_default_and_echo_ui_is_truthful():
     assert 'const EXPECTED_UI_API_VERSION = 20;' in MAIN_JS
     assert "Do not reuse a stock " in MAIN_JS
     assert "Let me check that" not in MAIN_JS
-    assert 'src="main.js?v=29-tool-privacy"' in INDEX_HTML
-    assert '"./ws/s2s-ws-client.js?v=17-tool-privacy"' in MAIN_JS
+    assert 'src="main.js?v=30-adaptive-safe-start"' in INDEX_HTML
+    assert '"./ws/s2s-ws-client.js?v=18-adaptive-safe-start"' in MAIN_JS
     assert '"./ui/chat.js?v=3-tool-privacy"' in MAIN_JS
     assert "loadAec3Worklet(ctx)" in CLIENT_JS
     assert 'new URL("mic-capture.js?v=12-aec3-fallback", base)' in CLIENT_JS
-    assert 'new URL("audio-playback.js?v=15-audible-lifecycle", base)' in CLIENT_JS
+    assert 'new URL("audio-playback.js?v=16-adaptive-safe-start", base)' in CLIENT_JS
     assert "new AudioWorkletNode(ctx, aec3.processorName" in CLIENT_JS
 
 
@@ -327,6 +327,29 @@ def test_native_pcm_metrics_cover_first_phrase_pcm_playback_rtf_and_end_to_end()
     assert 'this._diagnostic("started"' in PLAYBACK_JS
     assert "first_playback_ms" in CLIENT_JS
     assert "end_to_end_ms" in CLIENT_JS
+
+
+def test_native_pcm_adaptive_safe_start_is_acknowledged_bounded_and_sample_exact():
+    for field in (
+        "profileRevision",
+        "model",
+        "clone",
+        "firstBlockFrames",
+        "steadyBlockFrames",
+        "outputRate",
+    ):
+        assert field in MAIN_JS
+    assert "resolveAdaptivePlaybackSignature" in CLIENT_JS
+    assert "AdaptivePlaybackPolicyStore" in CLIENT_JS
+    assert "PLAYBACK_LEARNING_TTL_MS" in CLIENT_JS
+    assert "MAX_PLAYBACK_LEARNING_SIGNATURES" in CLIENT_JS
+    assert "PLAYBACK_GAP_WINDOW" in CLIENT_JS
+    assert "snapshot.policy.targetMs >= snapshot.policy.ceilingMs" in CLIENT_JS
+    assert "record.recoveryCleanCount >= 3" in CLIENT_JS
+    assert "inputSampleOffset" in CLIENT_JS
+    assert "inputSampleCount" in CLIENT_JS
+    assert 'this._diagnostic("stream_drained"' in PLAYBACK_JS
+    assert 'this._reject("audio", receivedGeneration, "input_sample_mismatch")' in PLAYBACK_JS
 
 
 def test_realtime_audio_diagnostics_show_paired_reference_truth_without_transcript_content():
