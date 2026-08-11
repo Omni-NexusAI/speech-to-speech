@@ -38,7 +38,7 @@ from speech_to_speech.api.openai_realtime.service import (
     CHUNK_SIZE_BYTES,
     RealtimeService,
 )
-from speech_to_speech.LLM.chat import make_user_message
+from speech_to_speech.LLM.chat import make_user_audio_message, make_user_message
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
     PartialTranscriptionEvent,
@@ -1045,7 +1045,9 @@ class TestDispatchPipelineEvent:
         st = service._state(conn_id)
         st.runtime_config.chat.add_item(make_user_message(f"Use {tool_name}"))
         tool = GemmaAudioSTTHandler._tool_calls_from_accum(
-            {0: {"name": tool_name, "args": "{}", "id": "UNM0K7ZOZpEN5uS0vGTo1G1UnSDH8Vki"}}
+            {0: {"name": tool_name, "args": "{}", "id": "UNM0K7ZOZpEN5uS0vGTo1G1UnSDH8Vki"}},
+            chat=st.runtime_config.chat,
+            turn_id="turn_opaque",
         )[0]
         st.runtime_config.chat.add_item(
             RealtimeConversationItemFunctionCall(
@@ -1063,7 +1065,7 @@ class TestDispatchPipelineEvent:
             AssistantTextEvent(text="Let me check.", tools=[tool]),
         )
         emitted = next(event for event in tool_events if isinstance(event, ResponseFunctionCallArgumentsDoneEvent))
-        assert emitted.call_id == "call_UNM0K7ZOZpEN5uS0vGTo1G1UnSDH8Vki"
+        assert emitted.call_id == "call_turn_opaque_0"
         assert [item.type for item in st.runtime_config.chat.buffer] == ["message"]
         assert st.runtime_config.chat.stats()["pending_tool_calls"] == 1
 
@@ -1421,13 +1423,18 @@ class TestDispatchPipelineEvent:
         assert text_prompt_queue.empty()
         assert service._state(conn_id).response_pending is False
 
-    def test_direct_audio_display_placeholder_never_enters_model_context(
+    def test_direct_audio_display_placeholder_preserves_semantic_audio_context(
         self,
         service,
         conn_id,
         runtime_config,
         text_prompt_queue,
     ):
+        audio_item = runtime_config.chat.add_item(make_user_audio_message("UklGRg=="))
+        state = service._state(conn_id)
+        state.speculative_user_turn_id = "turn_audio"
+        state.speculative_user_item_id = audio_item.id
+
         events = service.dispatch_pipeline_event(
             conn_id,
             TranscriptionCompletedEvent(
@@ -1441,9 +1448,42 @@ class TestDispatchPipelineEvent:
 
         assert len(events) == 1
         assert events[0].transcript == "[User audio]"
-        assert runtime_config.chat.buffer == []
+        assert runtime_config.chat.buffer == [audio_item]
+        assert runtime_config.chat.buffer[0].content[0].type == "input_audio"
+        assert state.speculative_user_item_id is None
         assert text_prompt_queue.empty()
-        assert service._state(conn_id).response_pending is False
+        assert state.response_pending is False
+
+    def test_direct_audio_validated_transcript_event_preserves_handler_owned_upgrade(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        text_prompt_queue,
+    ):
+        audio_item = runtime_config.chat.add_item(make_user_audio_message("UklGRg=="))
+        assert runtime_config.chat.replace_user_message_text(audio_item.id, "Validated semantic transcript")
+        state = service._state(conn_id)
+        state.speculative_user_turn_id = "turn_audio"
+        state.speculative_user_item_id = audio_item.id
+
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(
+                transcript="Validated semantic transcript",
+                turn_id="turn_audio",
+                turn_revision=0,
+                direct_audio_completed=True,
+            ),
+        )
+
+        assert len(events) == 1
+        assert events[0].transcript == "Validated semantic transcript"
+        assert runtime_config.chat.buffer == [audio_item]
+        assert runtime_config.chat.buffer[0].content[0].type == "input_text"
+        assert runtime_config.chat.buffer[0].content[0].text == "Validated semantic transcript"
+        assert state.speculative_user_item_id is None
+        assert text_prompt_queue.empty()
 
     def test_explicit_response_create_remains_available_after_direct_audio_completion(
         self,

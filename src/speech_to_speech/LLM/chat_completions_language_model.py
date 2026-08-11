@@ -11,6 +11,7 @@ from openai import Stream
 from openai.types.chat import (
     ChatCompletionChunk,
     ChatCompletionContentPartImageParam,
+    ChatCompletionContentPartInputAudioParam,
     ChatCompletionContentPartParam,
     ChatCompletionContentPartTextParam,
     ChatCompletionNamedToolChoiceParam,
@@ -18,6 +19,7 @@ from openai.types.chat import (
     ChatCompletionToolParam,
 )
 from openai.types.chat.chat_completion_content_part_image_param import ImageURL
+from openai.types.chat.chat_completion_content_part_input_audio_param import InputAudio
 from openai.types.chat.chat_completion_named_tool_choice_param import Function as NamedToolChoiceFunction
 from openai.types.realtime.realtime_conversation_item_assistant_message import (
     Content as AssistantContent,
@@ -151,6 +153,12 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
                 if detail is not None:
                     image_url["detail"] = detail
             return ChatCompletionContentPartImageParam(type="image_url", image_url=image_url)
+        if ptype == "input_audio":
+            raw_audio = part.get("input_audio") or {}
+            return ChatCompletionContentPartInputAudioParam(
+                type="input_audio",
+                input_audio=InputAudio(data=str(raw_audio.get("data") or ""), format="wav"),
+            )
         return cast("ChatCompletionContentPartParam", part)
 
     @classmethod

@@ -1,10 +1,10 @@
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 MAIN_JS = (ROOT / "web" / "hf-realtime-voice" / "main.js").read_text(encoding="utf-8")
 INDEX_HTML = (ROOT / "web" / "hf-realtime-voice" / "index.html").read_text(encoding="utf-8")
 CLIENT_JS = (ROOT / "web" / "hf-realtime-voice" / "ws" / "s2s-ws-client.js").read_text(encoding="utf-8")
+CHAT_JS = (ROOT / "web" / "hf-realtime-voice" / "ui" / "chat.js").read_text(encoding="utf-8")
 MIC_CAPTURE_JS = (ROOT / "web" / "hf-realtime-voice" / "worklets" / "mic-capture.js").read_text(encoding="utf-8")
 PLAYBACK_JS = (ROOT / "web" / "hf-realtime-voice" / "worklets" / "audio-playback.js").read_text(encoding="utf-8")
 
@@ -17,6 +17,59 @@ def test_camera_capability_depends_on_enabled_state_not_stream_readiness():
     assert "pushToolsToSession();" in permission_handler
 
 
+def test_browser_rejects_invalid_tool_arguments_without_executing_them():
+    executor = MAIN_JS.split("async function runTool", 1)[1].split("function renderTtsBackendOptions", 1)[0]
+    validation = executor.index("const validation = prepared.validation")
+    invalid_result = executor.index("result.output = prepared.displayArguments")
+    search = executor.index('name === "web_search"')
+    camera = executor.index('name === "camera_snapshot"')
+    tool_listener = MAIN_JS.split('c.addEventListener("toolcall"', 1)[1].split('c.addEventListener("error"', 1)[0]
+
+    assert validation < invalid_result < search < camera
+    assert tool_listener.index("prepareToolArgumentsForBrowser") < tool_listener.index("chat.onToolCall")
+    assert "chat.onToolCall(name, args" not in tool_listener
+    assert "chat.onToolResult(name, args" not in tool_listener
+    assert 'type: "invalid_tool_arguments"' in CLIENT_JS
+    assert 'error_class: failure.errorClass' in CLIENT_JS
+    assert 'return { path: `${path}.*`, errorClass: "unexpected_property" }' in CLIENT_JS
+    assert 'args = typeof event.arguments === "string" ? event.arguments : null' in CLIENT_JS
+    assert 'JSON.parse(argsJson || "{}")' not in MAIN_JS
+    assert 'additionalProperties: false' in MAIN_JS
+    assert 'pattern: "\\\\S"' in MAIN_JS
+
+
+def test_missing_tool_call_identity_is_visible_but_never_executable():
+    assert 'new CustomEvent("tool-protocol-error", { detail: { code } })' in CLIENT_JS
+    dispatch = CLIENT_JS.split('case "response.function_call_arguments.done"', 1)[1].split("break;", 1)[0]
+    assert dispatch.index("if (name && callId.trim())") < dispatch.index('new CustomEvent("toolcall"')
+    assert 'const code = name ? "missing_call_id" : "missing_tool_name"' in dispatch
+    assert 'c.addEventListener("tool-protocol-error"' in MAIN_JS
+    assert "chat.onToolProtocolFailure(code)" in MAIN_JS
+    assert 'type: "invalid_tool_call"' in CHAT_JS
+
+
+def test_debug_logging_is_content_free_for_user_and_assistant_transcripts():
+    assert "event.delta ?? event.transcript" in CLIENT_JS
+    assert "chars=${String(event.delta ?? event.transcript ?? \"\").length}" in CLIENT_JS
+    assert "${event.delta ?? event.transcript ?? \"\"}" not in CLIENT_JS
+    assert "chars=${String(d.text || \"\").length}" in CHAT_JS
+    assert "text=${JSON.stringify(d.text)}" not in CHAT_JS
+
+
+def test_every_camera_call_has_distinct_visible_content_free_lifecycle():
+    assert "let cameraCaptureGeneration = 0;" in MAIN_JS
+    assert "capture_generation: lifecycle.captureGeneration" in MAIN_JS
+    assert "requested_at_ms: lifecycle.requestedAtMs" in MAIN_JS
+    assert 'stage: "camera"' in MAIN_JS
+    assert "argsJson" not in MAIN_JS.split("function cameraLifecycleDetail", 1)[1].split("function beginToolLifecycle", 1)[0]
+    assert 'return `camera:${lifecycle.captureGeneration}:${callId || "missing-call-id"}`' in CHAT_JS
+    assert "Capture #${lifecycle.captureGeneration}" in CHAT_JS
+    assert "this._updateToolLifecycle(existing, lifecycle)" in CHAT_JS
+    assert "this._appendHistImage(image, existing)" in CHAT_JS
+    assert "The camera is not available right now." in MAIN_JS
+    assert "call camera_snapshot again" in MAIN_JS
+
+
 def test_native_v3_is_the_migrated_default_and_echo_ui_is_truthful():
     assert 'echoGuardVersion: "s2s.ws.echoGuardVersion"' in MAIN_JS
     assert 'localStorage.setItem(STORAGE_KEYS.echoGuardVersion, "3")' in MAIN_JS
@@ -27,8 +80,9 @@ def test_native_v3_is_the_migrated_default_and_echo_ui_is_truthful():
     assert 'const EXPECTED_UI_API_VERSION = 20;' in MAIN_JS
     assert "Do not reuse a stock " in MAIN_JS
     assert "Let me check that" not in MAIN_JS
-    assert 'src="main.js?v=27-audible-lifecycle"' in INDEX_HTML
-    assert '"./ws/s2s-ws-client.js?v=15-audible-lifecycle"' in MAIN_JS
+    assert 'src="main.js?v=29-tool-privacy"' in INDEX_HTML
+    assert '"./ws/s2s-ws-client.js?v=17-tool-privacy"' in MAIN_JS
+    assert '"./ui/chat.js?v=3-tool-privacy"' in MAIN_JS
     assert "loadAec3Worklet(ctx)" in CLIENT_JS
     assert 'new URL("mic-capture.js?v=12-aec3-fallback", base)' in CLIENT_JS
     assert 'new URL("audio-playback.js?v=15-audible-lifecycle", base)' in CLIENT_JS

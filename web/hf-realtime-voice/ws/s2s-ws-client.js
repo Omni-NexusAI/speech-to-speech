@@ -147,6 +147,158 @@ function _normalisePlaybackProvider(value) {
   return provider === "audio-cpp" ? "qwen3tts-audiocpp" : provider;
 }
 
+/** @param {unknown} value @returns {value is Record<string, unknown>} */
+function _isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Validate a value against the small JSON-Schema subset used by browser tools.
+ * Return only a field path and error class: caller diagnostics must never echo
+ * raw argument values.
+ * @param {unknown} value
+ * @param {Record<string, any>} schema
+ * @param {string} path
+ * @returns {{ path: string, errorClass: string } | null}
+ */
+function _toolSchemaError(value, schema, path = "$") {
+  if (Array.isArray(schema.enum) && !schema.enum.some((candidate) => Object.is(candidate, value))) {
+    return { path, errorClass: "not_in_enum" };
+  }
+  const type = typeof schema.type === "string" ? schema.type : "";
+  if (type === "object") {
+    if (!_isPlainObject(value)) return { path, errorClass: "expected_object" };
+    const properties = _isPlainObject(schema.properties) ? schema.properties : {};
+    const required = Array.isArray(schema.required) ? schema.required : [];
+    for (const field of required) {
+      if (typeof field === "string" && !Object.prototype.hasOwnProperty.call(value, field)) {
+        return { path: `${path}.${field}`, errorClass: "required" };
+      }
+    }
+    if (schema.additionalProperties === false) {
+      for (const field of Object.keys(value)) {
+        if (!Object.prototype.hasOwnProperty.call(properties, field)) {
+          // The field name is untrusted model output. Keep diagnostics on the
+          // declared-schema path instead of copying that name into cards,
+          // metrics, tool output, or console traces.
+          return { path: `${path}.*`, errorClass: "unexpected_property" };
+        }
+      }
+    }
+    for (const [field, childSchema] of Object.entries(properties)) {
+      if (!Object.prototype.hasOwnProperty.call(value, field) || !_isPlainObject(childSchema)) continue;
+      const childError = _toolSchemaError(value[field], childSchema, `${path}.${field}`);
+      if (childError) return childError;
+    }
+    return null;
+  }
+  if (type === "array") {
+    if (!Array.isArray(value)) return { path, errorClass: "expected_array" };
+    if (_isPlainObject(schema.items)) {
+      for (let index = 0; index < value.length; index += 1) {
+        const childError = _toolSchemaError(value[index], schema.items, `${path}[${index}]`);
+        if (childError) return childError;
+      }
+    }
+    return null;
+  }
+  if (type === "string") {
+    if (typeof value !== "string") return { path, errorClass: "expected_string" };
+    if (Number.isFinite(schema.minLength) && value.length < Number(schema.minLength)) {
+      return { path, errorClass: "min_length" };
+    }
+    if (typeof schema.pattern === "string" && !(new RegExp(schema.pattern)).test(value)) {
+      return { path, errorClass: "pattern_mismatch" };
+    }
+    return null;
+  }
+  if (type === "number" && (typeof value !== "number" || !Number.isFinite(value))) {
+    return { path, errorClass: "expected_number" };
+  }
+  if (type === "integer" && !Number.isInteger(value)) {
+    return { path, errorClass: "expected_integer" };
+  }
+  if (type === "boolean" && typeof value !== "boolean") {
+    return { path, errorClass: "expected_boolean" };
+  }
+  return null;
+}
+
+/**
+ * Parse and validate tool arguments without coercion. The raw JSON string stays
+ * on the public call event for exact server/history fidelity; only the local
+ * browser executor consumes the parsed object returned here.
+ * @param {unknown} argsJson
+ * @param {Record<string, any>} schema
+ * @returns {{ ok: true, args: Record<string, unknown> } | { ok: false, code: string, path: string, errorClass: string }}
+ */
+export function validateToolArguments(argsJson, schema) {
+  if (typeof argsJson !== "string") {
+    return { ok: false, code: "malformed_json", path: "$", errorClass: "expected_json_string" };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(argsJson);
+  } catch {
+    return { ok: false, code: "malformed_json", path: "$", errorClass: "json_parse_error" };
+  }
+  const error = _toolSchemaError(parsed, schema, "$");
+  if (error) return { ok: false, code: "schema_validation_failed", ...error };
+  if (!_isPlainObject(parsed)) {
+    return { ok: false, code: "schema_validation_failed", path: "$", errorClass: "expected_object" };
+  }
+  return { ok: true, args: parsed };
+}
+
+/**
+ * Build the function output for invalid arguments. It identifies the tool,
+ * field path, and validation class without reproducing user/model-provided
+ * argument values.
+ * @param {string} tool
+ * @param {{ ok: false, code: string, path: string, errorClass: string }} failure
+ */
+export function invalidToolArgumentsOutput(tool, failure) {
+  return JSON.stringify({
+    type: "invalid_tool_arguments",
+    tool,
+    code: failure.code,
+    path: failure.path,
+    error_class: failure.errorClass,
+    message: "The tool arguments were invalid. Submit a new call that matches the declared schema.",
+  });
+}
+
+/**
+ * Prepare the only tool-argument representation the browser may persist or
+ * display. Valid calls expose the schema-validated object; malformed,
+ * schema-invalid, and unknown calls expose content-free failure metadata.
+ * The original argument string remains available only to the protocol event
+ * and validator and must never be handed to a durable UI surface.
+ * @param {unknown} tool
+ * @param {unknown} argsJson
+ * @param {Record<string, any> | null | undefined} schema
+ * @returns {{
+ *   tool: string,
+ *   displayArguments: string,
+ *   validation: { ok: true, args: Record<string, unknown> } |
+ *     { ok: false, code: string, path: string, errorClass: string }
+ * }}
+ */
+export function prepareToolArgumentsForBrowser(tool, argsJson, schema) {
+  const hasSchema = _isPlainObject(schema);
+  const safeTool = hasSchema && typeof tool === "string" && tool ? tool : "unknown_tool";
+  const validation = hasSchema
+    ? validateToolArguments(argsJson, schema)
+    : { ok: false, code: "unknown_tool", path: "$", errorClass: "unknown_tool" };
+  return {
+    tool: safeTool,
+    validation,
+    displayArguments: validation.ok
+      ? JSON.stringify(validation.args)
+      : invalidToolArgumentsOutput(safeTool, validation),
+  };
+}
+
 function _normaliseProfileId(value) {
   return String(value || "")
     .trim()
@@ -1084,13 +1236,13 @@ export class S2sWsRealtimeClient extends EventTarget {
 
     const type = event?.type;
     if (typeof type !== "string") return;
-    // Opt-in event tracing for diagnosing turn/transcript issues. Enable with
+    // Opt-in content-free event tracing for diagnosing turn/transcript issues. Enable with
     // `localStorage.setItem("s2s.debug", "1")` in the browser console.
     if (this._debug) {
       const extra = type.startsWith("conversation.item.input_audio_transcription")
-        ? ` item=${event.item_id} ci=${event.content_index} ${event.delta ?? event.transcript ?? ""}`
+        ? ` item=${event.item_id} ci=${event.content_index} chars=${String(event.delta ?? event.transcript ?? "").length}`
         : type.startsWith("response.")
-          ? ` resp=${event.response_id ?? event.response?.id ?? ""} status=${event.response?.status ?? ""} ${event.transcript ?? ""}`
+          ? ` resp=${event.response_id ?? event.response?.id ?? ""} status=${event.response?.status ?? ""} chars=${String(event.transcript ?? "").length}`
           : "";
       console.debug(`[ws] ${type}${extra}`);
     }
@@ -1283,17 +1435,23 @@ export class S2sWsRealtimeClient extends EventTarget {
 
       case "response.function_call_arguments.done": {
         const name = typeof event.name === "string" ? event.name : "";
-        const args = typeof event.arguments === "string" ? event.arguments : "{}";
+        // Preserve the public argument string exactly. A non-string value is a
+        // malformed call, not an implicit empty object; the browser executor
+        // will return invalid_tool_arguments through the normal result path.
+        const args = typeof event.arguments === "string" ? event.arguments : null;
         const callId = typeof event.call_id === "string" ? event.call_id : "";
-        if (name) {
+        if (name && callId.trim()) {
           this.dispatchEvent(new CustomEvent("toolcall", {
             detail: { name, arguments: args, callId },
           }));
         } else {
-          // A nameless call can't be executed, so no function_call_output is
-          // ever sent and the model would wait forever for a result. The
-          // backend shouldn't emit these; warn loudly rather than stall silently.
-          console.warn(`[ws] function_call_arguments.done with no name (call_id=${callId}); cannot run tool — turn may stall`);
+          // Without both fields there is no safe call/result transaction. Do
+          // not dispatch `toolcall`: that would execute a side effect which
+          // cannot be paired with function_call_output. The UI renders this
+          // fixed, content-free protocol failure instead.
+          const code = name ? "missing_call_id" : "missing_tool_name";
+          this.dispatchEvent(new CustomEvent("tool-protocol-error", { detail: { code } }));
+          console.warn(`[ws] rejected invalid function_call_arguments.done (${code})`);
         }
         break;
       }

@@ -61,14 +61,21 @@ def test_non_empty_final_transcription_still_triggers_legacy_generation():
     assert not should_listen.is_set()
 
 
-def test_non_empty_final_transcription_logs_full_text_at_info(caplog):
-    notifier = _notifier()
-    transcript = "hello " * 30
+def test_transcription_logs_are_content_free(caplog):
+    notifier = _notifier(text_output_queue=Queue())
+    transcript = "PRIVATE FINAL TRANSCRIPT " * 10
 
-    with caplog.at_level(logging.INFO, logger="speech_to_speech.STT.transcription_notifier"):
-        assert list(notifier.process(Transcription(text=transcript, language_code="en"))) == []
+    with caplog.at_level(logging.DEBUG, logger="speech_to_speech.STT.transcription_notifier"):
+        assert list(notifier.process(PartialTranscription(text="PRIVATE PARTIAL TRANSCRIPT", turn_id="turn_1"))) == []
+        assert list(
+            notifier.process(
+                Transcription(text=transcript, language_code="en", turn_id="turn_1", turn_revision=0)
+            )
+        ) == []
 
-    assert "Transcription completed (language=en): " + transcript in caplog.text
+    assert "PRIVATE" not in caplog.text
+    assert "Partial transcription emitted turn=turn_1" in caplog.text
+    assert f"Transcription completed language=en turn=turn_1 rev=0 chars={len(transcript)}" in caplog.text
 
 
 def test_empty_final_transcription_reenables_listening_without_runtime_config():

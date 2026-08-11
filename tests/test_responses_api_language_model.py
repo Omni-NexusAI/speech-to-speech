@@ -7,7 +7,9 @@ from openai import Stream
 from openai.types.realtime.conversation_item import (
     RealtimeConversationItemAssistantMessage,
     RealtimeConversationItemFunctionCallOutput,
+    RealtimeConversationItemUserMessage,
 )
+from openai.types.realtime.realtime_conversation_item_user_message import Content as UserContent
 from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
 from openai.types.responses import (
     Response,
@@ -89,6 +91,19 @@ def _make_request(text="Hi", chat_size=2):
     cfg = _make_runtime_config(chat_size=chat_size)
     cfg.chat.add_item(make_user_message(text))
     return GenerateResponseRequest(runtime_config=cfg)
+
+
+def _add_user_image(chat, text, image_url):
+    return chat.add_item(
+        RealtimeConversationItemUserMessage(
+            type="message",
+            role="user",
+            content=[
+                UserContent(type="input_text", text=text),
+                UserContent(type="input_image", image_url=image_url),
+            ],
+        )
+    )
 
 
 def _make_handler(*, disable_thinking=False, stream=True, cancel_scope=None):
@@ -305,6 +320,30 @@ def test_process_handles_cancellation():
     assert isinstance(outputs[0], EndOfResponse)
 
 
+def test_cancelled_generation_retires_only_images_in_its_input_snapshot():
+    scope = CancelScope()
+    handler = _make_handler(cancel_scope=scope)
+    cfg = _make_runtime_config()
+    consumed = _add_user_image(cfg.chat, "look at this", "data:image/jpeg;base64,OLD")
+    fresh = None
+
+    def fake_create(**kwargs):
+        nonlocal fresh
+        fresh = _add_user_image(cfg.chat, "next frame", "data:image/jpeg;base64,NEW")
+        scope.cancel()
+        return _make_stream([_make_text_delta_event("stale")])
+
+    handler.client = SimpleNamespace(responses=SimpleNamespace(create=fake_create))
+
+    outputs = list(handler.process(GenerateResponseRequest(runtime_config=cfg)))
+
+    assert len(outputs) == 1
+    assert isinstance(outputs[0], EndOfResponse)
+    assert all(part.type != "input_image" for part in consumed.content)
+    assert fresh is not None
+    assert any(part.type == "input_image" for part in fresh.content)
+
+
 def test_responses_api_timing_logs_only_text_chunks():
     handler = object.__new__(ResponsesApiModelHandler)
     handler._times = [0.01]
@@ -351,6 +390,22 @@ def test_generation_error_emits_failed_end_of_response():
     assert "input must not be empty" in eors[0].error
     # No partial output committed; the only thing emitted is the failed EndOfResponse.
     assert all(isinstance(o, EndOfResponse) for o in outputs)
+
+
+def test_generation_error_retires_consumed_camera_image():
+    handler = _make_handler()
+    cfg = _make_runtime_config()
+    consumed = _add_user_image(cfg.chat, "look at this", "data:image/jpeg;base64,OLD")
+
+    def boom(**kwargs):
+        raise RuntimeError("provider failed")
+
+    handler.client = SimpleNamespace(responses=SimpleNamespace(create=boom))
+
+    outputs = list(handler.process(GenerateResponseRequest(runtime_config=cfg)))
+
+    assert outputs[-1].error is not None
+    assert all(part.type != "input_image" for part in consumed.content)
 
 
 def test_empty_context_fails_with_clear_message_without_calling_provider():

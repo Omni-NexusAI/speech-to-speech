@@ -89,9 +89,11 @@ class DirectAssistantResponse(PipelineMessage):
     speech_stopped_at_s: float | None = None
     runtime_config: RuntimeConfig | None = None
     response: RealtimeResponseCreateParams | None = None
+    # True once the direct-audio handler has durably anchored the accepted
+    # semantic user turn and applied any validated in-place text upgrade.
     context_committed: bool = False
-    # A validated user transcript may be finalized before the direct Gemma
-    # answer is complete so persistent history precedes streamed assistant text.
+    # Optional transcript metadata may be finalized for the Realtime UI before
+    # the direct Gemma answer is complete; this flag does not create history.
     transcript_finalized: bool = False
     # Direct-audio responses bypass the normal LLM request object, but must
     # still carry the request generation through LM output and TTS so a

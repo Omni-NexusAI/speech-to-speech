@@ -23,10 +23,12 @@
   out after 15 seconds; any server error before it is fatal, visible, and closes
   the socket so the backend releases the pipeline slot.
 - Send tool output, optional camera image, and one follow-up `response.create` immediately in hosted order. The backend owns the call-ID barrier; never replay a rejected create on a later user turn.
-- Speech stop reserves persistent user chronology. Replace it with validated transcript metadata when available or persistent `[User audio]` when absent; the placeholder is display-only and transcript availability never controls assistant or tool UI.
+- Speech stop reserves persistent visual user chronology. Replace it with validated transcript metadata when available or persistent `[User audio]` when absent; both are UI-only representations. The backend separately owns one semantic user anchor, upgrading audio to validated text when available, and transcript availability never controls assistant or tool UI.
 - The live-transcription setting controls only the temporary floating user bubble. Final user text always updates the persistent conversation panel.
 - Diagnostics label the always-on final stage `Transcription` and show retained history tokens against the context window detected from llama.cpp.
 - Camera preview and Diagnostics should not occupy the same desktop corner; keep the camera self-view clear when diagnostics are open.
+- Reject missing, non-string, wrong-type, and extra tool arguments before execution without displaying raw values. Preserve output/image/single-`response.create` ordering.
+- Render every real camera invocation as a distinct generation-keyed card, including unavailable captures. Requests about the current view or what changed require a fresh snapshot; never imply that a stale frame is live.
 - Settings list every configured TTS provider even while unavailable. Provider
   changes apply to the next conversation, and an unavailable selected provider
   blocks start without silent fallback.

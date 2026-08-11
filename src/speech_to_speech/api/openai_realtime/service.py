@@ -622,7 +622,13 @@ class RealtimeService:
         cfg = st.runtime_config
         transcript = event.transcript
         context_transcript = None if event.display_only else transcript
-        if context_transcript and not event.context_committed:
+        if event.direct_audio_completed:
+            # The direct-audio handler owns the accepted semantic user item,
+            # including its in-place upgrade from audio to validated text, and
+            # its assistant/tool history. This event only finalizes the visual
+            # transcript row and must not mutate that single durable anchor.
+            st.speculative_user_item_id = None
+        elif context_transcript and not event.context_committed:
             if same_speculative_turn and st.speculative_user_item_id:
                 replaced = cfg.chat.replace_user_message_text(st.speculative_user_item_id, context_transcript)
                 if not replaced:
@@ -642,9 +648,10 @@ class RealtimeService:
             st.speculative_user_turn_revision = event.turn_revision
             st.speculative_user_speech_stopped_at_s = event.speech_stopped_at_s
 
-        # Direct Gemma commits complete user/assistant/tool history itself.
-        # Publish the authoritative tokenized value from the service rather
-        # than a partial stats-only metric from a pipeline handler.
+        # Direct Gemma commits one accepted semantic user item before any
+        # assistant/tool state, upgrading audio to validated text when present.
+        # Publish the authoritative tokenized value from the service rather than
+        # a partial stats-only pipeline metric.
         if self._state(conn_id).runtime_config.model_endpoint.context_window is not None:
             events.append(self.context_metric(conn_id, "committed" if event.context_committed else "updated"))
 

@@ -196,6 +196,16 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             return True
         return self.speculative_turns.is_latest_after_reopen_grace(turn_id, turn_revision)
 
+    @staticmethod
+    def _log_generation_summary(ctx: StreamContext) -> None:
+        """Log generation shape without assistant or tool-call content."""
+
+        logger.debug(
+            "Legacy LLM generation summary assistant_chars=%d tool_calls=%d",
+            len(ctx.generated_text),
+            len(ctx.tools),
+        )
+
     @abstractmethod
     def _load_model(
         self,
@@ -574,8 +584,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             if commit_allowed:
                 original_chat.strip_images(consumed_image_ids)
                 original_chat.trim_if_needed(self.compactor)
-            logger.debug("Clean text: %s", ctx.generated_text)
-            logger.info(f"Tools: {ctx.tools}")
+            self._log_generation_summary(ctx)
 
             if turn_output_allowed and ctx.printable_text.strip():
                 yield LLMResponseChunk(

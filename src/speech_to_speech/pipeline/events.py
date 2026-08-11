@@ -61,6 +61,9 @@ class TranscriptionCompletedEvent(PipelineEvent):
     turn_id: str | None = None
     turn_revision: int | None = None
     speech_stopped_at_s: float | None = Field(default=None, exclude=True)
+    # Direct audio sets this after persisting the accepted semantic user item and
+    # optionally upgrading it to validated text; the Realtime service must not
+    # infer history ownership from this UI event.
     context_committed: bool = Field(default=False, exclude=True)
     # Direct-audio mode may publish a UI-only placeholder when Gemma omits
     # optional transcript metadata. It must never enter model context.

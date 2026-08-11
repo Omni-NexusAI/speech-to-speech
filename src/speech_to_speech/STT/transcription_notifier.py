@@ -81,7 +81,7 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
                             turn_revision=transcription.turn_revision,
                         )
                     )
-            if self.runtime_config is not None and transcript:
+            if self.runtime_config is not None and transcript and not transcription.context_committed:
                 self.runtime_config.chat.add_item(make_user_message(transcript))
             if transcription.is_final:
                 self._finalized_direct_transcripts.discard((transcription.turn_id, transcription.turn_revision))
@@ -114,7 +114,12 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
                         turn_revision=transcription.turn_revision,
                     )
                 )
-                logger.debug("Partial transcription: %s", str(transcription.text)[:80])
+                logger.debug(
+                    "Partial transcription emitted turn=%s rev=%s chars=%d",
+                    transcription.turn_id,
+                    transcription.turn_revision,
+                    len(str(transcription.text)),
+                )
             return
 
         if isinstance(transcription, Transcription):
@@ -153,9 +158,20 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
             return
 
         if language_code:
-            logger.info("Transcription completed (language=%s): %s", language_code, transcript)
+            logger.info(
+                "Transcription completed language=%s turn=%s rev=%s chars=%d",
+                language_code,
+                turn_id,
+                turn_revision,
+                len(transcript),
+            )
         else:
-            logger.info("Transcription completed: %s", transcript)
+            logger.info(
+                "Transcription completed turn=%s rev=%s chars=%d",
+                turn_id,
+                turn_revision,
+                len(transcript),
+            )
 
         if self.runtime_config is not None:
             self.runtime_config.chat.add_item(make_user_message(transcript))

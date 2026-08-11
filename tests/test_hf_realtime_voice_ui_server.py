@@ -698,7 +698,7 @@ def test_local_ui_teardown_isolates_closed_client_events():
 
     assert "if (client !== c) return;" in main_js
     assert "const closingClient = client;\n  client = null;" in main_js
-    assert "runTool(c, name, args, callId)" in main_js
+    assert "runTool(c, name, callId, lifecycle, prepared)" in main_js
     assert 'if (this._closed && status !== "closed") return;' in client_js
     assert 'this._captureNode?.port.postMessage({ kind: "enable", value: false });' in client_js
     assert 'this._invalidatePlayback("stop")' in client_js

@@ -245,15 +245,16 @@ export class ChatView {
   }
 
   /**
-   * Append a tool-call row to the conversation. We only add it once the tool
-   * has run, so the expandable toggle carries BOTH the call input and its result.
-   * @param {string} name @param {string} argsJson @param {string} output
+   * Append a durable tool-call row immediately; its output and optional camera
+   * frame are filled into the same card when execution finishes.
+   * @param {string} name @param {unknown} argsJson @param {string} output
+   * @param {{ captureGeneration: number, requestedAtMs: number, callId: string, captureStatus: string, outputStatus: string } | undefined} [lifecycle]
    */
-  _appendHistTool(name, argsJson, output) {
+  _appendHistTool(name, argsJson, output, lifecycle) {
     const empty = this._chatHistory.querySelector(".chat-empty");
     if (empty) empty.remove();
-    let pretty = argsJson;
-    try { pretty = JSON.stringify(JSON.parse(argsJson), null, 2); } catch {}
+    let pretty = typeof argsJson === "string" ? argsJson : "(invalid non-string arguments)";
+    try { pretty = JSON.stringify(JSON.parse(pretty), null, 2); } catch {}
     const el = document.createElement("div");
     el.className = "hist-msg tool";
     el.innerHTML = `
@@ -263,6 +264,7 @@ export class ChatView {
         <span class="hist-tool-name">${escHtml(name)}</span>
         <svg class="hist-tool-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
+      <div class="hist-tool-meta" hidden></div>
       <div class="hist-tool-body">
         <div class="hist-tool-label">Input</div>
         <div class="hist-tool-block">${escHtml(pretty)}</div>
@@ -272,6 +274,7 @@ export class ChatView {
     `;
     const header = /** @type {HTMLButtonElement} */ (el.querySelector(".hist-tool-header"));
     const body = /** @type {HTMLDivElement} */ (el.querySelector(".hist-tool-body"));
+    this._updateToolLifecycle(el, lifecycle);
     header.addEventListener("click", () => {
       const expanded = header.getAttribute("aria-expanded") === "true";
       header.setAttribute("aria-expanded", String(!expanded));
@@ -280,6 +283,39 @@ export class ChatView {
     this._chatHistory.appendChild(el);
     this._scrollToBottom();
     return el;
+  }
+
+  /**
+   * A camera generation is part of the history identity so every actual call
+   * receives its own durable card, even if the backend omits or repeats a call ID.
+   * @param {string} callId
+   * @param {{ captureGeneration?: number } | undefined} lifecycle
+   */
+  _toolHistoryKey(callId, lifecycle) {
+    if (Number.isFinite(lifecycle?.captureGeneration)) {
+      return `camera:${lifecycle.captureGeneration}:${callId || "missing-call-id"}`;
+    }
+    return callId;
+  }
+
+  /**
+   * Render content-free camera lifecycle information. Never include argument,
+   * transcript, image, or tool-result content in this metadata line.
+   * @param {HTMLElement} el
+   * @param {{ captureGeneration: number, requestedAtMs: number, callId: string, captureStatus: string, outputStatus: string } | undefined} lifecycle
+   */
+  _updateToolLifecycle(el, lifecycle) {
+    if (!lifecycle) return;
+    el.dataset.captureGeneration = String(lifecycle.captureGeneration);
+    el.dataset.callId = lifecycle.callId || "";
+    const meta = /** @type {HTMLElement | null} */ (el.querySelector(".hist-tool-meta"));
+    if (!meta) return;
+    const requested = Number.isFinite(lifecycle.requestedAtMs)
+      ? new Date(lifecycle.requestedAtMs).toLocaleTimeString()
+      : "time unavailable";
+    const call = lifecycle.callId || "missing call ID";
+    meta.hidden = false;
+    meta.textContent = `Capture #${lifecycle.captureGeneration} | ${requested} | ${call} | ${lifecycle.captureStatus} | output ${lifecycle.outputStatus}`;
   }
 
   /** Tag an assistant history row as interrupted (user barged in mid-reply).
@@ -293,17 +329,16 @@ export class ChatView {
     hist.appendChild(note);
   }
 
-  /** Render a captured webcam frame in the transcript (the camera tool result).
-   *  @param {string} dataUrl */
-  _appendHistImage(dataUrl) {
-    const empty = this._chatHistory.querySelector(".chat-empty");
-    if (empty) empty.remove();
-    const el = document.createElement("div");
-    el.className = "hist-msg tool";
-    el.innerHTML = `<div class="hist-role">Snapshot</div><img class="hist-image" alt="Webcam snapshot sent to the model" />`;
-    const img = /** @type {HTMLImageElement} */ (el.querySelector("img"));
+  /** Render a captured webcam frame inside its exact tool card.
+   *  @param {string} dataUrl @param {HTMLElement} toolCard */
+  _appendHistImage(dataUrl, toolCard) {
+    const body = toolCard.querySelector(".hist-tool-body") || toolCard;
+    const frame = document.createElement("div");
+    frame.className = "hist-tool-snapshot";
+    frame.innerHTML = `<div class="hist-tool-label">Captured frame</div><img class="hist-image" alt="Webcam snapshot sent to the model" />`;
+    const img = /** @type {HTMLImageElement} */ (frame.querySelector("img"));
     img.src = dataUrl;
-    this._chatHistory.appendChild(el);
+    body.appendChild(frame);
     this._scrollToBottom();
   }
 
@@ -332,7 +367,7 @@ export class ChatView {
    * @param {{ role: "user" | "assistant"; text: string; partial: boolean; itemId?: string; responseId?: string }} d
    */
   onTranscript(d, options = {}) {
-    if (DEBUG) console.debug(`[ui] transcript role=${d.role} partial=${d.partial} item=${d.itemId} resp=${d.responseId} text=${JSON.stringify(d.text)}`);
+    if (DEBUG) console.debug(`[ui] transcript role=${d.role} partial=${d.partial} item=${d.itemId} resp=${d.responseId} chars=${String(d.text || "").length}`);
 
     if (d.role === "user") {
       // Group by item_id: a speculative continuation reuses the same id, so it
@@ -426,27 +461,51 @@ export class ChatView {
   }
 
   /** The model called a tool — reserve its durable history position immediately.
-   *  @param {string} name @param {string} argsJson @param {string} callId */
-  onToolCall(name, argsJson, callId) {
+   *  @param {string} name @param {unknown} argsJson @param {string} callId
+   *  @param {{ captureGeneration: number, requestedAtMs: number, callId: string, captureStatus: string, outputStatus: string } | undefined} [lifecycle] */
+  onToolCall(name, argsJson, callId, lifecycle) {
     this._bumpDismiss(this._spawnBubble("tool", name));
-    if (callId && !this._toolHistByCall.has(callId)) {
+    const historyKey = this._toolHistoryKey(callId, lifecycle);
+    if (lifecycle && historyKey && !this._toolHistByCall.has(historyKey)) {
+      this._toolHistByCall.set(historyKey, this._appendHistTool(name, argsJson, "Running...", lifecycle));
+    }
+    if (!lifecycle && callId && !this._toolHistByCall.has(callId)) {
       this._toolHistByCall.set(callId, this._appendHistTool(name, argsJson, "Running…"));
     }
     this._markUnread();
   }
 
+  /** Render a non-executable, content-free tool protocol failure. Missing call
+   * IDs cannot be paired with function output and must never reach the tool
+   * executor or trigger response.create.
+   * @param {string} code */
+  onToolProtocolFailure(code) {
+    const safeCode = code === "missing_call_id" ? "missing_call_id" : "missing_tool_name";
+    const output = JSON.stringify({
+      type: "invalid_tool_call",
+      code: safeCode,
+      message: "The tool call was rejected because its protocol identity was incomplete.",
+    });
+    this._bumpDismiss(this._spawnBubble("tool", "tool_protocol"));
+    this._appendHistTool("tool_protocol", "{}", output);
+    this._markUnread();
+  }
+
   /** The tool finished — update its durable card (and any captured image).
-   *  @param {string} name @param {string} argsJson @param {string} output @param {string} [image] @param {string} [callId] */
-  onToolResult(name, argsJson, output, image, callId = "") {
-    const existing = callId ? this._toolHistByCall.get(callId) : null;
+   *  @param {string} name @param {unknown} argsJson @param {string} output @param {string} [image] @param {string} [callId]
+   *  @param {{ captureGeneration: number, requestedAtMs: number, callId: string, captureStatus: string, outputStatus: string } | undefined} [lifecycle] */
+  onToolResult(name, argsJson, output, image, callId = "", lifecycle) {
+    const historyKey = this._toolHistoryKey(callId, lifecycle);
+    let existing = historyKey ? this._toolHistByCall.get(historyKey) : null;
     const outputEl = existing?.querySelector(".hist-tool-output");
     if (outputEl) {
       outputEl.textContent = output || "(no output)";
-      this._toolHistByCall.delete(callId);
+      this._updateToolLifecycle(existing, lifecycle);
+      this._toolHistByCall.delete(historyKey);
     } else {
-      this._appendHistTool(name, argsJson, output);
+      existing = this._appendHistTool(name, argsJson, output, lifecycle);
     }
-    if (image) this._appendHistImage(image); // show the captured frame below the call
+    if (image && existing) this._appendHistImage(image, existing);
     this._markUnread();
   }
 }

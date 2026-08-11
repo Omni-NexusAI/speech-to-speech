@@ -12,6 +12,10 @@
 
 - Local realtime defaults retain 30 complete turns with compaction disabled; context is session-scoped and resets with the WebSocket/backend.
 - VAD is the only direct-audio admission boundary. A completed accepted turn always reaches Gemma once; transcript metadata is optional and must never gate assistant text, tools, or response completion. The live-transcription toggle controls only the temporary speaking bubble.
+- Each accepted direct-audio turn creates exactly one semantic user anchor
+  before assistant or tool state. Upgrade that anchor in place to validated
+  transcript text when available; otherwise retain its session-only historical
+  `input_audio`. The visual `[User audio]` fallback never enters model history.
 - Context diagnostics report retained history tokens against the live llama.cpp context window; turn retention remains a separate 30-turn policy.
 - `scripts/local_realtime.ps1` is the managed background entry point; foreground launchers remain available for raw-console debugging.
 - Model provider selection is conversation-scoped. Remote completely replaces local Gemma operations without fallback; TTS selection remains independent.

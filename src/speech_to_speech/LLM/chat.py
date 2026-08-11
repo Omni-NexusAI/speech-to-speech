@@ -62,6 +62,16 @@ def _ensure_id(value: str | None, prefix: str) -> str:
     return value
 
 
+def _tool_arguments_envelope(value: Any) -> dict[str, Any]:
+    """Return structured arguments or a content-free invalid marker."""
+
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+    except (json.JSONDecodeError, TypeError):
+        return {"error": "invalid_tool_arguments"}
+    return parsed if isinstance(parsed, dict) else {"error": "invalid_tool_arguments"}
+
+
 SupportedItem = Union[
     RealtimeConversationItemSystemMessage,
     RealtimeConversationItemUserMessage,
@@ -100,6 +110,11 @@ class Chat:
         # is evicted -- or, with a compactor, summarized in the background.
         self.buffer: list[SupportedItem] = []
         self._pending_tool_calls: dict[str, RealtimeConversationItemFunctionCall] = {}
+        # IDs remain reserved for the session even after their turns are
+        # trimmed, preventing a later provider response from aliasing an old
+        # browser tool transaction.
+        self._seen_call_ids: set[str] = set()
+        self._tool_call_assistant_ids: dict[str, str | None] = {}
         self._user_turn_count: int = 0
         self._trim_count: int = 0
 
@@ -118,11 +133,15 @@ class Chat:
         """Remove items from the front until the next user message boundary."""
         if not self.buffer:
             return
-        first = self.buffer.pop(0)
+        removed = [self.buffer.pop(0)]
+        first = removed[0]
         if isinstance(first, RealtimeConversationItemUserMessage):
             self._user_turn_count -= 1
         while self.buffer and not isinstance(self.buffer[0], RealtimeConversationItemUserMessage):
-            self.buffer.pop(0)
+            removed.append(self.buffer.pop(0))
+        for item in removed:
+            if isinstance(item, RealtimeConversationItemFunctionCall) and item.call_id:
+                self._tool_call_assistant_ids.pop(item.call_id, None)
         self._trim_count += 1
 
     def _has_call_id_in_buffer(self, call_id: str) -> bool:
@@ -140,6 +159,27 @@ class Chat:
                 entry.status = "completed" if status is None else status
                 return
 
+    def _assistant_has_completed_call(self, assistant_id: str) -> bool:
+        """Whether one completed call/result pair follows this preamble."""
+
+        in_response = False
+        call_ids: set[str] = set()
+        for item in self.buffer:
+            if isinstance(item, RealtimeConversationItemAssistantMessage):
+                if in_response:
+                    break
+                in_response = item.id == assistant_id
+                continue
+            if not in_response:
+                continue
+            if isinstance(item, RealtimeConversationItemUserMessage):
+                break
+            if isinstance(item, RealtimeConversationItemFunctionCall) and item.call_id:
+                call_ids.add(item.call_id)
+            elif isinstance(item, RealtimeConversationItemFunctionCallOutput) and item.call_id in call_ids:
+                return True
+        return False
+
     def append_tool_output(self, call_id: str, output_item: RealtimeConversationItemFunctionCallOutput) -> None:
         """Append a ``function_call_output``, re-injecting its ``function_call`` if evicted.
 
@@ -152,28 +192,54 @@ class Chat:
             self._append_tool_output_locked(call_id, output_item)
 
     def discard_pending_tool_calls(self, call_ids: set[str]) -> None:
-        """Drop unresolved calls that were superseded by newer user speech."""
+        """Drop unresolved calls while retaining the accepted user/completed pairs."""
         if not call_ids:
             return
         with self._lock:
+            pending_to_discard = call_ids & set(self._pending_tool_calls)
+            candidate_assistant_ids = {
+                self._tool_call_assistant_ids.get(call_id)
+                for call_id in pending_to_discard
+            }
             self._pending_tool_calls = {
                 call_id: call
                 for call_id, call in self._pending_tool_calls.items()
-                if call_id not in call_ids
+                if call_id not in pending_to_discard
             }
             self.buffer = [
                 item
                 for item in self.buffer
                 if not (
                     isinstance(item, RealtimeConversationItemFunctionCall)
-                    and item.call_id in call_ids
+                    and item.call_id in pending_to_discard
                 )
             ]
+            for call_id in pending_to_discard:
+                self._tool_call_assistant_ids.pop(call_id, None)
+            for assistant_id in candidate_assistant_ids - {None}:
+                remaining_associated = {
+                    call_id
+                    for call_id, mapped_assistant_id in self._tool_call_assistant_ids.items()
+                    if mapped_assistant_id == assistant_id
+                }
+                has_pending = any(call_id in self._pending_tool_calls for call_id in remaining_associated)
+                has_completed = any(
+                    isinstance(item, RealtimeConversationItemFunctionCall)
+                    and item.call_id in remaining_associated
+                    for item in self.buffer
+                ) or self._assistant_has_completed_call(assistant_id)
+                if not has_pending and not has_completed:
+                    self.buffer = [
+                        item
+                        for item in self.buffer
+                        if not (isinstance(item, RealtimeConversationItemAssistantMessage) and item.id == assistant_id)
+                    ]
 
     def _append_tool_output_locked(self, call_id: str, output_item: RealtimeConversationItemFunctionCallOutput) -> None:
         """Body of :meth:`append_tool_output`. Caller must hold ``_lock``."""
         if self._has_call_id_in_buffer(call_id):
             self._pending_tool_calls.pop(call_id, None)
+            self._tool_call_assistant_ids.pop(call_id, None)
             self._mark_call_completed(call_id, output_item.status)
             self.buffer.append(output_item)
             return
@@ -181,6 +247,7 @@ class Chat:
         if call_id in self._pending_tool_calls:
             logger.info("Re-injecting evicted function_call for call_id=%s", call_id)
             fc = self._pending_tool_calls.pop(call_id)
+            self._tool_call_assistant_ids.pop(call_id, None)
             fc.status = "completed" if output_item.status is None else output_item.status
             self.buffer.append(fc)
             self.buffer.append(output_item)
@@ -214,11 +281,13 @@ class Chat:
                 item.content = [
                     p
                     for p in item.content
-                    if (p.type == "input_text" and p.text) or (p.type == "input_image" and p.image_url)
+                    if (p.type == "input_text" and p.text)
+                    or (p.type == "input_image" and p.image_url)
+                    or (p.type == "input_audio" and p.audio)
                 ]
                 if not item.content:
                     raise ChatItemError(
-                        "Message has no supported content. Supported modalities: input_text, input_image."
+                        "Message has no supported content. Supported modalities: input_text, input_image, input_audio."
                     )
                 self.buffer.append(item)
                 self._user_turn_count += 1
@@ -235,6 +304,9 @@ class Chat:
             elif isinstance(item, RealtimeConversationItemFunctionCall):
                 item.id = _ensure_id(item.id, "fc")
                 item.call_id = _ensure_id(item.call_id, "call")
+                if item.call_id in self._seen_call_ids:
+                    raise ChatItemError(f"Duplicate function call_id {item.call_id!r} in conversation history.")
+                self._seen_call_ids.add(item.call_id)
                 self._pending_tool_calls[item.call_id] = item
                 logger.debug("Added function_call to chat (call_id=%s)", item.call_id)
 
@@ -256,6 +328,69 @@ class Chat:
                     self._evict_oldest_turn()
 
             return item
+
+    def commit_assistant_response(
+        self,
+        user_item_id: str,
+        assistant_text: str,
+        function_calls: list[RealtimeConversationItemFunctionCall],
+    ) -> bool:
+        """Atomically append a completed response for an accepted user turn.
+
+        The user item is persisted before model generation. Assistant prose and
+        tool calls are validated here before any response-side mutation, so a
+        cancelled or invalid response cannot leave partial assistant history.
+        Tool outputs are appended later through :meth:`append_tool_output`.
+        """
+
+        with self._lock:
+            if not any(
+                isinstance(item, RealtimeConversationItemUserMessage) and item.id == user_item_id
+                for item in self.buffer
+            ):
+                raise ChatItemError(f"Accepted user item {user_item_id!r} is not present in conversation history.")
+
+            assistant: RealtimeConversationItemAssistantMessage | None = None
+            if assistant_text:
+                assistant = make_assistant_message(assistant_text)
+                assistant.id = _ensure_id(assistant.id, "msg")
+
+            prepared_calls: list[RealtimeConversationItemFunctionCall] = []
+            response_call_ids: set[str] = set()
+            for function_call in function_calls:
+                function_call.id = _ensure_id(function_call.id, "fc")
+                function_call.call_id = _ensure_id(function_call.call_id, "call")
+                if function_call.call_id in self._seen_call_ids or function_call.call_id in response_call_ids:
+                    raise ChatItemError(
+                        f"Duplicate function call_id {function_call.call_id!r} in conversation history."
+                    )
+                response_call_ids.add(function_call.call_id)
+                prepared_calls.append(function_call)
+
+            if assistant is not None:
+                self.buffer.append(assistant)
+            for function_call in prepared_calls:
+                assert function_call.call_id is not None
+                self._seen_call_ids.add(function_call.call_id)
+                self._pending_tool_calls[function_call.call_id] = function_call
+                self._tool_call_assistant_ids[function_call.call_id] = assistant.id if assistant is not None else None
+                self.buffer.append(function_call)
+            return assistant is not None or bool(prepared_calls)
+
+    def canonical_call_id(self, value: str | None, additional_used: set[str] | None = None) -> str:
+        """Select a Realtime-shaped call ID unique across this session."""
+
+        with self._lock:
+            base = value if value and value.startswith("call_") else f"call_{value}" if value else _generate_id("call")
+            used = self._seen_call_ids | set(additional_used or ())
+            if base not in used:
+                return base
+            suffix = 1
+            candidate = f"{base}_{suffix}"
+            while candidate in used:
+                suffix += 1
+                candidate = f"{base}_{suffix}"
+            return candidate
 
     def trim_if_needed(self, compactor: CompactFn | None = None) -> None:
         """Enforce the size limit after a generation completes. Fires when
@@ -289,6 +424,18 @@ class Chat:
                     continue
                 item.content = [UserContent(type="input_text", text=text)]
                 logger.debug("Replaced speculative user message %s", item_id)
+                return True
+        return False
+
+    def replace_user_message_audio(self, item_id: str, audio: str) -> bool:
+        """Replace one accepted user's content with a cumulative mono-WAV anchor."""
+
+        with self._lock:
+            for item in self.buffer:
+                if not isinstance(item, RealtimeConversationItemUserMessage) or item.id != item_id:
+                    continue
+                item.content = [UserContent(type="input_audio", audio=audio)]
+                logger.debug("Replaced accepted user audio %s", item_id)
                 return True
         return False
 
@@ -341,6 +488,14 @@ class Chat:
                         if user_part.image_url is not None:
                             img["image_url"] = user_part.image_url
                         content.append(img)
+                    elif user_part.type == "input_audio" and user_part.audio:
+                        # The installed Responses API message-content contract
+                        # does not include input_audio. Never omit the semantic
+                        # user turn and leave its assistant/tool items orphaned.
+                        raise ChatItemError(
+                            "Responses API serialization does not support retained input_audio history; "
+                            "use a provider with historical audio support or wait for a validated transcript."
+                        )
                 if content:
                     result.append(ResponseMessage(content=content, role="user", type="message"))
             elif isinstance(item, RealtimeConversationItemAssistantMessage):
@@ -391,8 +546,8 @@ class Chat:
         """Serialize the full chat for HuggingFace transformers ``apply_chat_template``.
 
         User messages with only text produce a plain string ``content`` value.
-        User messages containing images keep ``content`` as a list of dicts so
-        VLM pipelines can process them.
+        User messages containing images or session-only WAV history keep
+        ``content`` as a multimodal list.
         """
         with self._lock:
             messages: list[TransformersChatMessage] = []
@@ -401,11 +556,22 @@ class Chat:
                 messages.append(TransformersSystemMessage(content=text))
             for item in self.buffer:
                 if isinstance(item, RealtimeConversationItemUserMessage):
-                    has_images = any(p.type == "input_image" for p in item.content)
-                    if has_images:
-                        messages.append(
-                            TransformersUserMessage(content=[p.model_dump(exclude_none=True) for p in item.content])
-                        )
+                    has_multimodal = any(p.type in {"input_image", "input_audio"} for p in item.content)
+                    if has_multimodal:
+                        content: list[dict[str, Any]] = []
+                        for part in item.content:
+                            if part.type == "input_text" and part.text:
+                                content.append({"type": "input_text", "text": part.text})
+                            elif part.type == "input_image" and part.image_url:
+                                content.append(part.model_dump(exclude_none=True))
+                            elif part.type == "input_audio" and part.audio:
+                                content.append(
+                                    {
+                                        "type": "input_audio",
+                                        "input_audio": {"data": part.audio, "format": "wav"},
+                                    }
+                                )
+                        messages.append(TransformersUserMessage(content=content))
                     else:
                         text = " ".join(p.text for p in item.content if p.type == "input_text" and p.text)
                         messages.append(TransformersUserMessage(content=text))
@@ -414,11 +580,7 @@ class Chat:
                     messages.append(TransformersAssistantMessage(content=text))
                 elif isinstance(item, RealtimeConversationItemFunctionCall):
                     assert item.call_id is not None and item.call_id != ""
-                    args: Any = item.arguments
-                    try:
-                        args = json.loads(args) if isinstance(args, str) else args
-                    except (json.JSONDecodeError, TypeError):
-                        args = {}
+                    args = _tool_arguments_envelope(item.arguments)
                     messages.append(
                         TransformersFunctionCallMessage(
                             tool_calls=[
@@ -455,6 +617,8 @@ class Chat:
             clone.init_chat_message = self.init_chat_message
             clone.buffer = list(self.buffer)
             clone._pending_tool_calls = dict(self._pending_tool_calls)
+            clone._seen_call_ids = set(self._seen_call_ids)
+            clone._tool_call_assistant_ids = dict(self._tool_call_assistant_ids)
             clone._user_turn_count = self._user_turn_count
             clone._trim_count = self._trim_count
             return clone
@@ -471,9 +635,15 @@ class Chat:
             for item in self.buffer:
                 if isinstance(item, RealtimeConversationItemUserMessage):
                     content = [
-                        part.text if part.type == "input_text" else "<image>"
+                        part.text
+                        if part.type == "input_text"
+                        else "<image>"
+                        if part.type == "input_image"
+                        else "<audio:wav>"
                         for part in item.content
-                        if (part.type == "input_text" and part.text) or part.type == "input_image"
+                        if (part.type == "input_text" and part.text)
+                        or part.type == "input_image"
+                        or (part.type == "input_audio" and part.audio)
                     ]
                     entries.append({"role": "user", "content": content})
                 elif isinstance(item, RealtimeConversationItemAssistantMessage):
@@ -482,17 +652,33 @@ class Chat:
                     )
                 elif isinstance(item, RealtimeConversationItemFunctionCall):
                     entries.append(
-                        {"role": "tool_call", "name": item.name, "arguments": item.arguments, "call_id": item.call_id}
+                        {
+                            "role": "tool_call",
+                            "name": item.name,
+                            "arguments": _tool_arguments_envelope(item.arguments),
+                            "call_id": item.call_id,
+                        }
                     )
                 elif isinstance(item, RealtimeConversationItemFunctionCallOutput):
-                    entries.append({"role": "tool_output", "output": item.output, "call_id": item.call_id})
+                    entries.append(
+                        {
+                            "role": "tool_output",
+                            "output": f"<tool_output:chars={len(item.output)}>",
+                            "call_id": item.call_id,
+                        }
+                    )
             buffered_calls = {
                 item.call_id for item in self.buffer if isinstance(item, RealtimeConversationItemFunctionCall)
             }
             for call_id, item in self._pending_tool_calls.items():
                 if call_id not in buffered_calls:
                     entries.append(
-                        {"role": "tool_call", "name": item.name, "arguments": item.arguments, "call_id": call_id}
+                        {
+                            "role": "tool_call",
+                            "name": item.name,
+                            "arguments": _tool_arguments_envelope(item.arguments),
+                            "call_id": call_id,
+                        }
                     )
             return json.dumps(entries, ensure_ascii=False, separators=(",", ":")) if entries else ""
 
@@ -515,6 +701,8 @@ class Chat:
             self.buffer = []
             self.init_chat_message = None
             self._pending_tool_calls = {}
+            self._seen_call_ids = set()
+            self._tool_call_assistant_ids = {}
             self._user_turn_count = 0
             self._trim_count = 0
 
@@ -549,13 +737,24 @@ class Chat:
         request was sent). This leaves intact an image a fast client injected
         mid-generation for the *next* turn, which the current response never saw.
         Without *only_ids*, every image is stripped.
+
+        An image-only message is a transient request attachment rather than a
+        durable empty semantic turn. Remove that item after its image is retired
+        and keep the user-turn counter aligned with the actual buffer.
         """
         with self._lock:
+            retained: list[SupportedItem] = []
             for item in self.buffer:
                 if isinstance(item, RealtimeConversationItemUserMessage):
                     if only_ids is not None and item.id not in only_ids:
+                        retained.append(item)
                         continue
                     item.content = [p for p in item.content if p.type != "input_image"]
+                    if not item.content:
+                        self._user_turn_count = max(0, self._user_turn_count - 1)
+                        continue
+                retained.append(item)
+            self.buffer = retained
 
     # ── Compaction internals ──────────────────────────────────
 
@@ -761,6 +960,16 @@ def make_user_message(text: str) -> RealtimeConversationItemUserMessage:
         type="message",
         role="user",
         content=[UserContent(type="input_text", text=text)],
+    )
+
+
+def make_user_audio_message(wav_base64: str) -> RealtimeConversationItemUserMessage:
+    """Create a session-only accepted user turn backed by the original mono WAV."""
+
+    return RealtimeConversationItemUserMessage(
+        type="message",
+        role="user",
+        content=[UserContent(type="input_audio", audio=wav_base64)],
     )
 
 

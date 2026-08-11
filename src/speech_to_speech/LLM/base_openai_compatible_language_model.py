@@ -106,7 +106,7 @@ class _GenState(BaseModel):
 
     tools: list[ResponseFunctionToolCall] = Field(default_factory=list)
     pending: list[SupportedItem] = Field(default_factory=list)
-    clean_text: str = ""  # filtered text, kept only for the debug log
+    clean_text: str = ""  # filtered text, retained for content-free length diagnostics
     input_tokens: int = 0
     output_tokens: int = 0
 
@@ -372,6 +372,17 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             chat.add_item(fc_item)
         yield self._chunk(turn, tools=[item])
 
+    @staticmethod
+    def _log_generation_summary(state: _GenState, *, mode: str) -> None:
+        """Log generation shape without assistant or tool-call content."""
+
+        logger.debug(
+            "LLM generation summary mode=%s assistant_chars=%d tool_calls=%d",
+            mode,
+            len(state.clean_text),
+            len(state.tools),
+        )
+
     # â”€â”€ consumption â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€--
 
     def _consume_streaming(self, events: Iterator[ProviderEvent], state: _GenState, turn: _Turn) -> Iterator[LLMOut]:
@@ -451,9 +462,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 if self._generation_is_stale(turn.gen):
                     logger.info("LLM generation cancelled (interruption)")
                 else:
-                    logger.debug(f"Clean text: {state.clean_text}")
                     yield from _flush(sentence_batch)
-            logger.info(f"Tools: {state.tools}")
+            self._log_generation_summary(state, mode="streaming")
 
     def _consume_nonstreaming(self, events: Iterator[ProviderEvent], state: _GenState, turn: _Turn) -> Iterator[LLMOut]:
         if self._generation_is_stale(turn.gen) or not self._turn_is_latest(turn.turn_id, turn.turn_revision):
@@ -481,8 +491,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     and self._turn_output_allowed(turn.turn_id, turn.turn_revision)
                 ):
                     yield self._chunk(turn, text=out)
-        logger.debug(f"Clean text: {state.clean_text}")
-        logger.info(f"Tools: {state.tools}")
+        self._log_generation_summary(state, mode="nonstreaming")
 
     # â”€â”€ orchestration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -576,6 +585,14 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 except Exception:
                     pass
 
+        # A camera frame is a point-in-time request attachment. Once this model
+        # operation terminates, retire exactly the images captured in its input
+        # snapshot even when the request failed or was cancelled. Images added
+        # concurrently for a later turn are not in ``consumed_image_ids`` and
+        # therefore remain available to that later operation.
+        if not is_out_of_band(turn.response) and consumed_image_ids:
+            original_chat.strip_images(consumed_image_ids)
+
         if (
             error_message is None
             and not self._generation_is_stale(turn.gen)
@@ -588,7 +605,6 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 # written eagerly in _record_tool_call; only trailing items remain.
                 for item in state.pending:
                     original_chat.add_item(item)
-                original_chat.strip_images(consumed_image_ids)
                 original_chat.trim_if_needed(self.compactor)
             if state.input_tokens or state.output_tokens:
                 yield TokenUsage(

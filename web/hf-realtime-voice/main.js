@@ -16,9 +16,12 @@
  * @typedef {"idle" | "connecting" | "queued" | "your-turn" | "listening" | "user-speaking" | "processing" | "ai-speaking" | "error"} AppState
  */
 
-import { S2sWsRealtimeClient } from "./ws/s2s-ws-client.js?v=15-audible-lifecycle";
+import {
+  S2sWsRealtimeClient,
+  prepareToolArgumentsForBrowser,
+} from "./ws/s2s-ws-client.js?v=17-tool-privacy";
 import { $, truncateError, DEBUG } from "./ui/dom.js";
-import { ChatView } from "./ui/chat.js";
+import { ChatView } from "./ui/chat.js?v=3-tool-privacy";
 import { Account } from "./ui/account.js";
 
 const DEFAULT_VOICE = "clone:16d9bb336799";
@@ -34,7 +37,9 @@ const TOOL_USE_HINT =
   "that you are acting before the tool call, using natural wording that fits " +
   "the specific request and varies with the conversation. Do not reuse a stock " +
   "phrase, describe capabilities, or wait for another turn. Call the tool right " +
-  "away in the same response.";
+  "away in the same response. A camera snapshot is point-in-time: when the user " +
+  "asks what is visible now or what changed, call camera_snapshot again instead " +
+  "of relying on an earlier description.";
 
 const STORAGE_KEYS = {
   // Direct s2s server URL, used only when the deploy has no LOAD_BALANCER_URL
@@ -93,8 +98,9 @@ const TOOL_DEFS = {
       "snippets and URLs.",
     parameters: {
       type: "object",
-      properties: { query: { type: "string", description: "The search query." } },
+      properties: { query: { type: "string", minLength: 1, pattern: "\\S", description: "The search query." } },
       required: ["query"],
+      additionalProperties: false,
     },
   },
   camera_snapshot: {
@@ -102,9 +108,10 @@ const TOOL_DEFS = {
     name: "camera_snapshot",
     description:
       "Capture the current frame from the user's webcam so you can see what they " +
-      "are showing you. Use it whenever the user refers to something visual or " +
-      "asks you to look.",
-    parameters: { type: "object", properties: {}, required: [] },
+      "are showing you. Each call is a point-in-time view. Use it whenever the user " +
+      "refers to something visual or asks you to look, and call it again for what " +
+      "is visible now or what changed since an earlier snapshot.",
+    parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
   },
 };
 
@@ -980,6 +987,9 @@ let serverSearchKey = false;
 let userSearchKey = localStorage.getItem(STORAGE_KEYS.searchKey) || "";
 /** @type {MediaStream | null} */
 let cameraStream = null;
+// Monotonic within the page session. This identifies each actual camera tool
+// invocation independently from backend call IDs, including malformed calls.
+let cameraCaptureGeneration = 0;
 
 /** Search is usable if the server has a key or the user supplied one. */
 function searchAvailable() {
@@ -1572,7 +1582,7 @@ async function watchCameraPermission() {
  * Grab the current webcam frame as a downscaled JPEG data URL. The preview is
  * mirrored in CSS for a natural self-view, but we draw the raw (un-mirrored)
  * video here so the model sees the scene in its true orientation.
- * @returns {string | null}
+ * @returns {{ dataUrl: string, width: number, height: number } | null}
  */
 function captureSnapshot() {
   if (!cameraStream || !camVideo.videoWidth) return null;
@@ -1587,7 +1597,7 @@ function captureSnapshot() {
   const ctx = canvas.getContext("2d");
   if (!ctx) return null;
   ctx.drawImage(camVideo, 0, 0, w, h);
-  return canvas.toDataURL("image/jpeg", SNAPSHOT_QUALITY);
+  return { dataUrl: canvas.toDataURL("image/jpeg", SNAPSHOT_QUALITY), width: w, height: h };
 }
 
 /** Brief shutter flash on the preview so the user sees a snapshot was taken. */
@@ -1595,6 +1605,70 @@ function flashPreview() {
   camPip.classList.remove("flash");
   void camPip.offsetWidth; // reflow so the animation restarts
   camPip.classList.add("flash");
+}
+
+/**
+ * @typedef {Object} CameraCallLifecycle
+ * @property {number} captureGeneration
+ * @property {number} requestedAtMs
+ * @property {string} callId
+ * @property {"requested"|"captured"|"unavailable"|"invalid_arguments"} captureStatus
+ * @property {"pending"|"acknowledged"|"rejected"} outputStatus
+ * @property {number} [completedAtMs]
+ * @property {number} [width]
+ * @property {number} [height]
+ */
+
+/** @param {CameraCallLifecycle} lifecycle @param {Record<string, unknown>} [extra] */
+function cameraLifecycleDetail(lifecycle, extra = {}) {
+  return {
+    capture_generation: lifecycle.captureGeneration,
+    requested_at_ms: lifecycle.requestedAtMs,
+    completed_at_ms: lifecycle.completedAtMs,
+    call_id: lifecycle.callId,
+    capture_status: lifecycle.captureStatus,
+    output_status: lifecycle.outputStatus,
+    width: lifecycle.width,
+    height: lifecycle.height,
+    ...extra,
+  };
+}
+
+/** @param {string} name @param {string} callId @returns {CameraCallLifecycle | undefined} */
+function beginToolLifecycle(name, callId) {
+  if (name !== "camera_snapshot") return undefined;
+  const lifecycle = {
+    captureGeneration: ++cameraCaptureGeneration,
+    requestedAtMs: Date.now(),
+    callId,
+    captureStatus: /** @type {const} */ ("requested"),
+    outputStatus: /** @type {const} */ ("pending"),
+  };
+  addPipelineMetric({
+    stage: "camera",
+    status: "requested",
+    detail: cameraLifecycleDetail(lifecycle),
+  });
+  return lifecycle;
+}
+
+/**
+ * @param {CameraCallLifecycle | undefined} lifecycle
+ * @param {"captured"|"unavailable"|"invalid_arguments"} status
+ * @param {{ width?: number, height?: number }} [dimensions]
+ */
+function finishCameraCapture(lifecycle, status, dimensions = {}) {
+  if (!lifecycle) return;
+  lifecycle.captureStatus = status;
+  lifecycle.completedAtMs = Date.now();
+  lifecycle.width = dimensions.width;
+  lifecycle.height = dimensions.height;
+  addPipelineMetric({
+    stage: "camera",
+    status,
+    elapsed_ms: lifecycle.completedAtMs - lifecycle.requestedAtMs,
+    detail: cameraLifecycleDetail(lifecycle),
+  });
 }
 
 // ── Tool executor ─────────────────────────────────────────────────────────
@@ -1607,30 +1681,50 @@ function flashPreview() {
  * for a follow-up response. We also hand the result back to the caller so it
  * can be shown in the conversation once the tool has actually run.
  * @param {S2sWsRealtimeClient} sessionClient
- * @param {string} name @param {string} argsJson @param {string} callId
- * @returns {Promise<{ output: string, image?: string }>}
+ * @param {string} name @param {string} callId
+ * @param {CameraCallLifecycle | undefined} lifecycle
+ * @param {{
+ *   tool: string,
+ *   displayArguments: string,
+ *   validation: { ok: true, args: Record<string, unknown> } |
+ *     { ok: false, code: string, path: string, errorClass: string }
+ * }} prepared
+ * @returns {Promise<{ output: string, image?: string, lifecycle?: CameraCallLifecycle }>}
  */
-async function runTool(sessionClient, name, argsJson, callId) {
-  if (client !== sessionClient) return { output: "" };
-  let args = /** @type {Record<string, unknown>} */ ({});
-  try { args = JSON.parse(argsJson || "{}"); } catch { /* keep {} */ }
+async function runTool(sessionClient, name, callId, lifecycle, prepared) {
+  if (client !== sessionClient) return { output: "", lifecycle };
 
-  if (DEBUG) console.debug(`[tool] run name=${name} callId=${JSON.stringify(callId)} args=${argsJson}`);
-  if (!callId) console.warn("[tool] empty call_id — the backend didn't tag the call, can't return a function_call_output");
+  const safeName = prepared.tool;
+  if (DEBUG) console.debug(`[tool] run name=${safeName} callId=${JSON.stringify(callId)}`);
 
-  /** @type {{ output: string, image?: string }} */
-  let result = { output: "" };
+  /** @type {{ output: string, image?: string, lifecycle?: CameraCallLifecycle }} */
+  let result = { output: "", lifecycle };
   const toolStartedAt = performance.now();
-  addPipelineMetric({ stage: "tool", status: "active", detail: { name } });
+  addPipelineMetric({ stage: "tool", status: "active", detail: { name: safeName, callId } });
   try {
-    if (name === "web_search") {
-      const query = typeof args.query === "string" ? args.query : "";
+    const validation = prepared.validation;
+    const validatedArgs = validation?.ok ? validation.args : {};
+    if (!validation.ok) {
+      result.output = prepared.displayArguments;
+      finishCameraCapture(lifecycle, "invalid_arguments");
+      addPipelineMetric({
+        stage: "tool",
+        status: "invalid_arguments",
+        detail: { name: safeName, callId, code: validation.code, path: validation.path, error_class: validation.errorClass },
+      });
+    } else if (name === "web_search") {
+      const query = typeof validatedArgs.query === "string" ? validatedArgs.query : "";
       result.output = await execWebSearch(query);
     } else if (name === "camera_snapshot") {
-      const dataUrl = captureSnapshot();
-      if (dataUrl) {
-        if (DEBUG) console.debug(`[tool] camera_snapshot captured frame (${dataUrl.length} chars), sending image + output`);
-        result = { output: "Snapshot captured from the webcam and attached as an image.", image: dataUrl };
+      const snapshot = captureSnapshot();
+      if (snapshot) {
+        if (DEBUG) console.debug(`[tool] camera_snapshot captured generation=${lifecycle?.captureGeneration ?? 0}`);
+        result = {
+          output: "Snapshot captured from the webcam and attached as an image.",
+          image: snapshot.dataUrl,
+          lifecycle,
+        };
+        finishCameraCapture(lifecycle, "captured", snapshot);
         // Return the tool output; the frame itself rides along with the
         // response.create below (sent right before it), so the model sees the
         // snapshot in the very response it's about to speak.
@@ -1638,31 +1732,43 @@ async function runTool(sessionClient, name, argsJson, callId) {
       } else {
         console.warn("[tool] camera_snapshot: no frame — camera off or not ready");
         result.output = "The camera is not available right now.";
+        finishCameraCapture(lifecycle, "unavailable");
       }
     } else {
-      result.output = `Unknown tool: ${name}`;
+      // `prepareToolArgumentsForBrowser` makes unknown tools invalid, so this
+      // branch is defensive and deliberately omits the untrusted raw name.
+      result.output = "Unknown tool.";
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     result.output = `Tool failed: ${msg}`;
+    if (lifecycle?.captureStatus === "requested") finishCameraCapture(lifecycle, "unavailable");
   }
   if (client !== sessionClient) return result;
   try {
-    addPipelineMetric({ stage: "tool", status: "sending_output", detail: { name, callId } });
+    addPipelineMetric({ stage: "tool", status: "sending_output", detail: { name: safeName, callId } });
     const outputAck = sessionClient.sendToolOutput(callId, result.output);
     // Hosted ordering: output, optional image, then response.create. The
     // backend owns the response-ID barrier and starts exactly one follow-up.
     sessionClient.requestToolResponse(result.image ? { image: result.image } : undefined);
     await outputAck;
-    addPipelineMetric({ stage: "tool", status: "output_acknowledged", detail: { name, callId } });
+    if (lifecycle) {
+      lifecycle.outputStatus = "acknowledged";
+      addPipelineMetric({ stage: "camera", status: "output_acknowledged", detail: cameraLifecycleDetail(lifecycle) });
+    }
+    addPipelineMetric({ stage: "tool", status: "output_acknowledged", detail: { name: safeName, callId } });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     result.output = `Tool output was not accepted: ${msg}`;
-    addPipelineMetric({ stage: "tool", status: "failed", elapsed_ms: performance.now() - toolStartedAt, detail: { name } });
+    if (lifecycle) {
+      lifecycle.outputStatus = "rejected";
+      addPipelineMetric({ stage: "camera", status: "output_rejected", detail: cameraLifecycleDetail(lifecycle) });
+    }
+    addPipelineMetric({ stage: "tool", status: "failed", elapsed_ms: performance.now() - toolStartedAt, detail: { name: safeName } });
     return result;
   }
-  if (DEBUG) console.debug(`[tool] requesting model response after ${name}`);
-  addPipelineMetric({ stage: "tool", status: "done", elapsed_ms: performance.now() - toolStartedAt, detail: { name } });
+  if (DEBUG) console.debug(`[tool] requesting model response after ${safeName}`);
+  addPipelineMetric({ stage: "tool", status: "done", elapsed_ms: performance.now() - toolStartedAt, detail: { name: safeName } });
   return result;
 }
 
@@ -2603,14 +2709,25 @@ async function doStart(audioContext = null) {
 
   c.addEventListener("toolcall", (e) => {
     if (client !== c) return;
-    const { name, arguments: args, callId } = /** @type {CustomEvent<{ name: string; arguments: string; callId: string }>} */ (e).detail;
-    chat.onToolCall(name, args, callId);
+    const { name, arguments: args, callId } = /** @type {CustomEvent<{ name: string; arguments: unknown; callId: string }>} */ (e).detail;
+    const prepared = prepareToolArgumentsForBrowser(name, args, TOOL_DEFS[name]?.parameters);
+    const lifecycle = beginToolLifecycle(prepared.tool, callId);
+    // Durable UI surfaces receive only schema-validated arguments or fixed,
+    // content-free failure metadata. Raw protocol arguments stay transient.
+    chat.onToolCall(prepared.tool, prepared.displayArguments, callId, lifecycle);
     // Execute the tool, then push it to the conversation once the result is in,
     // so the toggle shows both the call input and its output together.
-    void runTool(c, name, args, callId).then(({ output, image }) => {
+    void runTool(c, name, callId, lifecycle, prepared).then(({ output, image, lifecycle: completedLifecycle }) => {
       if (client !== c) return;
-      chat.onToolResult(name, args, output, image, callId);
+      chat.onToolResult(prepared.tool, prepared.displayArguments, output, image, callId, completedLifecycle);
     });
+  });
+  c.addEventListener("tool-protocol-error", (e) => {
+    if (client !== c) return;
+    const rawCode = /** @type {CustomEvent<{ code?: string }>} */ (e).detail?.code;
+    const code = rawCode === "missing_call_id" ? "missing_call_id" : "missing_tool_name";
+    chat.onToolProtocolFailure(code);
+    addPipelineMetric({ stage: "tool", status: "protocol_error", detail: { code } });
   });
   c.addEventListener("error", (e) => {
     if (client !== c) return;
