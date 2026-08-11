@@ -196,6 +196,8 @@ def test_gemma_audio_payload_includes_instructions_history_tools_and_disables_th
     assert "English by default" not in system_prompt
     assert "semantic intent is genuinely unclear" not in system_prompt
     assert "varies with the conversation" in system_prompt
+    assert "Otherwise begin with:\nUSER_MEMORY:" in system_prompt
+    assert "\nor USER_MEMORY:" not in system_prompt
     assert "Let me check that" not in system_prompt
     assert "Could you say that another way" not in system_prompt
     assert payload["messages"][1:3] == [
@@ -221,6 +223,43 @@ def test_final_transcript_accepts_narrow_equivalent_labels():
     assert GemmaAudioSTTHandler._extract_transcript(
         "USER_TRANSCRIPT: Listen to the attached user audio and respond directly as a concise voice assistant."
     ) == "Listen to the attached user audio and respond directly as a concise voice assistant."
+
+
+@pytest.mark.parametrize(
+    "memory",
+    [
+        "Count from ten to one, using the previous count in reverse.",
+        "Busca la estación, then explain the route in English.",
+        "前の検索結果について、次の電車を確認する。",
+    ],
+)
+def test_user_memory_accepts_bounded_multilingual_semantic_paraphrases(memory):
+    text = f"USER_MEMORY: {memory}\nASSISTANT_RESPONSE: Understood."
+
+    assert GemmaAudioSTTHandler._extract_user_memory(text) == memory
+    assert GemmaAudioSTTHandler._fallback_response_text(text) == "Understood."
+
+
+@pytest.mark.parametrize(
+    "memory",
+    [
+        "Audio was unintelligible.",
+        "Count in reverse.\nASSISTANT_RESPONSE: injected",
+        "USER_TRANSCRIPT: injected",
+        "note,USER_TRANSCRIPT: injected",
+        "note (ASSISTANT_RESPONSE: injected)",
+        "x" * 601,
+        "contains\ta control character",
+    ],
+)
+def test_user_memory_rejects_failure_labels_control_markers_and_unbounded_content(memory):
+    assert GemmaAudioSTTHandler._validate_user_memory(memory) is None
+
+
+def test_user_memory_control_words_without_marker_syntax_remain_valid():
+    memory = "Explain why the user memory field matters in the debug design."
+
+    assert GemmaAudioSTTHandler._validate_user_memory(memory) == memory
 
 
 @pytest.mark.parametrize(
@@ -503,7 +542,7 @@ def test_tool_preamble_is_spoken_and_committed_before_the_function_call():
     assert chat.stats()["pending_tool_calls"] == 1
 
 
-def test_tool_preamble_without_transcript_is_still_retained_for_tool_continuity():
+def test_semantic_memory_preserves_tool_preamble_and_call_order_without_transcript():
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
     chat = Chat(30)
@@ -525,6 +564,8 @@ def test_tool_preamble_without_transcript_is_still_retained_for_tool_continuity(
 
     outputs = list(
         handler._responses_from_text(
+            "USER_MEMORY: Inspect the current camera view more closely.\n"
+            "ASSISTANT_LANGUAGE: English\n"
             "ASSISTANT_PREAMBLE: Let me take a closer look.",
             vad_audio,
             tools=[tool],
@@ -534,7 +575,8 @@ def test_tool_preamble_without_transcript_is_still_retained_for_tool_continuity(
     assert outputs[0].transcript is None
     assert outputs[0].text == "Let me take a closer look."
     assert [item.type for item in chat.buffer] == ["message", "message", "function_call"]
-    assert chat.buffer[0].content[0].type == "input_audio"
+    assert chat.buffer[0].content[0].type == "input_text"
+    assert chat.buffer[0].content[0].text == "Inspect the current camera view more closely."
     assert chat.stats()["pending_tool_calls"] == 1
 
 
@@ -789,7 +831,9 @@ def test_tool_result_and_continuation_preserve_exact_atomic_order():
 
     outputs = list(
         handler._responses_from_text(
-            "ASSISTANT_LANGUAGE: Spanish\nASSISTANT_PREAMBLE: Buscaré eso.",
+            "USER_MEMORY: Busca la información local y conserva el contexto en español.\n"
+            "ASSISTANT_LANGUAGE: Spanish\n"
+            "ASSISTANT_PREAMBLE: Buscaré eso.",
             vad_audio,
             tools=[tool],
         )
@@ -821,7 +865,7 @@ def test_tool_result_and_continuation_preserve_exact_atomic_order():
         "assistant",
         "user",
     ]
-    assert payload["messages"][1]["content"][0]["type"] == "input_audio"
+    assert payload["messages"][1]["content"] == "Busca la información local y conserva el contexto en español."
     assert payload["messages"][3]["tool_calls"][0]["id"] == "call_search_order"
     assert payload["messages"][4]["tool_call_id"] == "call_search_order"
     assert payload["messages"][5]["content"] == "Encontré el resultado."
@@ -924,6 +968,200 @@ def test_primary_payload_contains_current_audio_once_before_history_anchor_is_co
     assert [item.type for item in chat.buffer] == ["message", "message"]
 
 
+def test_streamed_primary_user_memory_upgrades_existing_audio_anchor_without_ui_transcript():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
+    chat = Chat(30)
+    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(
+        _sse_text(
+            "USER_MEMORY: Count from one to ten.\n"
+            "ASSISTANT_LANGUAGE: English\n"
+            "ASSISTANT_RESPONSE: One, two, three."
+        )
+    )
+    vad_audio = SimpleNamespace(
+        audio=np.zeros(1600, dtype=np.float32),
+        mode="final",
+        runtime_config=RuntimeConfig(chat=chat),
+        turn_id="turn_memory_streamed",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+
+    outputs = list(handler.process(vad_audio))
+
+    assert outputs[-1].transcript is None
+    assert "".join(output.text for output in outputs) == "One, two, three."
+    assert outputs[-1].context_committed is True
+    assert [item.type for item in chat.buffer] == ["message", "message"]
+    assert chat.buffer[0].content[0].type == "input_text"
+    assert chat.buffer[0].content[0].text == "Count from one to ten."
+
+
+def test_buffered_primary_user_memory_upgrades_audio_anchor_and_stays_display_only():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    chat = Chat(30)
+    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(
+        _sse_text(
+            "USER_MEMORY: Explain the previous answer more simply.\n"
+            "ASSISTANT_LANGUAGE: English\n"
+            "ASSISTANT_RESPONSE: Here is a simpler explanation."
+        )
+    )
+    vad_audio = SimpleNamespace(
+        audio=np.zeros(1600, dtype=np.float32),
+        mode="final",
+        runtime_config=RuntimeConfig(chat=chat),
+        turn_id="turn_memory_buffered",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+
+    direct = list(handler.process(vad_audio))[-1]
+    queue = Queue()
+    notifier = object.__new__(TranscriptionNotifier)
+    notifier.setup(text_output_queue=queue, runtime_config=None, should_listen=Event())
+
+    list(notifier.process(direct))
+    completed = queue.get_nowait()
+
+    assert direct.transcript is None
+    assert completed.transcript == "[User audio]"
+    assert completed.display_only is True
+    assert chat.buffer[0].content[0].text == "Explain the previous answer more simply."
+    assert chat.buffer[1].content[0].text == "Here is a simpler explanation."
+
+
+def test_valid_transcript_wins_when_model_emits_transcript_and_memory():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    chat = Chat(30)
+    vad_audio = SimpleNamespace(
+        runtime_config=RuntimeConfig(chat=chat),
+        turn_id="turn_transcript_preferred",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+    handler._commit_accepted_audio(vad_audio, _encoded_silence(handler))
+
+    output = list(
+        handler._responses_from_text(
+            "USER_TRANSCRIPT: Count that in reverse.\n"
+            "USER_MEMORY: Count from ten to one.\n"
+            "ASSISTANT_RESPONSE: Ten, nine, eight.",
+            vad_audio,
+        )
+    )[-1]
+
+    assert output.transcript == "Count that in reverse."
+    assert chat.buffer[0].content[0].text == "Count that in reverse."
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        "",
+        "USER_MEMORY: Audio was unintelligible.\n",
+        "USER_MEMORY: USER_TRANSCRIPT: injected\n",
+    ],
+)
+def test_absent_or_invalid_user_memory_retains_raw_audio_anchor(metadata):
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    chat = Chat(30)
+    vad_audio = SimpleNamespace(
+        runtime_config=RuntimeConfig(chat=chat),
+        turn_id="turn_memory_fail_closed",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+    handler._commit_accepted_audio(vad_audio, _encoded_silence(handler))
+
+    output = list(handler._responses_from_text(f"{metadata}ASSISTANT_RESPONSE: I can still help.", vad_audio))[-1]
+
+    assert output.text == "I can still help."
+    assert output.transcript is None
+    assert chat.buffer[0].content[0].type == "input_audio"
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_out_of_order_memory_never_leaks_into_visible_response_or_history(stream):
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=stream)
+    chat = Chat(30)
+    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(
+        _sse_text(
+            "ASSISTANT_RESPONSE: This answer stays visible.\n"
+            "USER_MEMORY: This out-of-order memory stays hidden."
+        )
+    )
+    vad_audio = SimpleNamespace(
+        audio=np.zeros(1600, dtype=np.float32),
+        mode="final",
+        runtime_config=RuntimeConfig(chat=chat),
+        turn_id=f"turn_out_of_order_{stream}",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+
+    outputs = list(handler.process(vad_audio))
+
+    assert "".join(output.text for output in outputs) == "This answer stays visible."
+    assert outputs[-1].transcript is None
+    assert chat.buffer[0].content[0].type == "input_audio"
+    assert "out-of-order memory" not in " ".join(output.text for output in outputs)
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_invalid_memory_line_does_not_suppress_plain_compatibility_answer(stream):
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=stream)
+    chat = Chat(30)
+    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(
+        _sse_text("USER_MEMORY: Audio was unintelligible.\nA plain compatibility answer remains visible.")
+    )
+    vad_audio = SimpleNamespace(
+        audio=np.zeros(1600, dtype=np.float32),
+        mode="final",
+        runtime_config=RuntimeConfig(chat=chat),
+        turn_id=f"turn_invalid_memory_plain_{stream}",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+
+    outputs = list(handler.process(vad_audio))
+
+    assert "".join(output.text for output in outputs) == "A plain compatibility answer remains visible."
+    assert chat.buffer[0].content[0].type == "input_audio"
+
+
+def test_streamed_split_trailing_control_marker_is_never_spoken():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
+    chat = Chat(30)
+    chunks = [
+        "ASSISTANT_RESPONSE: This sentence is complete.\nUSER_MEM",
+        "ORY: hidden semantic text",
+    ]
+    lines = [f"data: {json.dumps({'choices': [{'delta': {'content': chunk}}]})}" for chunk in chunks]
+    lines.append("data: [DONE]")
+    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(lines)
+    vad_audio = SimpleNamespace(
+        audio=np.zeros(1600, dtype=np.float32),
+        mode="final",
+        runtime_config=RuntimeConfig(chat=chat),
+        turn_id="turn_split_trailing_control",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+
+    outputs = list(handler.process(vad_audio))
+
+    assert "".join(output.text for output in outputs) == "This sentence is complete."
+    assert chat.buffer[0].content[0].type == "input_audio"
+
+
 def test_newer_revision_supersedes_one_stable_audio_anchor_without_payload_duplication():
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
@@ -1020,6 +1258,106 @@ def test_paused_stale_transcript_cannot_overwrite_newer_cumulative_audio(monkeyp
     assert chat.buffer[0].content[0].text == "final rev1 transcript"
 
 
+def test_stale_semantic_memory_cannot_overwrite_newer_cumulative_audio_or_memory():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    chat = Chat(30)
+    runtime_config = RuntimeConfig(chat=chat)
+    runtime_config.local_pipeline["_session_id"] = "session_memory_revision"
+    rev0 = SimpleNamespace(runtime_config=runtime_config, turn_id="turn_1", turn_revision=0)
+    rev1 = SimpleNamespace(runtime_config=runtime_config, turn_id="turn_1", turn_revision=1)
+    newer_audio = _encoded_silence(handler, 2400)
+
+    anchor_id = handler._commit_accepted_audio(rev0, _encoded_silence(handler, 800))
+    assert handler._commit_accepted_audio(rev1, newer_audio) == anchor_id
+
+    assert handler._ensure_user_context(rev0, None, "Stale earlier intent.") is None
+    assert chat.buffer[0].content[0].type == "input_audio"
+    assert chat.buffer[0].content[0].audio == newer_audio
+
+    assert handler._ensure_user_context(rev1, None, "Use the complete revised request.") == anchor_id
+    assert chat.buffer[0].content[0].type == "input_text"
+    assert chat.buffer[0].content[0].text == "Use the complete revised request."
+    assert handler._ensure_user_context(rev0, None, "Still stale earlier intent.") is None
+    assert chat.buffer[0].content[0].text == "Use the complete revised request."
+
+
+def test_response_commit_and_revision_supersession_share_one_ownership_transaction(monkeypatch):
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    chat = Chat(30)
+    runtime_config = RuntimeConfig(chat=chat)
+    runtime_config.local_pipeline["_session_id"] = "session_response_commit_race"
+    rev0 = SimpleNamespace(runtime_config=runtime_config, turn_id="turn_1", turn_revision=0)
+    rev1 = SimpleNamespace(runtime_config=runtime_config, turn_id="turn_1", turn_revision=1)
+    handler._commit_accepted_audio(rev0, _encoded_silence(handler, 800))
+    stale_tool = ResponseFunctionToolCall(
+        type="function_call",
+        name="web_search",
+        arguments='{"query":"stale"}',
+        call_id="call_stale_revision",
+        id="fc_stale_revision",
+        status="completed",
+    )
+    original_ensure = handler._ensure_user_context
+    ensure_complete = Event()
+    resume_rev0 = Event()
+    rev1_complete = Event()
+
+    def paused_ensure(vad_audio, transcript, user_memory=None):
+        result = original_ensure(vad_audio, transcript, user_memory)
+        if vad_audio is rev0 and not ensure_complete.is_set():
+            ensure_complete.set()
+            assert resume_rev0.wait(timeout=2.0)
+        return result
+
+    monkeypatch.setattr(handler, "_ensure_user_context", paused_ensure)
+    rev0_result = []
+    rev0_thread = Thread(
+        target=lambda: rev0_result.append(
+            handler._commit_context(
+                rev0,
+                None,
+                "The first revision completed.",
+                [stale_tool],
+                user_memory="Remember the first revision.",
+            )
+        ),
+        daemon=True,
+    )
+    rev0_thread.start()
+    assert ensure_complete.wait(timeout=2.0)
+
+    def supersede():
+        handler._commit_accepted_audio(rev1, _encoded_silence(handler, 2400))
+        rev1_complete.set()
+
+    rev1_thread = Thread(target=supersede, daemon=True)
+    rev1_thread.start()
+    assert rev1_complete.wait(timeout=2.0) is True
+
+    resume_rev0.set()
+    rev0_thread.join(timeout=2.0)
+    rev1_thread.join(timeout=2.0)
+
+    assert rev0_result == [False]
+    assert rev1_complete.is_set()
+    assert [item.type for item in chat.buffer] == ["message"]
+    assert chat.buffer[0].content[0].type == "input_audio"
+    item_count = len(chat.buffer)
+    assert (
+        handler._commit_context(
+            rev0,
+            None,
+            "This stale response must not append.",
+            [],
+            user_memory="Stale first-revision memory.",
+        )
+        is False
+    )
+    assert len(chat.buffer) == item_count
+
+
 def test_cross_session_reused_turn_id_has_distinct_ownership_and_stale_cleanup_is_scoped():
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
@@ -1038,14 +1376,14 @@ def test_cross_session_reused_turn_id_has_distinct_ownership_and_stale_cleanup_i
 
     assert old_item_id != new_item_id
     assert handler._owns_user_context(new_turn) is True
-    assert handler._ensure_user_context(new_turn, "New session speech") == new_item_id
+    assert handler._ensure_user_context(new_turn, None, "Remember the new session request.") == new_item_id
     assert chat_old.buffer[0].content[0].type == "input_audio"
-    assert chat_new.buffer[0].content[0].text == "New session speech"
+    assert chat_new.buffer[0].content[0].text == "Remember the new session request."
     handler.on_session_end()
     assert handler._owned_user_context(new_turn) is None
 
 
-def test_transcriptless_count_turn_is_audio_history_for_reverse_follow_up():
+def test_transcriptless_count_turn_uses_semantic_memory_for_reverse_follow_up():
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
     chat = Chat(30)
@@ -1054,7 +1392,12 @@ def test_transcriptless_count_turn_is_audio_history_for_reverse_follow_up():
     def stream_request(_url, payload, *, api_key):
         payloads.append(payload)
         if len(payloads) == 1:
-            return _FakeSSEStream(_sse_text("ASSISTANT_RESPONSE: One, two, three, four, five, six, seven, eight, nine, ten."))
+            return _FakeSSEStream(
+                _sse_text(
+                    "USER_MEMORY: Count from one to ten.\n"
+                    "ASSISTANT_RESPONSE: One, two, three, four, five, six, seven, eight, nine, ten."
+                )
+            )
         return _FakeSSEStream(
             _sse_text("USER_TRANSCRIPT: Count in reverse.\nASSISTANT_RESPONSE: Ten, nine, eight, seven.")
         )
@@ -1077,7 +1420,7 @@ def test_transcriptless_count_turn_is_audio_history_for_reverse_follow_up():
 
     second = payloads[1]["messages"]
     assert [message["role"] for message in second] == ["system", "user", "assistant", "user"]
-    assert second[1]["content"][0]["type"] == "input_audio"
+    assert second[1]["content"] == "Count from one to ten."
     assert second[2]["content"].startswith("One, two, three")
     assert second[3]["content"][0]["type"] == "input_audio"
 
@@ -1121,7 +1464,10 @@ def test_cancelled_primary_retains_only_accepted_user_audio():
     )
     chat = Chat(30)
     handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(
-        _sse_text("ASSISTANT_RESPONSE: This partial answer must not persist.")
+        _sse_text(
+            "USER_MEMORY: This memory belongs only to the cancelled response.\n"
+            "ASSISTANT_RESPONSE: This partial answer must not persist."
+        )
     )
     vad_audio = SimpleNamespace(
         audio=np.zeros(1600, dtype=np.float32),
@@ -1174,12 +1520,19 @@ def test_non_json_sse_debug_log_never_contains_stream_content(caplog):
     )
     handler._commit_accepted_audio(vad_audio, _encoded_silence(handler))
     secret = "PRIVATE TRANSCRIPT CONTENT MUST NOT BE LOGGED"
-    stream = _FakeSSEStream([secret, *_sse_text("ASSISTANT_RESPONSE: Ready.")])
+    memory_secret = "PRIVATE SEMANTIC MEMORY MUST NOT BE LOGGED"
+    stream = _FakeSSEStream(
+        [
+            secret,
+            *_sse_text(f"USER_MEMORY: {memory_secret}\nASSISTANT_RESPONSE: Ready."),
+        ]
+    )
     caplog.set_level(logging.DEBUG, logger="speech_to_speech.STT.gemma_audio_handler")
 
     list(handler._consume_stream(stream, vad_audio))
 
     assert secret not in caplog.text
+    assert memory_secret not in caplog.text
     assert "Ignoring non-JSON Gemma stream event (chars=" in caplog.text
 
 
@@ -1248,7 +1601,11 @@ def test_one_hundred_accepted_turns_make_one_primary_request_each_with_optional_
     def stream_request(_url, payload, *, api_key):
         turn = len(calls) + 1
         calls.append(payload)
-        prefix = "" if turn in {9, 37, 73, 96} else f"USER_TRANSCRIPT: request {turn}\n"
+        prefix = (
+            f"USER_MEMORY: semantic request {turn}\n"
+            if turn in {9, 37, 73, 96}
+            else f"USER_TRANSCRIPT: request {turn}\n"
+        )
         return _FakeSSEStream(
             _sse_text(f"{prefix}ASSISTANT_LANGUAGE: English\nASSISTANT_RESPONSE: answer {turn}.")
         )

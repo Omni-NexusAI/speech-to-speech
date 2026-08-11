@@ -43,21 +43,47 @@ def _response_max_tokens(value: Any, fallback: Any = 384) -> int:
         return min(1024, max(64, int(value if value is not None else fallback)))
     except (TypeError, ValueError):
         return 384
+
+
 _TRANSCRIPT_MARKER = "USER_TRANSCRIPT:"
+_MEMORY_MARKER = "USER_MEMORY:"
 _RESPONSE_MARKER = "ASSISTANT_RESPONSE:"
 _LANGUAGE_MARKER = "ASSISTANT_LANGUAGE:"
 _PREAMBLE_MARKER = "ASSISTANT_PREAMBLE:"
 _PREVIEW_TRANSCRIPT_MARKER = "TRANSCRIPT:"
 _FINAL_TRANSCRIPT_RE = re.compile(
     r"(?ims)^\s*(?:USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER)\s*:\s*(.+?)"
-    r"(?=^\s*(?:ASSISTANT_LANGUAGE|ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:|\Z)"
+    r"(?=^\s*(?:USER_MEMORY|ASSISTANT_LANGUAGE|ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:|\Z)"
 )
-_ASSISTANT_RESPONSE_RE = re.compile(r"(?ims)^\s*(?:ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:\s*(.+)\Z")
+_FINAL_MEMORY_RE = re.compile(
+    r"(?ims)^\s*USER_MEMORY\s*:\s*(.+?)"
+    r"(?=^\s*(?:USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER|ASSISTANT_LANGUAGE|ASSISTANT_PREAMBLE|"
+    r"ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:|\Z)"
+)
+_ASSISTANT_RESPONSE_RE = re.compile(
+    r"(?ims)^\s*(?:ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:\s*(.+?)"
+    r"(?=^\s*(?:USER_MEMORY|USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER|ASSISTANT_LANGUAGE|"
+    r"ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:|\Z)"
+)
 _ASSISTANT_LANGUAGE_RE = re.compile(r"(?im)^\s*ASSISTANT_LANGUAGE\s*:\s*([^\r\n]+)")
 _ASSISTANT_PREAMBLE_RE = re.compile(
     r"(?ims)^\s*ASSISTANT_PREAMBLE\s*:\s*(.+?)"
-    r"(?=^\s*(?:ASSISTANT_LANGUAGE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:|\Z)"
+    r"(?=^\s*(?:USER_MEMORY|USER_TRANSCRIPT|ASSISTANT_LANGUAGE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:|\Z)"
 )
+_MEMORY_CONTROL_MARKER_RE = re.compile(
+    r"(?i)(?:USER_MEMORY|USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER|ASSISTANT_LANGUAGE|"
+    r"ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:"
+)
+_OUTPUT_MARKER_RE = re.compile(r"(?im)^\s*(?:ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:")
+_CONTROL_LINE_RE = re.compile(
+    r"(?im)^\s*(?:USER_MEMORY|USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER|ASSISTANT_LANGUAGE|"
+    r"ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:[^\r\n]*(?:\r?\n|$)"
+)
+_TRAILING_RESPONSE_CONTROL_RE = re.compile(
+    r"(?im)^\s*(?:USER_MEMORY|USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER|ASSISTANT_LANGUAGE|"
+    r"ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:"
+)
+_MAX_USER_MEMORY_CHARS = 600
 _SENTENCE_RE = re.compile(r"(.+?[.!?](?:\s+|$))", re.DOTALL)
 _TRANSCRIPT_FAILURE_SENTINELS = frozenset(
     {
@@ -402,21 +428,30 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         self._emit_history_metric(vad_audio, "user_committed", input_kind="input_audio", committed=True)
         return item.id
 
-    def _ensure_user_context(self, vad_audio: STTIn, transcript: str | None) -> str | None:
-        """Return the accepted user item, upgrading audio to validated text when available."""
+    def _ensure_user_context(
+        self,
+        vad_audio: STTIn,
+        transcript: str | None,
+        user_memory: str | None = None,
+    ) -> str | None:
+        """Return the accepted user item, preferring transcript over semantic memory."""
 
         chat = self._conversation_chat(vad_audio)
         if chat is None:
             return None
+        transcript = self._validate_transcript(transcript)
+        user_memory = None if transcript else self._validate_user_memory(user_memory)
+        semantic_text = transcript or user_memory
+        semantic_kind = "transcript" if transcript else "semantic_memory" if user_memory else "input_audio"
         key = self._turn_key(vad_audio)
         revision = self._turn_revision(vad_audio)
         upgraded = False
         with self._accepted_user_lock:
             owned = self._accepted_user_items.get(key)
             if owned is None:
-                if not transcript:
+                if not semantic_text:
                     return None
-                item = chat.add_item(make_user_message(transcript))
+                item = chat.add_item(make_user_message(semantic_text))
                 assert item.id is not None
                 item_id = item.id
                 self._accepted_user_items[key] = (item_id, revision)
@@ -428,17 +463,17 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 if revision > owned_revision:
                     self._accepted_user_items[key] = (item_id, revision)
                 committed_new = False
-            if transcript:
+            if semantic_text:
                 # Ownership validation and semantic replacement are one
                 # transaction. Otherwise rev0 can pass the check, rev1 can
                 # replace the cumulative WAV, and rev0 can then overwrite the
-                # newer anchor with its stale transcript.
-                upgraded = chat.replace_user_message_text(item_id, transcript)
+                # newer anchor with stale metadata.
+                upgraded = chat.replace_user_message_text(item_id, semantic_text)
         if committed_new:
-            self._emit_history_metric(vad_audio, "user_committed", input_kind="transcript", committed=True)
+            self._emit_history_metric(vad_audio, "user_committed", input_kind=semantic_kind, committed=True)
             return item_id
         if upgraded:
-            self._emit_history_metric(vad_audio, "user_upgraded", input_kind="transcript", committed=True)
+            self._emit_history_metric(vad_audio, "user_upgraded", input_kind=semantic_kind, committed=True)
         return item_id
 
     def _finish_user_context(self, vad_audio: STTIn) -> None:
@@ -479,9 +514,16 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             "or session instructions request another response language. Do not mention transcription, audio quality, "
             "garbling, attached audio, or internal audio processing unless the user explicitly asks about that topic. "
             "USER_TRANSCRIPT is optional display metadata and must never replace or gate the semantic response. "
-            "If exact words are unavailable, omit USER_TRANSCRIPT instead of filling it with a failure label. "
-            "When available, use this plain-text shape:\n"
-            "USER_TRANSCRIPT: <short transcript of what the user said>\n"
+            "Emit USER_TRANSCRIPT only when the exact words are confidently available. Otherwise emit USER_MEMORY as "
+            "one short, content-faithful semantic paraphrase of the user's current intent, resolving ordinary references "
+            "from conversation context without adding facts. Never emit both fields, and never fill either field with an "
+            "audio, transcription, or failure label. USER_MEMORY is hidden session context, not an answer or a tool result, "
+            "and must not gate, alter, or replace the assistant response or tool call. If exact words are available, "
+            "begin with:\n"
+            "USER_TRANSCRIPT: <exact short transcript, preferred when available>\n"
+            "Otherwise begin with:\n"
+            "USER_MEMORY: <short semantic paraphrase when USER_TRANSCRIPT is omitted>\n"
+            "After that, continue with:\n"
             "ASSISTANT_LANGUAGE: <single language name for a monolingual spoken answer; Auto for a mixed-language "
             "or otherwise unspecified spoken answer>\n"
             "ASSISTANT_RESPONSE: <your spoken answer>\n"
@@ -768,6 +810,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         tool_accum: dict[int, dict[str, str]] = {}
         assistant_started = False
         pending_response = ""
+        assistant_response_closed = False
         transcript_value: str | None = None
         language_code: str | None = None
         full_buffer_tts = self._full_buffer_tts(getattr(vad_audio, "runtime_config", None))
@@ -816,8 +859,10 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                     )
                 assistant_started = True
                 pending_response = after
-            elif assistant_started:
+            elif assistant_started and not assistant_response_closed:
                 pending_response += str(content)
+            if assistant_started and not assistant_response_closed:
+                pending_response, assistant_response_closed = self._visible_response_prefix(pending_response)
             if assistant_started and not full_buffer_tts:
                 chunks, pending_response = self._pop_sentence_chunks(pending_response)
                 for chunk in chunks:
@@ -844,6 +889,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             else self._fallback_response_text(raw_text)
         )
         transcript = self._validate_transcript(transcript_value or self._extract_transcript(raw_text))
+        user_memory = None if transcript else self._extract_user_memory(raw_text)
         self._emit_metric(
             vad_audio,
             "transcription",
@@ -857,6 +903,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             transcript,
             full_response,
             tools,
+            user_memory=user_memory,
         )
         self._finish_user_context(vad_audio)
         self._preview_transcripts.pop((vad_audio.turn_id, vad_audio.turn_revision), None)
@@ -882,6 +929,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         generation: int | None = None,
     ) -> Iterator[DirectAssistantResponse]:
         transcript = self._extract_transcript(text)
+        user_memory = None if transcript else self._extract_user_memory(text)
         tools = tools or []
         language_code = self._effective_assistant_language(text)
         preamble = self._tool_preamble(text, tools) if tools else None
@@ -894,7 +942,13 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         response_text = preamble or self._fallback_response_text(text)
         if response_text:
             logger.info("Gemma audio response ready (%d characters)", len(response_text))
-        committed = self._commit_context(vad_audio, transcript, response_text, tools)
+        committed = self._commit_context(
+            vad_audio,
+            transcript,
+            response_text,
+            tools,
+            user_memory=user_memory,
+        )
         self._finish_user_context(vad_audio)
         self._preview_transcripts.pop((vad_audio.turn_id, vad_audio.turn_revision), None)
         yield self._direct(
@@ -947,35 +1001,48 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         transcript: str | None,
         assistant_text: str,
         tools: list[ResponseFunctionToolCall],
+        *,
+        user_memory: str | None = None,
     ) -> bool:
         chat = self._conversation_chat(vad_audio)
         if chat is None:
             return False
-        user_item_id = self._ensure_user_context(vad_audio, transcript)
+        transcript = self._validate_transcript(transcript)
+        user_memory = None if transcript else self._validate_user_memory(user_memory)
+        user_item_id = self._ensure_user_context(vad_audio, transcript, user_memory)
         if user_item_id is None:
             self._emit_history_metric(vad_audio, "response_uncommitted", input_kind="missing", committed=False)
             return False
-        function_calls: list[RealtimeConversationItemFunctionCall] = []
-        for tool in tools:
-            function_calls.append(
-                RealtimeConversationItemFunctionCall(
-                    type="function_call",
-                    name=tool.name,
-                    arguments=tool.arguments,
-                    call_id=tool.call_id,
-                    id=tool.id,
-                    status=tool.status,
-                )
+        function_calls = [
+            RealtimeConversationItemFunctionCall(
+                type="function_call",
+                name=tool.name,
+                arguments=tool.arguments,
+                call_id=tool.call_id,
+                id=tool.id,
+                status=tool.status,
             )
-        chat.commit_assistant_response(user_item_id, assistant_text, function_calls)
-        # Keep unresolved function-call pairs intact; the normal tool follow-up
-        # path trims after its final assistant response is committed.
-        if not tools:
-            chat.trim_if_needed(None)
+            for tool in tools
+        ]
+        key = self._turn_key(vad_audio)
+        revision = self._turn_revision(vad_audio)
+        with self._accepted_user_lock:
+            owned = self._accepted_user_items.get(key)
+            if owned != (user_item_id, revision):
+                self._emit_history_metric(vad_audio, "response_uncommitted", input_kind="missing", committed=False)
+                return False
+            # Keep ownership validation and assistant/tool persistence in one
+            # transaction. A newer cumulative revision cannot claim the anchor
+            # between these two operations and receive a stale response.
+            chat.commit_assistant_response(user_item_id, assistant_text, function_calls)
+            # Keep unresolved function-call pairs intact; the normal tool
+            # follow-up path trims after its final assistant response commits.
+            if not tools:
+                chat.trim_if_needed(None)
         self._emit_history_metric(
             vad_audio,
             "response_committed",
-            input_kind="transcript" if transcript else "input_audio",
+            input_kind="transcript" if transcript else "semantic_memory" if user_memory else "input_audio",
             committed=True,
         )
         return True
@@ -984,6 +1051,9 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
     def _extract_transcript(text: str) -> str | None:
         match = _FINAL_TRANSCRIPT_RE.search(text)
         if not match:
+            return None
+        output = _OUTPUT_MARKER_RE.search(text)
+        if output is not None and match.start() > output.start():
             return None
         return GemmaAudioSTTHandler._validate_transcript(match.group(1))
 
@@ -999,6 +1069,35 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         if failure_key in _TRANSCRIPT_FAILURE_SENTINELS:
             return None
         return transcript
+
+    @staticmethod
+    def _extract_user_memory(text: str) -> str | None:
+        match = _FINAL_MEMORY_RE.search(text)
+        if not match:
+            return None
+        output = _OUTPUT_MARKER_RE.search(text)
+        if output is not None and match.start() > output.start():
+            return None
+        return GemmaAudioSTTHandler._validate_user_memory(match.group(1))
+
+    @staticmethod
+    def _validate_user_memory(value: str | None) -> str | None:
+        if not value:
+            return None
+        raw_memory = str(value).strip().strip('"')
+        if (
+            not raw_memory
+            or len(raw_memory) > _MAX_USER_MEMORY_CHARS
+            or "\n" in raw_memory
+            or "\r" in raw_memory
+            or any(ord(character) < 32 for character in raw_memory)
+        ):
+            return None
+        memory = " ".join(raw_memory.split())
+        failure_key = memory.lower().strip(" \t\r\n\"'`[]()<>.,!?;:")
+        if failure_key in _TRANSCRIPT_FAILURE_SENTINELS or _MEMORY_CONTROL_MARKER_RE.search(memory):
+            return None
+        return memory
 
     def on_session_end(self) -> None:
         super().on_session_end()
@@ -1017,7 +1116,12 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         if _PREVIEW_TRANSCRIPT_MARKER not in text:
             return None
         prefix, transcript = text.split(_PREVIEW_TRANSCRIPT_MARKER, 1)
-        if prefix.strip() or _TRANSCRIPT_MARKER in transcript or _RESPONSE_MARKER in transcript:
+        if (
+            prefix.strip()
+            or _TRANSCRIPT_MARKER in transcript
+            or _MEMORY_MARKER in transcript
+            or _RESPONSE_MARKER in transcript
+        ):
             return None
         transcript = transcript.strip().strip('"')
         return GemmaAudioSTTHandler._validate_transcript(transcript)
@@ -1064,9 +1168,16 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         assistant = _ASSISTANT_RESPONSE_RE.search(text)
         if assistant:
             return assistant.group(1).strip()
-        if _FINAL_TRANSCRIPT_RE.search(text) or _ASSISTANT_PREAMBLE_RE.search(text):
-            return ""
-        return text.strip()
+        return _CONTROL_LINE_RE.sub("", text).strip()
+
+    @staticmethod
+    def _visible_response_prefix(text: str) -> tuple[str, bool]:
+        """Return response prose before a trailing protocol-control line."""
+
+        match = _TRAILING_RESPONSE_CONTROL_RE.search(text)
+        if not match:
+            return text, False
+        return text[: match.start()].rstrip(), True
 
     @staticmethod
     def _pop_sentence_chunks(text: str) -> tuple[list[str], str]:
