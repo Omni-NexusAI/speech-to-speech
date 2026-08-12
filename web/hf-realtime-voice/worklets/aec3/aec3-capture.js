@@ -152,6 +152,8 @@ class Aec3CaptureProcessor extends AudioWorkletProcessor {
       };
       this._postStatus();
     } else if (data.kind === "echo_reset") {
+      this._flushStrictPending();
+      this._flushOutputChunk();
       this._micRing.clear();
       this._referenceRing.clear();
       this._chunkWrite = 0;
@@ -169,13 +171,16 @@ class Aec3CaptureProcessor extends AudioWorkletProcessor {
 
   _resolveMode() {
     const previousMode = this._effectiveMode;
-    if (this._requestedMode === "native") this._effectiveMode = "native";
+    let nextMode;
+    if (this._requestedMode === "native") nextMode = "native";
     else if (this._requestedMode === "adaptive") {
-      this._effectiveMode = this._moduleReady ? "adaptive" : "native";
+      nextMode = this._moduleReady ? "adaptive" : "native";
     } else {
-      this._effectiveMode = this._moduleReady ? "strict" : "strict-fallback";
+      nextMode = this._moduleReady ? "strict" : "strict-fallback";
     }
-    if (previousMode !== this._effectiveMode) {
+    if (previousMode !== nextMode) {
+      if (previousMode === "strict") this._flushStrictPending();
+      this._effectiveMode = nextMode;
       this._strictGate.reset();
       this._lastCandidateMs = 0;
     }
@@ -258,16 +263,32 @@ class Aec3CaptureProcessor extends AudioWorkletProcessor {
     }
   }
 
-  _emitChunk(levelRms) {
+  _flushStrictPending() {
+    const decision = this._strictGate.flush();
+    for (const retainedFrame of decision.emit) {
+      this._appendOutput(retainedFrame, rms(retainedFrame));
+    }
+    this._suppressedMs += decision.suppressedFrames * AEC3_FRAME_MS;
+    this._lastCandidateMs = 0;
+  }
+
+  _flushOutputChunk() {
+    if (this._chunkWrite <= 0) return;
+    const sampleCount = this._chunkWrite;
+    this._emitChunk(rms(this._chunk.subarray(0, sampleCount)), sampleCount);
+    this._chunkWrite = 0;
+  }
+
+  _emitChunk(levelRms, sampleCount = this._chunk.length) {
     let target = 1;
     if (this._gateEnabled) {
       if (levelRms >= this._thresholdLin) this._holdRemaining = this._holdSamples;
-      else if (this._holdRemaining > 0) this._holdRemaining -= this._chunk.length;
+      else if (this._holdRemaining > 0) this._holdRemaining -= sampleCount;
       else target = 0;
     }
-    const output = new Int16Array(this._chunk.length);
+    const output = new Int16Array(sampleCount);
     let gain = this._gateGain;
-    for (let index = 0; index < this._chunk.length; index += 1) {
+    for (let index = 0; index < sampleCount; index += 1) {
       const coefficient = target > gain ? this._attackCoef : this._releaseCoef;
       gain = target + (gain - target) * coefficient;
       const sample = Math.max(-1, Math.min(1, this._chunk[index] * gain));

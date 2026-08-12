@@ -152,6 +152,83 @@ const doubleTalkMetric = processor.messages
 assert.equal(doubleTalkMetric.doubleTalk, true);
 assert.equal(doubleTalkMetric.doubleTalkSource, "aec3-output-evidence");
 
+const makeProcessor = () => new Processor({
+  processorOptions: {
+    chunkMs: 40,
+    aec3Module: wasmModule,
+    aec3Manifest: manifest,
+  },
+});
+const pendingNearEndFrame = () => new Float32Array(480).fill(0.2);
+const queueUncertainNearEnd = (target) => {
+  const decision = target._strictGate.consume(pendingNearEndFrame(), {
+    playbackActive: true,
+    nearEndEvidence: true,
+    highConfidenceEchoOnly: false,
+  });
+  assert.equal(decision.emit.length, 0);
+  assert.equal(target._strictGate.pending.length, 1);
+};
+const buffersAfter = (target, before) => target.messages
+  .slice(before)
+  .filter((value) => value instanceof ArrayBuffer);
+const assertResetFlushesOnset = (target, label) => {
+  const before = target.messages.length;
+  target.port.onmessage({ data: { kind: "echo_reset" } });
+  const emitted = buffersAfter(target, before);
+  assert.equal(emitted.length, 1, `${label} remains available to the output path`);
+  const pcm = new Int16Array(emitted[0]);
+  assert.equal(pcm.length, 160, `${label} preserves the exact 10 ms onset`);
+  assert.ok([...pcm].every((sample) => sample > 0), `${label} emits retained PCM rather than silence`);
+};
+
+const modeTransitionProcessor = makeProcessor();
+modeTransitionProcessor.port.onmessage({
+  data: { kind: "echo_guard", mode: "strict", nativeAec: true },
+});
+queueUncertainNearEnd(modeTransitionProcessor);
+modeTransitionProcessor.port.onmessage({
+  data: { kind: "echo_guard", mode: "native", nativeAec: true },
+});
+assert.equal(modeTransitionProcessor._strictGate.pending.length, 0);
+assert.equal(
+  modeTransitionProcessor._chunkWrite,
+  160,
+  "leaving Strict routes pending uncertain speech into the normal output FIFO",
+);
+assertResetFlushesOnset(modeTransitionProcessor, "mode-transition onset");
+
+const moduleFailureProcessor = makeProcessor();
+moduleFailureProcessor.port.onmessage({
+  data: { kind: "echo_guard", mode: "strict", nativeAec: true },
+});
+queueUncertainNearEnd(moduleFailureProcessor);
+moduleFailureProcessor._disableModule(new Error("synthetic module failure"));
+assert.equal(moduleFailureProcessor._strictGate.pending.length, 0);
+assert.equal(
+  moduleFailureProcessor._chunkWrite,
+  160,
+  "a Strict module failure preserves pending uncertain speech before fallback",
+);
+assertResetFlushesOnset(moduleFailureProcessor, "module-failure onset");
+
+const resetProcessor = makeProcessor();
+resetProcessor.port.onmessage({
+  data: { kind: "echo_guard", mode: "strict", nativeAec: true },
+});
+queueUncertainNearEnd(resetProcessor);
+const beforeReset = resetProcessor.messages.length;
+resetProcessor.port.onmessage({ data: { kind: "echo_reset" } });
+const resetBuffers = buffersAfter(resetProcessor, beforeReset);
+assert.equal(resetBuffers.length, 1, "echo reset flushes pending uncertain speech");
+assert.equal(new Int16Array(resetBuffers[0]).length, 160, "reset preserves the exact 10 ms onset");
+assert.ok(
+  [...new Int16Array(resetBuffers[0])].every((sample) => sample > 0),
+  "reset emits retained onset PCM rather than silence",
+);
+assert.equal(resetProcessor._chunkWrite, 0);
+assert.equal(resetProcessor._strictGate.pending.length, 0);
+
 const { loadAec3Worklet } = await import(loaderUrl);
 const addedModules = [];
 const fetchImpl = async (url) => {

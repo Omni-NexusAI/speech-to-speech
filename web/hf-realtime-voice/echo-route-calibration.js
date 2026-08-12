@@ -81,7 +81,7 @@ export class EchoRouteCalibration {
    * @returns {{ accepted: boolean, reason: string, sampleCount: number }}
    */
   add(sample) {
-    if (!sample || sample.playbackActive !== true || sample.doubleTalk === true) {
+    if (!sample || sample.playbackActive !== true || sample.doubleTalk !== false) {
       return { accepted: false, reason: "ineligible", sampleCount: this._samples.length };
     }
     const lagMs = finiteNumber(sample.lagMs);

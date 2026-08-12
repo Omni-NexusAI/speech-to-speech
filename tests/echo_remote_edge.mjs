@@ -42,6 +42,8 @@ for (const centerMs of [80, 150, 300]) {
   // Ineligible observations do not contaminate the quiet playback cohort.
   collector.add({ lagMs: 999, timestampMs: 2100, playbackActive: false, doubleTalk: false });
   collector.add({ lagMs: 999, timestampMs: 2200, playbackActive: true, doubleTalk: true });
+  collector.add({ lagMs: 999, timestampMs: 2300, playbackActive: true, doubleTalk: null });
+  collector.add({ lagMs: 999, timestampMs: 2400, playbackActive: true });
   const result = collector.result({ outputLatencyMs: 20 });
   assert.equal(result.accepted, true, `${centerMs} ms remote-route calibration is stable`);
   assert.equal(result.sampleCount, 21);
