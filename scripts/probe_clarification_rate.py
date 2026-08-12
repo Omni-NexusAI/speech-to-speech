@@ -26,6 +26,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 import wave
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -512,7 +513,12 @@ def parse_primary_response(handler: GemmaAudioSTTHandler, data: Mapping[str, Any
 _GARBLING_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
-        r"\b(?:garbl|transcri|audio (?:was|is)|speech (?:was|is)|could not hear|couldn't hear|cannot hear|can't hear)\w*\b",
+        r"\b(?:garbl\w*|transcri\w*|recogn(?:ition|iz(?:e|ed|ing))|"
+        r"(?:audio|speech|input) (?:was|is|seems?|sounds?)|"
+        r"(?:(?:could not|couldn't|cannot|can't|did not|didn't|do not|don't|"
+        r"was unable to|wasn't able to|am unable to|unable to) "
+        r"(?:hear|understand|make out|recognize|transcribe|catch)(?: you| that| the (?:audio|speech|input))?|"
+        r"had trouble (?:hearing|understanding|recognizing|transcribing)(?: you| that| the (?:audio|speech|input))?))\b",
         r"\b(?:no (?:te )?entend|transcripci|audio (?:estaba|está)|no puedo oír)\w*\b",
         r"\b(?:nicht verstanden|nicht verstehen|unklar|transkrip|audio war|nicht hören)\w*\b",
         r"(?:聞き取れ|聞こえ|文字起こし|音声|不明瞭|分かりません|わかりません)",
@@ -537,13 +543,16 @@ def _contains_expected_number(text: str, expected: int | None) -> bool:
 
 
 def classify_visible_response(text: str, expected: int | None) -> str:
-    if any(pattern.search(text) for pattern in _GARBLING_PATTERNS):
+    # Process/recognition commentary is always disqualifying, even when the
+    # response also happens to contain the expected numeric answer.
+    normalized = unicodedata.normalize("NFKC", text).replace("’", "'")
+    if any(pattern.search(normalized) for pattern in _GARBLING_PATTERNS):
         return "garbling_commentary"
-    if any(pattern.search(text) for pattern in _CLARIFICATION_PATTERNS):
+    if any(pattern.search(normalized) for pattern in _CLARIFICATION_PATTERNS):
         return "clarification"
-    if text.rstrip().endswith(("?", "？")):
+    if normalized.rstrip().endswith(("?", "？")):
         return "clarification"
-    if _contains_expected_number(text, expected):
+    if _contains_expected_number(normalized, expected):
         return "ordinary"
     return "unclassified"
 

@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
+from pydantic import ValidationError
 
 
 def _load_ui_server_module():
@@ -21,6 +23,224 @@ def _load_ui_server_module():
             sys.path.remove(str(ui_dir))
         except ValueError:
             pass
+
+
+def _mock_serper(monkeypatch, server, payloads, *, status_code=200):
+    calls = []
+    queued = list(payloads)
+
+    class Response:
+        def __init__(self, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, url, *, headers, json):
+            calls.append({"url": url, "headers": headers, "json": dict(json)})
+            return Response(queued.pop(0))
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", Client)
+    return calls
+
+
+def _response_json(response):
+    return json.loads(response.body.decode("utf-8"))
+
+
+def test_search_defaults_to_unfiltered_web_and_returns_truthful_versioned_results(monkeypatch):
+    server = _load_ui_server_module()
+    calls = _mock_serper(
+        monkeypatch,
+        server,
+        [
+            {
+                "answerBox": {"answer": "A bounded direct answer"},
+                "organic": [
+                    {
+                        "title": "Reference",
+                        "snippet": "A factual snippet.",
+                        "link": "https://example.test/reference",
+                        "position": 4,
+                    }
+                ],
+            }
+        ],
+    )
+
+    response = asyncio.run(server.search(server.SearchRequest(query="reference topic", key="test-key")))
+    payload = _response_json(response)
+
+    assert calls == [
+        {
+            "url": "https://google.serper.dev/search",
+            "headers": {"X-API-KEY": "test-key", "Content-Type": "application/json"},
+            "json": {"q": "reference topic", "num": server.MAX_RESULTS},
+        }
+    ]
+    assert payload["type"] == "web_search_result"
+    assert payload["schema_version"] == 1
+    assert payload["provider"] == "serper"
+    assert payload["requested_mode"] == "auto"
+    assert payload["effective_mode"] == "web"
+    assert payload["freshness"] == "none"
+    assert payload["recency_filter_applied"] is False
+    assert payload["fallback_applied"] is False
+    assert payload["answer"] == "A bounded direct answer"
+    assert payload["results"] == [
+        {
+            "title": "Reference",
+            "snippet": "A factual snippet.",
+            "url": "https://example.test/reference",
+            "date": None,
+            "source": None,
+            "position": 4,
+        }
+    ]
+    assert payload["retrieved_at_utc"].endswith("Z")
+    assert "today" not in json.dumps(payload).lower()
+    assert response.headers["cache-control"] == "no-store, max-age=0"
+    assert response.headers["pragma"] == "no-cache"
+
+
+@pytest.mark.parametrize(
+    ("mode", "freshness", "endpoint", "qdr", "result_key"),
+    [
+        ("auto", "day", "news", "qdr:d", "news"),
+        ("auto", "week", "news", "qdr:w", "news"),
+        ("web", "month", "search", "qdr:m", "organic"),
+        ("news", "year", "news", "qdr:y", "news"),
+        ("news", "none", "news", None, "news"),
+    ],
+)
+def test_search_maps_mode_and_freshness_to_serper_endpoint_and_qdr(
+    monkeypatch, mode, freshness, endpoint, qdr, result_key
+):
+    server = _load_ui_server_module()
+    calls = _mock_serper(
+        monkeypatch,
+        server,
+        [{result_key: [{"title": "Dated", "link": "https://example.test", "date": "2 hours ago", "source": "Wire"}]}],
+    )
+
+    response = asyncio.run(
+        server.search(server.SearchRequest(query="dated topic", mode=mode, freshness=freshness, key="test-key"))
+    )
+    payload = _response_json(response)
+
+    assert calls[0]["url"] == f"https://google.serper.dev/{endpoint}"
+    assert calls[0]["json"] == {
+        "q": "dated topic",
+        "num": server.MAX_RESULTS,
+        **({"tbs": qdr} if qdr else {}),
+    }
+    assert payload["requested_mode"] == mode
+    assert payload["effective_mode"] == ("news" if endpoint == "news" else "web")
+    assert payload["freshness"] == freshness
+    assert payload["recency_filter_applied"] is (qdr is not None)
+    assert payload["answer"] is None
+    assert payload["results"][0]["date"] == "2 hours ago"
+    assert payload["results"][0]["source"] == "Wire"
+
+
+def test_empty_effective_news_uses_one_same_filter_web_fallback_without_answer_panel(monkeypatch):
+    server = _load_ui_server_module()
+    calls = _mock_serper(
+        monkeypatch,
+        server,
+        [
+            {"news": [], "answerBox": {"answer": "must not leak"}},
+            {
+                "organic": [{"title": "Fallback", "link": "https://example.test/fallback"}],
+                "answerBox": {"answer": "also must not leak"},
+            },
+        ],
+    )
+
+    response = asyncio.run(
+        server.search(server.SearchRequest(query="recent topic", mode="auto", freshness="week", key="test-key"))
+    )
+    payload = _response_json(response)
+
+    assert [call["url"].rsplit("/", 1)[-1] for call in calls] == ["news", "search"]
+    assert [call["json"]["tbs"] for call in calls] == ["qdr:w", "qdr:w"]
+    assert payload["requested_mode"] == "auto"
+    assert payload["effective_mode"] == "web"
+    assert payload["fallback_applied"] is True
+    assert payload["recency_filter_applied"] is True
+    assert payload["answer"] is None
+    assert payload["results"][0]["title"] == "Fallback"
+
+
+def test_empty_explicit_news_stays_news_without_web_fallback(monkeypatch):
+    server = _load_ui_server_module()
+    calls = _mock_serper(monkeypatch, server, [{"news": []}])
+
+    response = asyncio.run(
+        server.search(server.SearchRequest(query="recent topic", mode="news", freshness="week", key="test-key"))
+    )
+    payload = _response_json(response)
+
+    assert [call["url"].rsplit("/", 1)[-1] for call in calls] == ["news"]
+    assert calls[0]["json"]["tbs"] == "qdr:w"
+    assert payload["requested_mode"] == "news"
+    assert payload["effective_mode"] == "news"
+    assert payload["fallback_applied"] is False
+    assert payload["results"] == []
+    assert payload["answer"] is None
+
+
+def test_search_rejects_invalid_or_oversized_inputs_before_provider_call(monkeypatch):
+    server = _load_ui_server_module()
+    with pytest.raises(ValidationError):
+        server.SearchRequest(query="topic", mode="images", key="test-key")
+    with pytest.raises(ValidationError):
+        server.SearchRequest(query="topic", freshness="hour", key="test-key")
+    with pytest.raises(ValidationError):
+        server.SearchRequest(query="topic", extra_field="private", key="test-key")
+    with pytest.raises(HTTPException, match="Empty query"):
+        asyncio.run(server.search(server.SearchRequest(query="   ", key="test-key")))
+    with pytest.raises(HTTPException, match="too long"):
+        asyncio.run(server.search(server.SearchRequest(query="q" * (server.MAX_QUERY_CHARS + 1), key="test-key")))
+
+
+def test_search_bounds_provider_strings_and_provider_failure_is_content_free(monkeypatch, caplog):
+    server = _load_ui_server_module()
+    calls = _mock_serper(
+        monkeypatch,
+        server,
+        [{"organic": [{"title": "t" * 500, "snippet": "s" * 2000, "link": "u" * 3000, "date": "d" * 200, "source": "x" * 400}]}],
+    )
+    payload = _response_json(
+        asyncio.run(server.search(server.SearchRequest(query="bounded", key="test-key")))
+    )
+    result = payload["results"][0]
+    assert len(result["title"]) == server.MAX_RESULT_TITLE_CHARS
+    assert len(result["snippet"]) == server.MAX_RESULT_SNIPPET_CHARS
+    assert len(result["url"]) == server.MAX_RESULT_URL_CHARS
+    assert len(result["date"]) == server.MAX_RESULT_DATE_CHARS
+    assert len(result["source"]) == server.MAX_RESULT_SOURCE_CHARS
+    assert len(calls) == 1
+
+    secret_query = "private query sentinel"
+    secret_body = "private provider body sentinel"
+    _mock_serper(monkeypatch, server, [{"message": secret_body, "query": secret_query}], status_code=429)
+    with caplog.at_level("WARNING"), pytest.raises(HTTPException) as exc_info:
+        asyncio.run(server.search(server.SearchRequest(query=secret_query, key="test-key")))
+    public_failure = str(exc_info.value.detail) + caplog.text
+    assert secret_query not in public_failure
+    assert secret_body not in public_failure
 
 
 def test_voice_library_uses_portable_default_and_env_override(tmp_path, monkeypatch):
@@ -738,7 +958,9 @@ def test_tool_output_is_acknowledged_before_one_post_tool_response():
     assert main_js.index("sessionClient.sendToolOutput") < main_js.index("sessionClient.requestToolResponse")
     assert main_js.index("sessionClient.requestToolResponse") < main_js.index("await outputAck")
     assert "requestToolResponse(opts = {})" in client_js
-    assert 'this._send({ type: "response.create" })' in client_js
+    assert 'type: "response.create"' in client_js
+    assert "...(opts.tools ? { tools: opts.tools } : {})" in client_js
+    assert "...(opts.toolChoice ? { tool_choice: opts.toolChoice } : {})" in client_js
 
 
 def test_local_ui_teardown_isolates_closed_client_events():

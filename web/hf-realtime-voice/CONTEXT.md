@@ -103,6 +103,18 @@ One point-in-time frame captured only by a real tool call. Preview is not a
 snapshot, and a question about the current view or a change requires a fresh
 call. Every invocation receives a distinct durable visible card.
 
+## Web search
+
+A browser tool backed by the same-origin Serper proxy. Its canonical request is
+`query` plus optional `mode` (`auto`, `web`, or `news`) and `freshness` (`none`,
+`day`, `week`, `month`, or `year`). Output is versioned structured JSON that
+distinguishes requested/effective mode, retrieval time, recency filtering, and
+the one auto-news-to-web zero-result fallback; explicit news never falls back. Available result dates and sources remain attached to their
+results; retrieval time does not imply that an undated result was published
+today. One accepted turn may make at most one distinct narrower refinement. The
+first result follow-up exposes only search; terminal and non-search follow-ups
+disable tools for that response.
+
 ## Hosted session
 
 The optional Hugging Face deployment path in which the UI server proxies a

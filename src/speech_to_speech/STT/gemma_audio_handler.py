@@ -27,6 +27,7 @@ from speech_to_speech.LLM.chat_completions_language_model import (
     _to_chat_tool_choice,
     _to_chat_tools,
 )
+from speech_to_speech.LLM.voice_prompt import VOICE_INPUT_TOOL_POLICY
 from speech_to_speech.pipeline.cancellable_http import CancellableAsyncSSEStream
 from speech_to_speech.pipeline.events import PipelineMetricEvent
 from speech_to_speech.pipeline.handler_types import STTIn, STTOut
@@ -650,11 +651,9 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         if session_instructions:
             system_parts.append(session_instructions)
         semantic_instructions = (
-            "Treat accepted user input as an ordinary semantic user message. Infer its likely intent from the whole "
-            "accepted turn and answer naturally or call an appropriate provided tool. It may use any language, accent, "
-            "or code-switching. Follow the language or languages naturally used in the current utterance unless the user "
-            "or session instructions request another response language. Stay focused on the user's intended topic unless "
-            "the user explicitly asks about system internals. "
+            "The accepted turn may use any language, accent, or code-switching. Follow the language or languages "
+            "naturally used in the current utterance unless the user or session instructions request another response "
+            "language. Stay focused on the user's intended topic unless the user explicitly asks about system internals. "
             "For every meaningful accepted turn, begin with USER_MEMORY as one short, affirmative, content-faithful "
             "semantic paraphrase of what the user means. Preserve names, numbers, negation, ordinary references, and the "
             "language of the request; resolve references from conversation context without adding facts. Omit USER_MEMORY "
@@ -680,12 +679,10 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             "varies with the conversation; do not reuse a stock phrase. Put it in ASSISTANT_PREAMBLE: "
             "<acknowledgement>; plain ASSISTANT_RESPONSE text is also accepted for "
             "compatibility. Do not emit a result-dependent ASSISTANT_RESPONSE until the tool result is available. "
-            "Ask a brief, content-focused follow-up only when the request itself lacks a detail needed to complete it. "
-            "Resolve pronouns, references, and requests such as 'do that in reverse' from the retained conversation and "
-            "completed tool results, then continue the conversation naturally. "
             "Do not wrap plain-text responses in JSON or Markdown."
         )
         system_parts.append(semantic_instructions)
+        system_parts.append(VOICE_INPUT_TOOL_POLICY)
         user_content: list[dict[str, Any]] = []
         for image_url in self._conversation_image_urls(runtime_config):
             user_content.append({"type": "image_url", "image_url": {"url": image_url}})
@@ -1042,6 +1039,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         )
         tools, camera_context, _ = self._enforce_camera_context(vad_audio, raw_text, tools)
         camera_current = camera_context == "current"
+        camera_out_of_order = self._camera_context_is_out_of_order(raw_text)
         if generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation):
             return
         preamble = self._tool_preamble(raw_text, tools) if tools else None
@@ -1049,7 +1047,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             preamble
             if tools and preamble
             else ""
-            if camera_current
+            if camera_current or camera_out_of_order
             else pending_response.strip()
             if assistant_started
             else self._fallback_response_text(raw_text)
@@ -1062,8 +1060,13 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             "transcript_available" if transcript else "transcript_unavailable",
             detail={"mode": "final", "source": "primary"},
         )
-        full_response = preamble or ("" if camera_current else self._fallback_response_text(raw_text))
-        language_code = language_code or self._effective_assistant_language(raw_text)
+        full_response = preamble or (
+            "" if camera_current or camera_out_of_order else self._fallback_response_text(raw_text)
+        )
+        # The complete envelope is authoritative. A later duplicate or
+        # conflicting marker must fail closed to Auto for this response and its
+        # same-turn tool continuation.
+        language_code = self._effective_assistant_language(raw_text)
         committed = self._commit_context(
             vad_audio,
             transcript,
@@ -1098,6 +1101,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         user_memory = None if transcript else self._extract_user_memory(text)
         tools = tools or []
         tools, camera_context, _ = self._enforce_camera_context(vad_audio, text, tools)
+        camera_out_of_order = self._camera_context_is_out_of_order(text)
         language_code = self._effective_assistant_language(text)
         preamble = self._tool_preamble(text, tools) if tools else None
         self._emit_metric(
@@ -1106,7 +1110,11 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             "transcript_available" if transcript else "transcript_unavailable",
             detail={"mode": "final", "source": "primary"},
         )
-        response_text = preamble or ("" if camera_context == "current" else self._fallback_response_text(text))
+        response_text = preamble or (
+            ""
+            if camera_context == "current" or camera_out_of_order
+            else self._fallback_response_text(text)
+        )
         if response_text:
             logger.info("Gemma audio response ready (%d characters)", len(response_text))
         committed = self._commit_context(
@@ -1341,11 +1349,23 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
 
     @staticmethod
     def _extract_camera_context(text: str) -> str | None:
-        matches = _CAMERA_CONTEXT_RE.findall(text)
+        matches = list(_CAMERA_CONTEXT_RE.finditer(text))
         if len(matches) != 1:
             return None
-        value = _failure_sentinel_key(matches[0].strip().strip('"'))
+        output_match = _OUTPUT_MARKER_RE.search(text)
+        if output_match is not None and matches[0].start() >= output_match.start():
+            return None
+        value = _failure_sentinel_key(matches[0].group(1).strip().strip('"'))
         return value if value in {"current", "historical", "none"} else None
+
+    @staticmethod
+    def _camera_context_is_out_of_order(text: str) -> bool:
+        matches = list(_CAMERA_CONTEXT_RE.finditer(text))
+        output_match = _OUTPUT_MARKER_RE.search(text)
+        if len(matches) != 1 or output_match is None or matches[0].start() < output_match.start():
+            return False
+        value = _failure_sentinel_key(matches[0].group(1).strip().strip('"'))
+        return value == "current"
 
     def _enforce_camera_context(
         self,
@@ -1359,8 +1379,9 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         causes a capture. Metrics contain only the enum/call identity.
         """
 
+        non_camera_tools = [tool for tool in tools if tool.name != "camera_snapshot"]
         if not self._camera_tool_available(vad_audio):
-            return tools, None, False
+            return non_camera_tools, None, False
         camera_context = self._extract_camera_context(text)
         if camera_context is None:
             self._emit_metric(
@@ -1369,7 +1390,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 "freshness_unclassified",
                 detail={"camera_context": "unclassified", "enforced": False},
             )
-            return tools, None, False
+            return non_camera_tools, None, False
         if camera_context != "current":
             self._emit_metric(
                 vad_audio,
@@ -1377,7 +1398,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 "freshness_classified",
                 detail={"camera_context": camera_context, "enforced": False},
             )
-            return tools, camera_context, False
+            return non_camera_tools, camera_context, False
 
         first_camera = next((tool for tool in tools if tool.name == "camera_snapshot"), None)
         if first_camera is None:
@@ -1387,7 +1408,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 chat=self._conversation_chat(vad_audio),
                 turn_id=getattr(vad_audio, "turn_id", None),
             )[0]
-            tools = [*tools, injected]
+            tools = [*non_camera_tools, injected]
             first_camera = injected
             enforced = True
         else:

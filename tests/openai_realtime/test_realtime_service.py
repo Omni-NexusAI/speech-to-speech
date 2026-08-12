@@ -409,6 +409,47 @@ class TestHandleConversationItemCreate:
         assert st.tool_followup_requested is True
         assert st.tool_followup_started is False
 
+    def test_multi_tool_followup_merges_to_none_and_starts_after_last_output(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+    ):
+        st = service._state(conn_id)
+        st.in_response = True
+        st.pending_tool_call_ids.update({"call_search", "call_camera"})
+
+        first = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(type="response.create", response={"tool_choice": "auto"}),
+        )
+        conservative = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(type="response.create", response={"tool_choice": "none"}),
+        )
+
+        assert first is None
+        assert conservative is None
+        assert st.tool_followup_response is not None
+        assert st.tool_followup_response.tool_choice == "none"
+
+        # Model the originating response closing before the final output. The
+        # final tool's duplicate create must now start exactly one continuation.
+        st.in_response = False
+        st.pending_tool_call_ids.clear()
+        st.tool_followup_ready = True
+        created = service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(type="response.create", response={"tool_choice": "auto"}),
+        )
+
+        assert isinstance(created, ResponseCreatedEvent)
+        request = text_prompt_queue.get_nowait()
+        assert isinstance(request, GenerateResponseRequest)
+        assert request.response is not None
+        assert request.response.tool_choice == "none"
+        assert st.tool_followup_started is True
+
     def test_input_image_forwarded(self, service, conn_id, text_prompt_queue):
         evt = ConversationItemCreateEvent(
             type="conversation.item.create",

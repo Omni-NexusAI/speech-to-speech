@@ -153,8 +153,29 @@ class ResponseHandler(RealtimeBaseHandler):
             # Hosted-compatible ordering sends response.create immediately after
             # function_call_output. Queue it behind the originating response and
             # optional deferred camera image; the backend owns the barrier.
-            if st.tool_followup_started or st.tool_followup_requested:
-                logger.info("Ignoring duplicate response.create for the active tool transaction")
+            if st.tool_followup_started:
+                return self.make_error(
+                    message="The tool follow-up response has already been requested.",
+                    _type="duplicate_tool_followup",
+                )
+            if st.tool_followup_requested:
+                # Multiple calls in one origin each produce an output/create
+                # transaction. Merge those creates conservatively: any `none`
+                # override dominates a search-only refinement allowance, so
+                # arrival order cannot expose an unrelated tool. The final
+                # output's create also starts a queued follow-up when the
+                # origin response already closed.
+                if event.response and event.response.tool_choice == "none":
+                    current = st.tool_followup_response
+                    if current is None or current.tool_choice != "none":
+                        st.tool_followup_response = event.response
+                if st.tool_followup_ready and not st.in_response and not st.pending_tool_call_ids:
+                    return self._start_generation(
+                        conn_id,
+                        st.tool_followup_response,
+                        tool_followup=True,
+                    )
+                logger.info("Merged duplicate response.create for the active tool transaction")
                 return None
             st.tool_followup_requested = True
             st.tool_followup_response = event.response

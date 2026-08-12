@@ -23,6 +23,7 @@ from speech_to_speech.LLM.base_openai_compatible_language_model import (
 )
 from speech_to_speech.LLM.chat import Chat, make_assistant_message, make_user_message
 from speech_to_speech.LLM.chat_completions_language_model import ChatCompletionsApiModelHandler
+from speech_to_speech.LLM.voice_prompt import VOICE_INPUT_TOOL_POLICY
 from speech_to_speech.pipeline.events import TranscriptionCompletedEvent
 from speech_to_speech.pipeline.messages import (
     DirectAssistantRequest,
@@ -189,6 +190,9 @@ def test_gemma_audio_payload_includes_instructions_history_tools_and_disables_th
 
     system_prompt = payload["messages"][0]["content"]
     assert "Always answer as TEST ROLE." in system_prompt
+    assert system_prompt.count(VOICE_INPUT_TOOL_POLICY.rstrip()) == 1
+    assert "one distinct narrower refinement" in system_prompt
+    assert "retrieved_at_utc is retrieval" in system_prompt
     assert "any language, accent, or code-switching" in system_prompt
     assert "Follow the language or languages naturally used in the current utterance" in system_prompt
     assert "begin with USER_MEMORY as one short, affirmative, content-faithful" in system_prompt
@@ -629,8 +633,12 @@ def test_semantic_memory_preserves_tool_preamble_and_call_order_without_transcri
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
     chat = Chat(30)
+    runtime_config = RuntimeConfig(chat=chat)
+    runtime_config.session.tools = [
+        {"type": "function", "name": "camera_snapshot", "parameters": {"type": "object"}}
+    ]
     vad_audio = SimpleNamespace(
-        runtime_config=RuntimeConfig(chat=chat),
+        runtime_config=runtime_config,
         turn_id="turn_tool_preamble_no_transcript",
         turn_revision=0,
         created_at_s=0.0,
@@ -649,6 +657,7 @@ def test_semantic_memory_preserves_tool_preamble_and_call_order_without_transcri
         handler._responses_from_text(
             "USER_MEMORY: Inspect the current camera view more closely.\n"
             "ASSISTANT_LANGUAGE: English\n"
+            "CAMERA_CONTEXT: current\n"
             "ASSISTANT_PREAMBLE: Let me take a closer look.",
             vad_audio,
             tools=[tool],
@@ -676,6 +685,17 @@ def _camera_vad(turn_id="turn_camera_freshness"):
         turn_id=turn_id,
         turn_revision=0,
         created_at_s=0.0,
+    )
+
+
+def _completed_tool(name: str, call_id: str) -> ResponseFunctionToolCall:
+    return ResponseFunctionToolCall(
+        type="function_call",
+        name=name,
+        arguments="{}",
+        call_id=call_id,
+        id=f"fc_{call_id}",
+        status="completed",
     )
 
 
@@ -738,10 +758,19 @@ def test_noncurrent_camera_context_never_forces_a_capture(camera_context):
         "ASSISTANT_RESPONSE: I can answer from the retained context."
     )
 
-    output = list(handler._responses_from_text(text, vad_audio))[-1]
+    output = list(
+        handler._responses_from_text(
+            text,
+            vad_audio,
+            tools=[
+                _completed_tool("camera_snapshot", "call_noncurrent_camera"),
+                _completed_tool("web_search", "call_noncurrent_search"),
+            ],
+        )
+    )[-1]
 
     assert output.text == "I can answer from the retained context."
-    assert output.tools == []
+    assert [tool.name for tool in output.tools] == ["web_search"]
 
 
 def test_out_of_order_current_camera_context_never_streams_stale_visual_prose():
@@ -760,8 +789,7 @@ def test_out_of_order_current_camera_context_never_streams_stale_visual_prose():
     outputs = list(handler._consume_stream(stream, vad_audio))
 
     assert all("stale visual claim" not in output.text.lower() for output in outputs)
-    assert len(outputs[-1].tools) == 1
-    assert outputs[-1].tools[0].name == "camera_snapshot"
+    assert outputs[-1].tools == []
 
 
 @pytest.mark.parametrize(
@@ -783,7 +811,13 @@ def test_duplicate_or_conflicting_camera_context_is_buffered_and_never_forces_ca
         "ASSISTANT_RESPONSE: A complete response."
     )
 
-    output = list(handler._responses_from_text(text, vad_audio))[-1]
+    output = list(
+        handler._responses_from_text(
+            text,
+            vad_audio,
+            tools=[_completed_tool("camera_snapshot", "call_conflicting_camera")],
+        )
+    )[-1]
 
     assert output.tools == []
     assert output.text == "A complete response."
@@ -827,7 +861,13 @@ def test_missing_or_malformed_camera_context_is_privacy_fail_closed_and_content_
         "ASSISTANT_RESPONSE: Done."
     )
 
-    output = list(handler._responses_from_text(text, vad_audio))[-1]
+    output = list(
+        handler._responses_from_text(
+            text,
+            vad_audio,
+            tools=[_completed_tool("camera_snapshot", "call_unclassified_camera")],
+        )
+    )[-1]
     emitted_metrics = []
     while not metrics.empty():
         emitted_metrics.append(metrics.get_nowait())
@@ -858,7 +898,13 @@ def test_camera_context_marker_is_inert_when_camera_tool_is_disabled():
         "ASSISTANT_RESPONSE: Done."
     )
 
-    output = list(handler._responses_from_text(text, vad_audio))[-1]
+    output = list(
+        handler._responses_from_text(
+            text,
+            vad_audio,
+            tools=[_completed_tool("camera_snapshot", "call_disabled_camera")],
+        )
+    )[-1]
 
     assert output.text == "Done."
     assert output.tools == []
@@ -1223,6 +1269,44 @@ class _FakeSSEStream:
 
 def _sse_text(text: str) -> list[str]:
     return [f"data: {json.dumps({'choices': [{'delta': {'content': text}}]})}", "data: [DONE]"]
+
+
+def test_streaming_full_envelope_language_conflict_fails_closed_for_tool_continuation():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
+    runtime_config = RuntimeConfig(chat=Chat(30))
+    runtime_config.session.tools = [
+        {"type": "function", "name": "web_search", "parameters": {"type": "object"}}
+    ]
+    vad_audio = SimpleNamespace(
+        runtime_config=runtime_config,
+        turn_id="turn_language_conflict_tool",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+    delta = {
+        "content": (
+            "ASSISTANT_LANGUAGE: Spanish\n"
+            "ASSISTANT_RESPONSE: Buscaré.\n"
+            "ASSISTANT_LANGUAGE: English"
+        ),
+        "tool_calls": [
+            {
+                "index": 0,
+                "id": "call_language_search",
+                "function": {"name": "web_search", "arguments": "{}"},
+            }
+        ],
+    }
+    stream = _FakeSSEStream(
+        [f"data: {json.dumps({'choices': [{'delta': delta}]})}", "data: [DONE]"]
+    )
+
+    outputs = list(handler._consume_stream(stream, vad_audio))
+
+    assert outputs[-1].language_code == "Auto"
+    assert [tool.name for tool in outputs[-1].tools] == ["web_search"]
+    assert runtime_config.local_pipeline["assistant_language"] == "Auto"
 
 
 def test_primary_payload_contains_current_audio_once_before_history_anchor_is_committed():

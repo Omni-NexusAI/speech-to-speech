@@ -19,10 +19,15 @@
 import {
   S2sWsRealtimeClient,
   prepareToolArgumentsForBrowser,
-} from "./ws/s2s-ws-client.js?v=18-adaptive-safe-start";
+} from "./ws/s2s-ws-client.js?v=19-search-freshness";
 import { $, truncateError, DEBUG } from "./ui/dom.js";
 import { ChatView } from "./ui/chat.js?v=3-tool-privacy";
 import { Account } from "./ui/account.js";
+import {
+  SearchTurnPolicy,
+  WEB_SEARCH_ARGUMENT_SCHEMA,
+  searchPolicyOutput,
+} from "./tools/web-search.js?v=1-search-freshness";
 
 const DEFAULT_VOICE = "";
 const DEFAULT_INSTRUCTIONS =
@@ -39,7 +44,13 @@ const TOOL_USE_HINT =
   "phrase, describe capabilities, or wait for another turn. Call the tool right " +
   "away in the same response. A camera snapshot is point-in-time: when the user " +
   "asks what is visible now or what changed, call camera_snapshot again instead " +
-  "of relying on an earlier description.";
+  "of relying on an earlier description. For web_search, choose mode and freshness " +
+  "from the request instead of claiming that undated results are current. Treat " +
+  "retrieved_at_utc as retrieval time, not publication time, and cite each result's " +
+  "date and source when present. Never call an unchanged or broader search after a " +
+  "result. The same accepted user turn may use only one initial search and, only if " +
+  "needed, one distinct narrower refinement; after that, answer from the available " +
+  "results without another tool call.";
 
 const STORAGE_KEYS = {
   // Direct s2s server URL, used only when the deploy has no LOAD_BALANCER_URL
@@ -94,14 +105,10 @@ const TOOL_DEFS = {
     name: "web_search",
     description:
       "Search the web for current or factual information you don't already know " +
-      "(news, prices, facts, documentation). Returns the top results with titles, " +
-      "snippets and URLs.",
-    parameters: {
-      type: "object",
-      properties: { query: { type: "string", minLength: 1, pattern: "\\S", description: "The search query." } },
-      required: ["query"],
-      additionalProperties: false,
-    },
+      "(news, prices, facts, documentation). Choose news/web mode and a real recency " +
+      "filter when the request requires them. Returns versioned structured results " +
+      "with dates and sources when the provider supplies them.",
+    parameters: WEB_SEARCH_ARGUMENT_SCHEMA,
   },
   camera_snapshot: {
     type: "function",
@@ -986,9 +993,9 @@ let voiceInventoryRequest = 0;
 let diagnosticsOpen = localStorage.getItem(STORAGE_KEYS.diagnostics) === "1";
 /** @type {Array<any>} */
 let pipelineMetrics = [];
-const EXPECTED_UI_API_VERSION = 20;
+const EXPECTED_UI_API_VERSION = 21;
 const EXPECTED_BACKEND_API_VERSION = 7;
-const DIAGNOSTIC_STAGES = ["mic", "echo_guard", "vad", "transcription", "gemma", "context", "tool", "tts", "playback"];
+const DIAGNOSTIC_STAGES = ["mic", "echo_guard", "vad", "transcription", "gemma", "context", "tool", "search", "tts", "playback"];
 const DIAGNOSTIC_STAGE_LABELS = { echo_guard: "Echo Guard" };
 const diagnosticWarnings = new Map();
 let backendRuntime = null;
@@ -1013,6 +1020,20 @@ let toolsEnabled = loadTools();
 let serverSearchKey = false;
 // A user-supplied key (fallback when the deploy has none). localStorage only.
 let userSearchKey = localStorage.getItem(STORAGE_KEYS.searchKey) || "";
+const searchTurnPolicy = new SearchTurnPolicy();
+let searchTurnItemId = "";
+
+/** @param {string} [itemId] */
+function resetSearchTurnPolicy(itemId = "") {
+  searchTurnPolicy.reset();
+  searchTurnItemId = itemId;
+}
+
+/** A cumulative VAD revision retains its item ID and therefore its budget. */
+function beginAcceptedSearchTurn(itemId) {
+  const nextItemId = typeof itemId === "string" ? itemId : "";
+  if (!nextItemId || nextItemId !== searchTurnItemId) resetSearchTurnPolicy(nextItemId);
+}
 /** @type {MediaStream | null} */
 let cameraStream = null;
 // Monotonic within the page session. This identifies each actual camera tool
@@ -1722,7 +1743,7 @@ function finishCameraCapture(lifecycle, status, dimensions = {}) {
  *   validation: { ok: true, args: Record<string, unknown> } |
  *     { ok: false, code: string, path: string, errorClass: string }
  * }} prepared
- * @returns {Promise<{ output: string, image?: string, lifecycle?: CameraCallLifecycle }>}
+ * @returns {Promise<{ output: string, image?: string, lifecycle?: CameraCallLifecycle, responseToolChoice?: "auto"|"none", responseTools?: object[] }>}
  */
 async function runTool(sessionClient, name, callId, lifecycle, prepared) {
   if (client !== sessionClient) return { output: "", lifecycle };
@@ -1730,8 +1751,8 @@ async function runTool(sessionClient, name, callId, lifecycle, prepared) {
   const safeName = prepared.tool;
   if (DEBUG) console.debug(`[tool] run name=${safeName} callId=${JSON.stringify(callId)}`);
 
-  /** @type {{ output: string, image?: string, lifecycle?: CameraCallLifecycle }} */
-  let result = { output: "", lifecycle };
+  /** @type {{ output: string, image?: string, lifecycle?: CameraCallLifecycle, responseToolChoice?: "auto"|"none", responseTools?: object[] }} */
+  let result = { output: "", lifecycle, responseToolChoice: /** @type {const} */ ("none") };
   const toolStartedAt = performance.now();
   addPipelineMetric({ stage: "tool", status: "active", detail: { name: safeName, callId } });
   try {
@@ -1746,8 +1767,30 @@ async function runTool(sessionClient, name, callId, lifecycle, prepared) {
         detail: { name: safeName, callId, code: validation.code, path: validation.path, error_class: validation.errorClass },
       });
     } else if (name === "web_search") {
-      const query = typeof validatedArgs.query === "string" ? validatedArgs.query : "";
-      result.output = await execWebSearch(query);
+      const decision = searchTurnPolicy.accept(validatedArgs);
+      result.responseToolChoice = decision.terminal ? "none" : "auto";
+      if (!decision.terminal) result.responseTools = [TOOL_DEFS.web_search];
+      if (!decision.accepted) {
+        result.output = searchPolicyOutput(decision.reason);
+        addPipelineMetric({
+          stage: "search",
+          status: "rejected",
+          detail: { reason: decision.reason, terminal: true },
+        });
+      } else {
+        addPipelineMetric({
+          stage: "search",
+          status: "requested",
+          detail: {
+            requested_mode: decision.args.mode,
+            freshness: decision.args.freshness,
+            refinement: decision.refinement,
+          },
+        });
+        const searchResult = await execWebSearch(decision.args);
+        result.output = searchResult.output;
+        addPipelineMetric({ stage: "search", status: "done", detail: searchResult.diagnostic });
+      }
     } else if (name === "camera_snapshot") {
       const snapshot = captureSnapshot();
       if (snapshot) {
@@ -1756,6 +1799,7 @@ async function runTool(sessionClient, name, callId, lifecycle, prepared) {
           output: "Snapshot captured from the webcam and attached as an image.",
           image: snapshot.dataUrl,
           lifecycle,
+          responseToolChoice: "none",
         };
         finishCameraCapture(lifecycle, "captured", snapshot);
         // Return the tool output; the frame itself rides along with the
@@ -1775,6 +1819,14 @@ async function runTool(sessionClient, name, callId, lifecycle, prepared) {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     result.output = `Tool failed: ${msg}`;
+    if (name === "web_search") {
+      result.responseToolChoice = "none";
+      addPipelineMetric({
+        stage: "search",
+        status: "failed",
+        detail: { error_class: err instanceof TypeError ? "network_error" : "search_error", terminal: true },
+      });
+    }
     if (lifecycle?.captureStatus === "requested") finishCameraCapture(lifecycle, "unavailable");
   }
   if (client !== sessionClient) return result;
@@ -1783,7 +1835,12 @@ async function runTool(sessionClient, name, callId, lifecycle, prepared) {
     const outputAck = sessionClient.sendToolOutput(callId, result.output);
     // Hosted ordering: output, optional image, then response.create. The
     // backend owns the response-ID barrier and starts exactly one follow-up.
-    sessionClient.requestToolResponse(result.image ? { image: result.image } : undefined);
+    const responseOptions = {
+      ...(result.image ? { image: result.image } : {}),
+      ...(result.responseToolChoice ? { toolChoice: result.responseToolChoice } : {}),
+      ...(result.responseTools ? { tools: result.responseTools } : {}),
+    };
+    sessionClient.requestToolResponse(Object.keys(responseOptions).length ? responseOptions : undefined);
     await outputAck;
     if (lifecycle) {
       lifecycle.outputStatus = "acknowledged";
@@ -1820,11 +1877,13 @@ function renderTtsBackendOptions() {
   inputTtsBackend.value = settings.ttsBackend;
 }
 
-/** @param {string} query @returns {Promise<string>} */
-async function execWebSearch(query) {
-  if (!query) return "No query provided.";
+/**
+ * @param {{ query: string, mode: "auto"|"web"|"news", freshness: "none"|"day"|"week"|"month"|"year" }} searchArgs
+ * @returns {Promise<{ output: string, diagnostic: Record<string, unknown> }>}
+ */
+async function execWebSearch(searchArgs) {
   /** @type {Record<string, string>} */
-  const body = { query };
+  const body = { ...searchArgs };
   // Only send a user key when there's no server key (server prefers its own).
   if (!serverSearchKey && userSearchKey) body.key = userSearchKey;
 
@@ -1832,23 +1891,27 @@ async function execWebSearch(query) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    cache: "no-store",
   });
   if (!res.ok) {
-    let detail = String(res.status);
-    try { const j = await res.json(); if (j.detail) detail = j.detail; } catch {}
-    throw new Error(`search error (${detail})`);
+    throw new Error(`search unavailable (${res.status})`);
   }
   const json = await res.json();
-  // Date-stamp the header so the model treats these as fresh realtime facts
-  // rather than its (older) training knowledge.
-  const today = new Date().toISOString().slice(0, 10);
-  /** @type {string[]} */
-  const lines = [`Google search result from ${today}:`];
-  if (json.answer) lines.push(`Answer: ${json.answer}`);
-  for (const r of json.results || []) {
-    lines.push(`- ${r.title}: ${r.snippet} (${r.url})`);
+  if (json?.type !== "web_search_result" || json?.schema_version !== 1 || !Array.isArray(json?.results)) {
+    throw new Error("search result contract mismatch");
   }
-  return lines.length > 1 ? lines.join("\n") : `${lines[0]}\nNo results found.`;
+  return {
+    output: JSON.stringify(json),
+    diagnostic: {
+      schema_version: 1,
+      requested_mode: json.requested_mode,
+      effective_mode: json.effective_mode,
+      freshness: json.freshness,
+      recency_filter_applied: json.recency_filter_applied === true,
+      fallback_applied: json.fallback_applied === true,
+      result_count: json.results.length,
+    },
+  };
 }
 
 /** Learn server config (search key + connection target), then refresh the UI. */
@@ -2698,6 +2761,7 @@ async function doStart(audioContext = null) {
     ...(audioContext ? { audioContext } : {}),
   });
   client = c;
+  resetSearchTurnPolicy();
 
   c.addEventListener("queue", (e) => {
     if (client !== c) return;
@@ -2839,8 +2903,10 @@ async function doStart(audioContext = null) {
   });
   c.addEventListener("turn-state", (e) => {
     if (client !== c) return;
-    const status = /** @type {CustomEvent<any>} */ (e).detail.status;
+    const turnState = /** @type {CustomEvent<any>} */ (e).detail;
+    const status = turnState.status;
     if (status !== "speech_stopped") return;
+    beginAcceptedSearchTurn(turnState.itemId);
     chat.onUserTurnPending();
     clearTimeout(backendMetricTimer);
     backendMetricTimer = window.setTimeout(() => {
@@ -2938,6 +3004,7 @@ function endQueueTicket() {
 
 /** @param {string} status */
 function onClientStatus(status) {
+  if (status === "closed" || status === "error") resetSearchTurnPolicy();
   switch (status) {
     case "creating-session":
     case "connecting":
@@ -2971,6 +3038,7 @@ function onClientStatus(status) {
 }
 
 async function teardown() {
+  resetSearchTurnPolicy();
   stopHeartbeat();
   stopJoinCountdown();
   endTrackedSession();

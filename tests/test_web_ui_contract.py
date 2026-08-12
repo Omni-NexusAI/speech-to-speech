@@ -4,6 +4,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MAIN_JS = (ROOT / "web" / "hf-realtime-voice" / "main.js").read_text(encoding="utf-8")
 INDEX_HTML = (ROOT / "web" / "hf-realtime-voice" / "index.html").read_text(encoding="utf-8")
 CLIENT_JS = (ROOT / "web" / "hf-realtime-voice" / "ws" / "s2s-ws-client.js").read_text(encoding="utf-8")
+WEB_SEARCH_JS = (ROOT / "web" / "hf-realtime-voice" / "tools" / "web-search.js").read_text(encoding="utf-8")
 CHAT_JS = (ROOT / "web" / "hf-realtime-voice" / "ui" / "chat.js").read_text(encoding="utf-8")
 MIC_CAPTURE_JS = (ROOT / "web" / "hf-realtime-voice" / "worklets" / "mic-capture.js").read_text(encoding="utf-8")
 PLAYBACK_JS = (ROOT / "web" / "hf-realtime-voice" / "worklets" / "audio-playback.js").read_text(encoding="utf-8")
@@ -128,8 +129,73 @@ def test_browser_rejects_invalid_tool_arguments_without_executing_them():
     assert 'return { path: `${path}.*`, errorClass: "unexpected_property" }' in CLIENT_JS
     assert 'args = typeof event.arguments === "string" ? event.arguments : null' in CLIENT_JS
     assert 'JSON.parse(argsJson || "{}")' not in MAIN_JS
-    assert 'additionalProperties: false' in MAIN_JS
-    assert 'pattern: "\\\\S"' in MAIN_JS
+    assert 'additionalProperties: false' in WEB_SEARCH_JS
+    assert 'pattern: "\\\\S"' in WEB_SEARCH_JS
+
+
+def test_web_search_has_canonical_freshness_schema_and_truthful_structured_results():
+    assert "WEB_SEARCH_ARGUMENT_SCHEMA" in MAIN_JS
+    assert 'enum: ["auto", "web", "news"]' in WEB_SEARCH_JS
+    assert 'enum: ["none", "day", "week", "month", "year"]' in WEB_SEARCH_JS
+    assert 'required: ["query"]' in WEB_SEARCH_JS
+    assert 'maxLength: 500' in WEB_SEARCH_JS
+    assert 'cache: "no-store"' in MAIN_JS
+    assert 'json?.type !== "web_search_result"' in MAIN_JS
+    assert "output: JSON.stringify(json)" in MAIN_JS
+    assert "Google search result from" not in MAIN_JS
+    assert "new Date().toISOString().slice(0, 10)" not in MAIN_JS
+    for field in (
+        "requested_mode",
+        "effective_mode",
+        "freshness",
+        "retrieved_at_utc",
+        "recency_filter_applied",
+        "fallback_applied",
+        "date",
+        "source",
+        "position",
+    ):
+        assert f'"{field}"' in REALTIME_SERVER
+    assert '"day": "qdr:d"' in REALTIME_SERVER
+    assert '"week": "qdr:w"' in REALTIME_SERVER
+    assert '"month": "qdr:m"' in REALTIME_SERVER
+    assert '"year": "qdr:y"' in REALTIME_SERVER
+    assert '"news": "https://google.serper.dev/news"' in REALTIME_SERVER
+    assert '"web": "https://google.serper.dev/search"' in REALTIME_SERVER
+
+
+def test_search_refinement_policy_is_shared_and_terminal_override_is_response_scoped():
+    assert "one distinct narrower refinement" in MAIN_JS
+    assert "class SearchTurnPolicy" in WEB_SEARCH_JS
+    assert "isDistinctNarrowerSearch" in WEB_SEARCH_JS
+    assert 'return { accepted: false, args, terminal: true, reason: "limit_reached" }' in WEB_SEARCH_JS
+    assert 'return { accepted: false, args, terminal: true, reason: "not_narrower" }' in WEB_SEARCH_JS
+    assert 'result.responseToolChoice = decision.terminal ? "none" : "auto"' in MAIN_JS
+    assert "if (!decision.terminal) result.responseTools = [TOOL_DEFS.web_search]" in MAIN_JS
+    assert 'responseToolChoice: /** @type {const} */ ("none")' in MAIN_JS
+    assert "...(opts.tools ? { tools: opts.tools } : {})" in CLIENT_JS
+    assert "...(opts.toolChoice ? { tool_choice: opts.toolChoice } : {})" in CLIENT_JS
+    assert 'session: { type: "realtime", tools, tool_choice: tools.length ? "auto" : "none" }' in CLIENT_JS
+    assert "beginAcceptedSearchTurn(turnState.itemId)" in MAIN_JS
+    assert MAIN_JS.count("resetSearchTurnPolicy();") >= 3
+    assert 'itemId: typeof event.item_id === "string" ? event.item_id : ""' in CLIENT_JS
+    search_branch = MAIN_JS.split('} else if (name === "web_search") {', 1)[1].split(
+        '} else if (name === "camera_snapshot") {', 1
+    )[0]
+    assert "query:" not in search_branch
+    assert 'stage: "search"' in search_branch
+    assert "result_count" not in search_branch
+
+
+def test_terminal_search_keeps_exact_tool_output_image_create_order():
+    executor = MAIN_JS.split("async function runTool", 1)[1].split("function renderTtsBackendOptions", 1)[0]
+    assert executor.index("sessionClient.sendToolOutput") < executor.index("sessionClient.requestToolResponse")
+    assert executor.index("sessionClient.requestToolResponse") < executor.index("await outputAck")
+    request = CLIENT_JS.split("requestToolResponse(opts = {})", 1)[1].split("_responseActive()", 1)[0]
+    assert request.index("if (opts.image) this.sendUserImage(opts.image)") < request.index(
+        'type: "response.create"'
+    )
+    assert request.count('type: "response.create"') == 1
 
 
 def test_missing_tool_call_identity_is_visible_but_never_executable():
@@ -171,11 +237,13 @@ def test_native_v3_is_the_migrated_default_and_echo_ui_is_truthful():
     assert 'Adaptive (AEC3 reference cancellation)' in INDEX_HTML
     assert 'value="off"' not in INDEX_HTML
     assert 'requested === "strict" ? "strict" : "native"' in MIC_CAPTURE_JS
-    assert 'const EXPECTED_UI_API_VERSION = 20;' in MAIN_JS
+    assert 'const EXPECTED_UI_API_VERSION = 21;' in MAIN_JS
+    assert 'const EXPECTED_BACKEND_API_VERSION = 7;' in MAIN_JS
     assert "Do not reuse a stock " in MAIN_JS
     assert "Let me check that" not in MAIN_JS
-    assert 'src="main.js?v=31-live-voice-default"' in INDEX_HTML
-    assert '"./ws/s2s-ws-client.js?v=18-adaptive-safe-start"' in MAIN_JS
+    assert 'src="main.js?v=32-search-freshness"' in INDEX_HTML
+    assert '"./ws/s2s-ws-client.js?v=19-search-freshness"' in MAIN_JS
+    assert '"./tools/web-search.js?v=1-search-freshness"' in MAIN_JS
     assert '"./ui/chat.js?v=3-tool-privacy"' in MAIN_JS
     assert "loadAec3Worklet(ctx)" in CLIENT_JS
     assert 'new URL("mic-capture.js?v=12-aec3-fallback", base)' in CLIENT_JS

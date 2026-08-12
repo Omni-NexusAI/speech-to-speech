@@ -221,6 +221,9 @@ function _toolSchemaError(value, schema, path = "$") {
     if (Number.isFinite(schema.minLength) && value.length < Number(schema.minLength)) {
       return { path, errorClass: "min_length" };
     }
+    if (Number.isFinite(schema.maxLength) && value.length > Number(schema.maxLength)) {
+      return { path, errorClass: "max_length" };
+    }
     if (typeof schema.pattern === "string" && !(new RegExp(schema.pattern)).test(value)) {
       return { path, errorClass: "pattern_mismatch" };
     }
@@ -1844,7 +1847,12 @@ export class S2sWsRealtimeClient extends EventTarget {
         // that asynchronous clear acknowledgement is in flight.
         this._invalidatePlayback("barge-in");
         this._setStatus("user-speaking");
-        this.dispatchEvent(new CustomEvent("turn-state", { detail: { status: "speech_started" } }));
+        this.dispatchEvent(new CustomEvent("turn-state", {
+          detail: {
+            status: "speech_started",
+            itemId: typeof event.item_id === "string" ? event.item_id : "",
+          },
+        }));
         this.dispatchEvent(new CustomEvent("pipeline-metric", {
           detail: { stage: "mic", status: "speaking", source: "browser", detail: {} },
         }));
@@ -1856,7 +1864,12 @@ export class S2sWsRealtimeClient extends EventTarget {
         if (this._status === "user-speaking") this._setStatus("processing");
         this._speechStoppedAtMs = performance.now();
         this._firstPlaybackReported = false;
-        this.dispatchEvent(new CustomEvent("turn-state", { detail: { status: "speech_stopped" } }));
+        this.dispatchEvent(new CustomEvent("turn-state", {
+          detail: {
+            status: "speech_stopped",
+            itemId: typeof event.item_id === "string" ? event.item_id : "",
+          },
+        }));
         this.dispatchEvent(new CustomEvent("pipeline-metric", {
           detail: { stage: "mic", status: "captured", source: "browser", detail: {} },
         }));
@@ -2452,7 +2465,8 @@ export class S2sWsRealtimeClient extends EventTarget {
    * replay it once the active response finishes, so we never trip the
    * backend's `conversation_already_has_active_response` guard.
    *
-   * @param {{ image?: string }} [opts] Optional `image` (a data URL) sent as a
+   * @param {{ image?: string, toolChoice?: "auto"|"none", tools?: object[] }} [opts] Optional
+   *   response-scoped overrides. `image` is a data URL sent as a
    *   user `input_image` immediately before this response.create — so the frame
    *   travels with the create (and is deferred together with it if queued),
    *   rather than being added to the conversation eagerly. Used by the camera
@@ -2469,12 +2483,20 @@ export class S2sWsRealtimeClient extends EventTarget {
 
   /** Send a tool follow-up immediately. The backend binds it to the active
    *  call ID transaction and starts it after the originating response closes.
-   *  @param {{ image?: string }} [opts] */
+   *  @param {{ image?: string, toolChoice?: "auto"|"none", tools?: object[] }} [opts] */
   requestToolResponse(opts = {}) {
     if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
     if (opts.image) this.sendUserImage(opts.image);
     this._createInFlight = true;
-    this._send({ type: "response.create" });
+    this._send({
+      type: "response.create",
+      ...((opts.toolChoice || opts.tools) ? {
+        response: {
+          ...(opts.tools ? { tools: opts.tools } : {}),
+          ...(opts.toolChoice ? { tool_choice: opts.toolChoice } : {}),
+        },
+      } : {}),
+    });
   }
 
   /** True while a response occupies the single backend slot. */
@@ -2484,12 +2506,20 @@ export class S2sWsRealtimeClient extends EventTarget {
 
   /** Send a response.create immediately and arm the in-flight guard. Any image
    *  on the payload is added as user content right before the create.
-   *  @param {{ image?: string }} [opts] */
+   *  @param {{ image?: string, toolChoice?: "auto"|"none", tools?: object[] }} [opts] */
   _createResponseNow(opts = {}) {
     if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
     if (opts.image) this.sendUserImage(opts.image);
     this._createInFlight = true;
-    this._send({ type: "response.create" });
+    this._send({
+      type: "response.create",
+      ...((opts.toolChoice || opts.tools) ? {
+        response: {
+          ...(opts.tools ? { tools: opts.tools } : {}),
+          ...(opts.toolChoice ? { tool_choice: opts.toolChoice } : {}),
+        },
+      } : {}),
+    });
   }
 
   /** Replay one queued response.create if the slot is now free. Called on every

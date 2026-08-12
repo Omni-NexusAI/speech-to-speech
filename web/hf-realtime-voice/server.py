@@ -21,7 +21,7 @@ the live Space, never locally (even with the LB exported for testing).
 Endpoints:
   GET  /api/config           -> { search, lb, allowDirect, auth }
   GET  /api/me               -> login + tier + remaining budget (LB mode only)
-  POST /api/search           -> { results, answer }  Google via Serper.dev
+  POST /api/search           -> versioned structured Serper web/news results
   POST /api/session          -> proxies <LB>/session: a grant, or a queue ticket
   GET  /api/queue/{id}       -> proxies <LB>/queue/{id}: position, or a grant on claim
   DELETE /api/queue/{id}     -> leave the queue (explicit "Leave queue" button)
@@ -46,7 +46,7 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from secrets import token_hex
-from typing import Any
+from typing import Any, Literal
 
 import auth
 import httpx
@@ -54,7 +54,7 @@ import limiter
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 logger = logging.getLogger("s2s.search")
 
@@ -72,10 +72,27 @@ LOAD_BALANCER_URL = os.environ.get("LOAD_BALANCER_URL", "").strip()
 # but nothing is metered: no budget, no reservations, no sign-in gating.
 SPACE_ID = os.environ.get("SPACE_ID", "").strip()
 LIMITER_ENABLED = bool(LOAD_BALANCER_URL) and bool(SPACE_ID)
-SERPER_URL = "https://google.serper.dev/search"
+SERPER_URLS = {
+    "web": "https://google.serper.dev/search",
+    "news": "https://google.serper.dev/news",
+}
+SEARCH_FRESHNESS_TO_QDR = {
+    "none": None,
+    "day": "qdr:d",
+    "week": "qdr:w",
+    "month": "qdr:m",
+    "year": "qdr:y",
+}
 # Cap results so the tool output stays small enough to feed back to the model.
 MAX_RESULTS = 5
-LOCAL_UI_API_VERSION = 20
+MAX_QUERY_CHARS = 500
+MAX_RESULT_TITLE_CHARS = 300
+MAX_RESULT_SNIPPET_CHARS = 1200
+MAX_RESULT_URL_CHARS = 2048
+MAX_RESULT_DATE_CHARS = 100
+MAX_RESULT_SOURCE_CHARS = 200
+MAX_ANSWER_CHARS = 1600
+LOCAL_UI_API_VERSION = 21
 HERE = os.path.dirname(os.path.abspath(__file__))
 _repo_runtime_dir = Path(HERE).parents[1] / ".runtime"
 # In the repository the legacy shared runtime is two levels above the UI.
@@ -374,7 +391,11 @@ async def _sweeper():
 
 
 class SearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     query: str
+    mode: Literal["auto", "web", "news"] = "auto"
+    freshness: Literal["none", "day", "week", "month", "year"] = "none"
     # Optional user-supplied key (fallback when the deploy has no server key).
     # Used for this request only; never stored.
     key: str | None = None
@@ -1582,60 +1603,111 @@ async def me(request: Request):
 
 @app.post("/api/search")
 async def search(req: SearchRequest):
-    """Proxy a Google search via Serper.dev. The key stays on the server unless
-    the user brought their own (then theirs is used for this request only)."""
+    """Run one canonical Serper search with truthful mode and recency metadata."""
     query = (req.query or "").strip()
     if not query:
         raise HTTPException(status_code=400, detail="Empty query.")
+    if len(query) > MAX_QUERY_CHARS:
+        raise HTTPException(status_code=400, detail="Query is too long.")
 
     key = (req.key or "").strip() or SERPER_KEY
     if not key:
         # No server key and the user didn't supply one — search is unavailable.
         raise HTTPException(status_code=503, detail="Search is not configured.")
 
+    requested_mode = req.mode
+    effective_mode = "news" if requested_mode == "news" or (
+        requested_mode == "auto" and req.freshness != "none"
+    ) else "web"
+    qdr = SEARCH_FRESHNESS_TO_QDR[req.freshness]
     headers = {"X-API-KEY": key, "Content-Type": "application/json"}
     payload = {"q": query, "num": MAX_RESULTS}
-    try:
-        async with httpx.AsyncClient(timeout=12.0) as http:
-            resp = await http.post(SERPER_URL, headers=headers, json=payload)
-    except httpx.RequestError as exc:
-        logger.warning("Serper unreachable: %r", exc)
-        raise HTTPException(status_code=502, detail="Search provider unreachable.")
+    if qdr is not None:
+        payload["tbs"] = qdr
 
-    if resp.status_code != 200:
-        # Serper's error body carries the real reason (e.g. "Not enough
-        # credits") and contains no key, so it's safe to log and relay.
-        body = resp.text[:300]
-        logger.warning("Serper error %s: %s", resp.status_code, body)
-        msg = None
+    async def request_serper(http: httpx.AsyncClient, mode: Literal["web", "news"]) -> dict[str, Any]:
         try:
-            msg = resp.json().get("message")
-        except Exception:
-            pass
-        detail = f"Search provider error ({resp.status_code})"
-        if msg:
-            detail += f": {msg}"
-        raise HTTPException(status_code=502, detail=detail)
+            response = await http.post(SERPER_URLS[mode], headers=headers, json=payload)
+        except httpx.RequestError as exc:
+            logger.warning("Serper request failed error_class=%s", type(exc).__name__)
+            raise HTTPException(status_code=502, detail="Search provider unreachable.") from exc
+        if response.status_code != 200:
+            logger.warning("Serper request failed status=%s", response.status_code)
+            raise HTTPException(status_code=502, detail=f"Search provider error ({response.status_code})")
+        try:
+            data = response.json()
+        except ValueError as exc:
+            logger.warning("Serper response decode failed error_class=%s", type(exc).__name__)
+            raise HTTPException(status_code=502, detail="Search provider returned an invalid response.") from exc
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=502, detail="Search provider returned an invalid response.")
+        return data
 
-    data = resp.json()
-    results = []
-    for item in (data.get("organic") or [])[:MAX_RESULTS]:
+    async with httpx.AsyncClient(timeout=12.0) as http:
+        data = await request_serper(http, effective_mode)
+        raw_results = data.get("news" if effective_mode == "news" else "organic") or []
+        if not isinstance(raw_results, list):
+            raw_results = []
+        fallback_applied = requested_mode == "auto" and effective_mode == "news" and not raw_results
+        if fallback_applied:
+            effective_mode = "web"
+            data = await request_serper(http, "web")
+            raw_results = data.get("organic") or []
+            if not isinstance(raw_results, list):
+                raw_results = []
+
+    def bounded(value: Any, maximum: int) -> str | None:
+        if value is None:
+            return None
+        return str(value)[:maximum]
+
+    results: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_results[:MAX_RESULTS], start=1):
+        if not isinstance(item, dict):
+            continue
         results.append(
             {
-                "title": item.get("title", ""),
-                "snippet": item.get("snippet", ""),
-                "url": item.get("link", ""),
+                "title": bounded(item.get("title"), MAX_RESULT_TITLE_CHARS) or "",
+                "snippet": bounded(item.get("snippet"), MAX_RESULT_SNIPPET_CHARS) or "",
+                "url": bounded(item.get("link"), MAX_RESULT_URL_CHARS) or "",
+                "date": bounded(item.get("date"), MAX_RESULT_DATE_CHARS),
+                "source": bounded(item.get("source"), MAX_RESULT_SOURCE_CHARS),
+                "position": item.get("position")
+                if isinstance(item.get("position"), int) and 1 <= item["position"] <= 1000
+                else index,
             }
         )
 
     # A direct answer when Google has one — saves the model a hop.
-    box = data.get("answerBox") or {}
-    answer = box.get("answer") or box.get("snippet") or None
-    if not answer:
-        kg = data.get("knowledgeGraph") or {}
-        answer = kg.get("description") or None
+    answer = None
+    if requested_mode != "news" and req.freshness == "none":
+        box = data.get("answerBox") or {}
+        if isinstance(box, dict):
+            answer = box.get("answer") or box.get("snippet") or None
+        if not answer:
+            kg = data.get("knowledgeGraph") or {}
+            if isinstance(kg, dict):
+                answer = kg.get("description") or None
+        answer = bounded(answer, MAX_ANSWER_CHARS)
 
-    return JSONResponse({"query": query, "answer": answer, "results": results})
+    retrieved_at_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return JSONResponse(
+        {
+            "type": "web_search_result",
+            "schema_version": 1,
+            "provider": "serper",
+            "query": query,
+            "requested_mode": requested_mode,
+            "effective_mode": effective_mode,
+            "freshness": req.freshness,
+            "retrieved_at_utc": retrieved_at_utc,
+            "recency_filter_applied": qdr is not None,
+            "fallback_applied": fallback_applied,
+            "answer": answer,
+            "results": results,
+        },
+        headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"},
+    )
 
 
 @app.post("/api/session")

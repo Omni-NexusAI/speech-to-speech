@@ -1,7 +1,11 @@
 from speech_to_speech.LLM.language_model import LanguageModelHandler, StreamContext
 from speech_to_speech.LLM.tool_call.function_tool import FunctionTool
 from speech_to_speech.LLM.tool_call.tool_prompt import END_CODE, ENTER_CODE, build_block_regex, build_tool_system_prompt
-from speech_to_speech.LLM.voice_prompt import VOICE_SYSTEM_PROMPT, build_voice_system_prompt
+from speech_to_speech.LLM.voice_prompt import (
+    VOICE_INPUT_TOOL_POLICY,
+    VOICE_SYSTEM_PROMPT,
+    build_voice_system_prompt,
+)
 
 
 def test_voice_prompt_is_short_and_keeps_persona_in_session_prompt():
@@ -13,28 +17,39 @@ def test_voice_prompt_is_short_and_keeps_persona_in_session_prompt():
     assert "Match the user's intent" not in prompt
 
 
-def test_voice_prompt_makes_speech_the_default_and_handles_noisy_stt():
+def test_voice_prompt_reuses_semantic_input_and_search_policy_without_old_shortcuts():
     prompt = build_voice_system_prompt("Be concise.")
 
-    assert "Speech is the default." in prompt
-    assert "Use at most one tool" in prompt
-    assert "Treat transcripts as noisy." in prompt
-    assert "Correct likely mishearings only if asked or meaning depends on it" in prompt
+    assert prompt.count(VOICE_INPUT_TOOL_POLICY.rstrip()) == 1
+    assert "Speech is the default response channel." in prompt
+    assert "accepted turns as semantic input" in prompt
+    assert "current/external/visual facts" in prompt
+    assert "stable or historical questions" in prompt
+    assert "today/latest/now/changed/since" in prompt
+    assert "absent/undated/conflicting evidence" in prompt
+    assert "resolved prior entity and applicable absolute date" in prompt
+    assert "not persona/system-prompt topics" in prompt
+    assert "one distinct narrower refinement" in prompt
+    assert "never duplicate or broaden the search" in prompt
+    assert "retrieved_at_utc is retrieval" in prompt
+    assert "Report only returned dates/sources" in prompt
+    assert "Treat transcripts as noisy." not in prompt
+    assert "Use at most one tool" not in prompt
+    assert "If unsure whether a tool is needed, just speak." not in prompt
     assert "Reachy/Richie/Richy" not in prompt
-    assert "If unsure whether a tool is needed, just speak." in prompt
 
 
 def test_voice_prompt_requests_spoken_lead_in_and_sparing_expression_tools():
     prompt = build_voice_system_prompt("Be concise.")
 
-    assert "Before a tool call, use a brief natural utterance" in prompt
-    assert "briefly say that you will check" in prompt
-    assert "For expression/background tools, speak first." in prompt
+    assert "Before tools, speak briefly" in prompt
+    assert "say you will check slow information tools" in prompt
+    assert "For expression/background tools, speak first" in prompt
     assert "Sure, here's my best <emotion>." in prompt
     assert "Sure, here's my best sadness." not in prompt
     assert "Never mention tools." in prompt
-    assert "do not add a second spoken comment" in prompt
-    assert "Use motion, dance, emotion, and similar tools sparingly" in prompt
+    assert "speak again only for user-facing result information" in prompt
+    assert "Use motion/dance/emotion tools sparingly" in prompt
 
 
 def test_local_tool_prompt_forbids_multiple_tool_calls():

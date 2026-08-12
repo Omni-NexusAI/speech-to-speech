@@ -25,6 +25,7 @@
 - Model provider selection is conversation-scoped. Remote completely replaces local Gemma operations without fallback; TTS selection remains independent.
 - One conversation may own only one model HTTP operation at a time. Barge-in cancels or detaches that generation within two seconds without ending the WebSocket session or clearing context.
 - Browser echo protection defaults to Native browser AEC. Exact playback PCM remains available as a reference tap; Adaptive resolves to Native until an actual AEC3 module is loaded and validated, while Strict may fail closed by pausing upload through the echo tail.
+- Browser web search uses explicit web/news mode and optional day/week/month/year recency. Search results preserve available publication dates and sources, never equate retrieval time with publication time, and permit at most one distinct narrower refinement in the same accepted turn before a response-scoped tool cutoff.
 
 - This fork is used for local speech-to-speech testing with the OpenAI Realtime-compatible server preserved.
 - Keep upstream pipeline behavior intact unless a change is required for the local direct-audio Gemma path.

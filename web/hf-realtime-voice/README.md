@@ -165,14 +165,22 @@ The browser executes enabled tools and returns each result through the normal
 Realtime function-call protocol:
 
 - **Web search** uses the same-origin `/api/search` proxy when `SERPER_API_KEY` is
-  configured. The key never reaches browser JavaScript.
+  configured. The key never reaches browser JavaScript. Calls select general web
+  or news search and may request day/week/month/year recency. Results return as
+  versioned structured data with retrieval time plus each available publication
+  date and source; retrieval time is never presented as a publication date. One
+  accepted turn may make one initial search and at most one narrower refinement.
+  Auto-selected news may use one same-filter web fallback when news is empty;
+  explicit news returns zero results without changing mode.
 - **Camera snapshot** captures a fresh frame only when the model calls the tool.
   Every real call gets a distinct visible card, including unavailable captures.
 
 Malformed or schema-invalid arguments are rejected before execution without
-displaying their values. Function output acknowledgement precedes exactly one
-post-tool `response.create`, and tool-result continuation stays in the same
-semantic turn and playback policy.
+displaying their values. Function output, an optional camera image, and exactly
+one post-tool `response.create` retain that order. Tool-result continuation stays
+in the same semantic turn and playback policy. Only a first successful search
+follow-up exposes `web_search`; terminal search and non-search follow-ups disable
+tools for their response.
 
 ## Hosted Space mode
 

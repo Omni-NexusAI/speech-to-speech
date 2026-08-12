@@ -296,6 +296,11 @@ def test_noise_is_seeded_in_memory_and_keeps_wave_shape():
 def test_classifier_prioritizes_garbling_and_clarification_over_answer_recovery():
     assert probe.classify_visible_response("The result is 11.", 11) == "ordinary"
     assert probe.classify_visible_response("I could not hear that; perhaps 11.", 11) == "garbling_commentary"
+    assert probe.classify_visible_response("I couldn't understand you, but 11.", 11) == "garbling_commentary"
+    assert probe.classify_visible_response("I wasn’t able to understand the input, but 11.", 11) == "garbling_commentary"
+    assert probe.classify_visible_response("I had trouble recognizing the speech; maybe 11.", 11) == "garbling_commentary"
+    assert probe.classify_visible_response("I didn't recognize the input, though the result is 11.", 11) == "garbling_commentary"
+    assert probe.classify_visible_response("The audio seems unclear, but 11.", 11) == "garbling_commentary"
     assert probe.classify_visible_response("Could you repeat that?", 11) == "clarification"
     assert probe.classify_visible_response("Could you repeat that? I think it is 11.", 11) == "clarification"
     assert probe.classify_visible_response("I can help with several things.", 11) == "unclassified"

@@ -18,13 +18,14 @@ const {
   validateToolArguments,
 } = await import("../web/hf-realtime-voice/ws/s2s-ws-client.js");
 const { ChatView } = await import("../web/hf-realtime-voice/ui/chat.js");
+const {
+  SearchTurnPolicy,
+  WEB_SEARCH_ARGUMENT_SCHEMA,
+  isDistinctNarrowerSearch,
+  searchPolicyOutput,
+} = await import("../web/hf-realtime-voice/tools/web-search.js");
 
-const searchSchema = {
-  type: "object",
-  properties: { query: { type: "string", minLength: 1, pattern: "\\S" } },
-  required: ["query"],
-  additionalProperties: false,
-};
+const searchSchema = WEB_SEARCH_ARGUMENT_SCHEMA;
 const cameraSchema = {
   type: "object",
   properties: {},
@@ -43,6 +44,9 @@ for (const [raw, expectedCode, expectedPath, expectedClass] of [
   ['{}', "schema_validation_failed", "$.query", "required"],
   ['{"query":7}', "schema_validation_failed", "$.query", "expected_string"],
   ['{"query":"   "}', "schema_validation_failed", "$.query", "pattern_mismatch"],
+  [JSON.stringify({ query: "q".repeat(501) }), "schema_validation_failed", "$.query", "max_length"],
+  ['{"query":"weather","mode":"images"}', "schema_validation_failed", "$.mode", "not_in_enum"],
+  ['{"query":"weather","freshness":"hour"}', "schema_validation_failed", "$.freshness", "not_in_enum"],
   ['{"query":"weather","hidden":"value"}', "schema_validation_failed", "$.*", "unexpected_property"],
 ]) {
   const failure = validateToolArguments(raw, searchSchema);
@@ -56,6 +60,46 @@ assert.deepEqual(
   validateToolArguments('{"reuse_previous":true}', cameraSchema),
   { ok: false, code: "schema_validation_failed", path: "$.*", errorClass: "unexpected_property" },
 );
+
+// One accepted turn may use an initial search and one truly narrower
+// refinement. Normalized duplicates, broader searches, and a third call fail
+// closed without copying query text into the policy result.
+{
+  const policy = new SearchTurnPolicy();
+  assert.deepEqual(policy.accept({ query: "Climate policy" }), {
+    accepted: true,
+    args: { query: "Climate policy", mode: "auto", freshness: "none" },
+    terminal: false,
+    refinement: false,
+  });
+  assert.deepEqual(policy.accept({ query: "Climate policy Canada", mode: "news", freshness: "week" }), {
+    accepted: true,
+    args: { query: "Climate policy Canada", mode: "news", freshness: "week" },
+    terminal: true,
+    refinement: true,
+  });
+  assert.equal(policy.accept({ query: "Climate policy Canada 2026" }).reason, "limit_reached");
+
+  const duplicate = new SearchTurnPolicy();
+  duplicate.accept({ query: "Weather in Boston", mode: "web", freshness: "week" });
+  const duplicateResult = duplicate.accept({ query: "WEATHER, in Boston!", mode: "web", freshness: "week" });
+  assert.equal(duplicateResult.accepted, false);
+  assert.equal(duplicateResult.reason, "not_narrower");
+  const duplicateOutput = searchPolicyOutput(duplicateResult.reason);
+  assert.equal(duplicateOutput.includes("Weather in Boston"), false);
+
+  assert.equal(isDistinctNarrowerSearch(
+    { query: "weather Boston", mode: "news", freshness: "week" },
+    { query: "weather", mode: "web", freshness: "none" },
+  ), false);
+  assert.equal(isDistinctNarrowerSearch(
+    { query: "weather Boston", mode: "news", freshness: "week" },
+    { query: "weather Boston hourly", mode: "web", freshness: "none" },
+  ), false, "a query constraint cannot compensate for broader mode/freshness");
+
+  duplicate.reset();
+  assert.equal(duplicate.accept({ query: "new accepted turn" }).accepted, true);
+}
 
 // Durable/card presentation never contains malformed values, unexpected field
 // names, or values from unknown tool schemas.
@@ -227,12 +271,33 @@ function createClient() {
   await client.close();
 }
 
+// The browser receives the backend item ID on turn boundaries so cumulative
+// VAD revisions can retain one accepted-turn search budget.
+{
+  const { client } = createClient();
+  const states = [];
+  client.addEventListener("turn-state", (event) => states.push(event.detail));
+  await client._onWsMessage(JSON.stringify({
+    type: "input_audio_buffer.speech_started",
+    item_id: "item-turn-1",
+  }));
+  await client._onWsMessage(JSON.stringify({
+    type: "input_audio_buffer.speech_stopped",
+    item_id: "item-turn-1",
+  }));
+  assert.deepEqual(states, [
+    { status: "speech_started", itemId: "item-turn-1" },
+    { status: "speech_stopped", itemId: "item-turn-1" },
+  ]);
+  await client.close();
+}
+
 // Preserve hosted transaction ordering: function output, optional camera image,
 // then one response.create. Acknowledgement may arrive afterward.
 {
   const { client, sent } = createClient();
   const ack = client.sendToolOutput("call-camera-2", "captured");
-  client.requestToolResponse({ image: "data:image/jpeg;base64,AAAA" });
+  client.requestToolResponse({ image: "data:image/jpeg;base64,AAAA", toolChoice: "none" });
   assert.deepEqual(sent.map((event) => event.type), [
     "conversation.item.create",
     "conversation.item.create",
@@ -242,9 +307,50 @@ function createClient() {
   assert.equal(sent[0].item.call_id, "call-camera-2");
   assert.equal(sent[1].item.content[0].type, "input_image");
   assert.equal(sent.filter((event) => event.type === "response.create").length, 1);
+  assert.deepEqual(sent[2].response, { tool_choice: "none" });
   await client._onWsMessage(JSON.stringify({
     type: "conversation.item.created",
     item: { type: "function_call_output", call_id: "call-camera-2" },
+  }));
+  await ack;
+  await client.close();
+}
+
+// A terminal search follow-up disables tools only on that response. It does not
+// mutate the session's automatic tool policy for the next accepted turn.
+{
+  const { client, sent } = createClient();
+  const ack = client.sendToolOutput("call-search-2", '{"type":"web_search_result"}');
+  client.requestToolResponse({ toolChoice: "none" });
+  assert.deepEqual(sent.map((event) => event.type), ["conversation.item.create", "response.create"]);
+  assert.deepEqual(sent[1].response, { tool_choice: "none" });
+  assert.equal(sent.some((event) => event.type === "session.update"), false);
+  await client._onWsMessage(JSON.stringify({
+    type: "conversation.item.created",
+    item: { type: "function_call_output", call_id: "call-search-2" },
+  }));
+  await ack;
+  await client.close();
+}
+
+// The first successful search continuation exposes only web_search without
+// forcing it; camera and any other session tools are absent from that response.
+{
+  const { client, sent } = createClient();
+  const webSearch = {
+    type: "function",
+    name: "web_search",
+    description: "Search",
+    parameters: searchSchema,
+  };
+  const ack = client.sendToolOutput("call-search-1", '{"type":"web_search_result"}');
+  client.requestToolResponse({ tools: [webSearch], toolChoice: "auto" });
+  assert.deepEqual(sent.map((event) => event.type), ["conversation.item.create", "response.create"]);
+  assert.deepEqual(sent[1].response, { tools: [webSearch], tool_choice: "auto" });
+  assert.equal(sent.some((event) => event.type === "session.update"), false);
+  await client._onWsMessage(JSON.stringify({
+    type: "conversation.item.created",
+    item: { type: "function_call_output", call_id: "call-search-1" },
   }));
   await ack;
   await client.close();
