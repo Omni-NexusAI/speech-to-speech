@@ -12,6 +12,7 @@ REALTIME_README = (ROOT / "web" / "hf-realtime-voice" / "README.md").read_text(e
 REALTIME_CONTEXT = (ROOT / "web" / "hf-realtime-voice" / "CONTEXT.md").read_text(encoding="utf-8")
 REALTIME_SERVER = (ROOT / "web" / "hf-realtime-voice" / "server.py").read_text(encoding="utf-8")
 REALTIME_AGENTS = (ROOT / "web" / "hf-realtime-voice" / "AGENTS.md").read_text(encoding="utf-8")
+RUNTIME_IDENTITY_JS = (ROOT / "web" / "hf-realtime-voice" / "runtime-identity.js").read_text(encoding="utf-8")
 QWEN_HANDLER = (ROOT / "src" / "speech_to_speech" / "TTS" / "qwen3_tts_handler.py").read_text(
     encoding="utf-8"
 )
@@ -254,11 +255,16 @@ def test_native_v3_is_the_migrated_default_and_echo_ui_is_truthful():
     assert '<option value="native">Native browser AEC</option>' in INDEX_HTML
     assert 'value="off"' not in INDEX_HTML
     assert 'requested === "strict" ? "strict" : "native"' in MIC_CAPTURE_JS
-    assert 'const EXPECTED_UI_API_VERSION = 21;' in MAIN_JS
-    assert 'const EXPECTED_BACKEND_API_VERSION = 7;' in MAIN_JS
+    assert 'const EXPECTED_UI_API_VERSION = 22;' in MAIN_JS
+    assert 'const EXPECTED_BACKEND_API_VERSION = 8;' in MAIN_JS
+    assert 'runtimeIdentityMatches(frontendRuntime, backendRuntime)' in MAIN_JS
+    assert '"./runtime-identity.js?v=1-source-identity"' in MAIN_JS
+    assert "frontend.source_revision === backend.source_revision" in RUNTIME_IDENTITY_JS
+    assert "frontend.source_fingerprint === backend.source_fingerprint" in RUNTIME_IDENTITY_JS
+    assert "frontend.ui_asset_generation === backend.ui_asset_generation" in RUNTIME_IDENTITY_JS
     assert "Do not reuse a stock " in MAIN_JS
     assert "Let me check that" not in MAIN_JS
-    assert 'src="main.js?v=34-opaque-echo-route"' in INDEX_HTML
+    assert 'src="main.js?v=35-source-identity"' in INDEX_HTML
     assert '"./ws/s2s-ws-client.js?v=21-opaque-echo-route"' in MAIN_JS
     assert '"./ui/chat.js?v=5-opaque-echo-route"' in MAIN_JS
     assert '"./tools/web-search.js?v=1-search-freshness"' in MAIN_JS

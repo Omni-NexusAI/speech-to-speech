@@ -60,6 +60,47 @@ def _response_json(response):
     return json.loads(response.body.decode("utf-8"))
 
 
+def test_ui_config_runtime_identity_is_bounded_and_process_immutable(monkeypatch):
+    revision = "a" * 40
+    fingerprint = "b" * 64
+    assets = "main=34-opaque-echo-route;ws=21-opaque-echo-route;chat=5-opaque-echo-route;playback=16-adaptive-safe-start"
+    monkeypatch.setenv("S2S_RUNTIME_REVISION", revision)
+    monkeypatch.setenv("S2S_RUNTIME_DIRTY", "0")
+    monkeypatch.setenv("S2S_RUNTIME_SOURCE_FINGERPRINT", fingerprint)
+    monkeypatch.setenv("S2S_UI_ASSET_GENERATION", assets)
+    server = _load_ui_server_module()
+
+    expected = {
+        "source_revision": revision,
+        "source_dirty": False,
+        "source_fingerprint": fingerprint,
+        "ui_asset_generation": assets,
+    }
+    assert server.config()["runtime"] == expected
+    monkeypatch.setenv("S2S_RUNTIME_REVISION", "c" * 40)
+    assert server.config()["runtime"] == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "field"),
+    [
+        ("S2S_RUNTIME_REVISION", "not-a-revision", "source_revision"),
+        ("S2S_RUNTIME_DIRTY", "maybe", "source_dirty"),
+        ("S2S_RUNTIME_SOURCE_FINGERPRINT", "short", "source_fingerprint"),
+        ("S2S_UI_ASSET_GENERATION", "main=" + ("x" * 300) + ";ws=1;chat=1;playback=1", "ui_asset_generation"),
+    ],
+)
+def test_ui_config_runtime_identity_fails_closed(name, value, field, monkeypatch):
+    monkeypatch.setenv("S2S_RUNTIME_REVISION", "a" * 40)
+    monkeypatch.setenv("S2S_RUNTIME_DIRTY", "0")
+    monkeypatch.setenv("S2S_RUNTIME_SOURCE_FINGERPRINT", "b" * 64)
+    monkeypatch.setenv("S2S_UI_ASSET_GENERATION", "main=34;ws=21;chat=5;playback=16")
+    monkeypatch.setenv(name, value)
+    server = _load_ui_server_module()
+    expected = None if field == "source_dirty" else "unknown"
+    assert server.config()["runtime"][field] == expected
+
+
 def test_search_defaults_to_unfiltered_web_and_returns_truthful_versioned_results(monkeypatch):
     server = _load_ui_server_module()
     calls = _mock_serper(

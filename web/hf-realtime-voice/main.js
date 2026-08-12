@@ -35,6 +35,7 @@ import {
   sanitizeEchoCalibrations,
   upsertEchoCalibration,
 } from "./echo-route-calibration.js?v=1-opaque-route";
+import { runtimeIdentityMatches } from "./runtime-identity.js?v=1-source-identity";
 
 const DEFAULT_VOICE = "";
 const DEFAULT_INSTRUCTIONS =
@@ -1020,12 +1021,13 @@ let voiceInventoryRequest = 0;
 let diagnosticsOpen = localStorage.getItem(STORAGE_KEYS.diagnostics) === "1";
 /** @type {Array<any>} */
 let pipelineMetrics = [];
-const EXPECTED_UI_API_VERSION = 21;
-const EXPECTED_BACKEND_API_VERSION = 7;
+const EXPECTED_UI_API_VERSION = 22;
+const EXPECTED_BACKEND_API_VERSION = 8;
 const DIAGNOSTIC_STAGES = ["mic", "echo_guard", "vad", "transcription", "gemma", "context", "tool", "search", "tts", "playback"];
 const DIAGNOSTIC_STAGE_LABELS = { echo_guard: "Echo Guard" };
 const diagnosticWarnings = new Map();
 let backendRuntime = null;
+let frontendRuntime = null;
 let backendMetricTimer = 0;
 let backendRuntimeTimer = 0;
 
@@ -2211,6 +2213,7 @@ async function fetchConfig() {
         setDiagnosticWarning("frontend-version");
       }
       serverSearchKey = !!json.search;
+      frontendRuntime = json.runtime && typeof json.runtime === "object" ? json.runtime : null;
       lbMode = !!json.lb;
       // Lock to LB mode only when the deploy reports a load balancer.
       allowDirect = json.allowDirect ?? !lbMode;
@@ -2929,6 +2932,8 @@ async function doStart(audioContext = null) {
     clearTimeout(backendRuntimeTimer);
     if (backendRuntime.api_version !== EXPECTED_BACKEND_API_VERSION) {
       setDiagnosticWarning("backend-version", `Backend restart required (API ${backendRuntime.api_version ?? "missing"}, expected ${EXPECTED_BACKEND_API_VERSION}).`);
+    } else if (!runtimeIdentityMatches(frontendRuntime, backendRuntime)) {
+      setDiagnosticWarning("backend-version", "Frontend/backend source identity mismatch. Restart managed HF Realtime.");
     } else {
       setDiagnosticWarning("backend-version");
     }

@@ -22,6 +22,7 @@ from starlette.websockets import WebSocketState
 
 from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit, SessionState
 from speech_to_speech.api.openai_realtime.service import PipelineRuntimeServerEvent, ServerEvent, build_error_event
+from speech_to_speech.api.openai_realtime.source_identity import runtime_source_identity
 from speech_to_speech.pipeline.control import SESSION_END, PipelineControlMessage, is_control_message
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
@@ -45,7 +46,7 @@ MAX_AUDIO_BATCH_BYTES = 6400
 # monkeypatch this to a small value since their fixtures usually skip the
 # real handler chain.
 SESSION_END_DRAIN_TIMEOUT_S = 10.0
-BACKEND_RUNTIME_API_VERSION = 7
+BACKEND_RUNTIME_API_VERSION = 8
 MODEL_CANCEL_TIMEOUT_S = 2.0
 QItem = TypeVar("QItem")
 _AUDIO_CPP_TUNING_BOUNDS: dict[str, tuple[float, float]] = {
@@ -550,6 +551,7 @@ def create_app(
             "playback",
         ],
         **(runtime_info or {}),
+        **runtime_source_identity(),
     }
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:

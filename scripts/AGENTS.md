@@ -76,6 +76,9 @@
   entries inherited by Windows PowerShell into one `Path` value; duplicate
   keys must not prevent the model-independent managed backend from restarting.
 - Managed runtime state and split logs live under the gitignored `.runtime/` directory.
+- The clarification probe shares the production direct-audio sampling constants, keeps all utterances and responses process-local, and fails the 100-turn normal-conversation gate above one clarification, any recognition/input-process commentary, any repeated clarification wording, or incomplete safe multilingual voice coverage. Recognition commentary takes precedence over an expected numeric answer. Pure English/Spanish/German/Japanese turns and mixed-language turns remain distinct cohorts; meaningless input is reported separately.
+- The installed command reads only `rts.target`. Before repointing it, preserve the previous launcher in the passive local `rts.target.rollback` record; installers and lifecycle commands must never execute or overwrite that record implicitly. Restore it only through an explicit user-authorized target installation after confirming the pool is idle.
+- Before a managed start, hash only the checkout's runtime source files and capture the Git revision, dirty state, and browser asset generations. Inject that immutable content-free identity into both child processes, reject healthy listeners whose identity does not match the intended checkout, and make `status` warn prominently when running code is stale relative to current source.
 
 ## Child DOX Index
 

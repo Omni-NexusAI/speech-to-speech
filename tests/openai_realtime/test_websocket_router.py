@@ -217,6 +217,10 @@ class TestConnection:
                 assert runtime["runtime"]["api_version"] == router_module.BACKEND_RUNTIME_API_VERSION
                 assert runtime["runtime"]["mode"] == "local-direct-audio"
                 assert runtime["runtime"]["live_transcription"] is True
+                assert runtime["runtime"]["source_revision"] == "unknown"
+                assert runtime["runtime"]["source_dirty"] is None
+                assert runtime["runtime"]["source_fingerprint"] == "unknown"
+                assert runtime["runtime"]["ui_asset_generation"] == "unknown"
 
     def test_second_connection_rejected(self, setup):
         app, *_ = setup
@@ -1031,6 +1035,10 @@ class TestPool:
             assert data["in_use"] == 0
             assert [u["session_id"] for u in data["units"]] == [None, None]
             assert data["runtime"]["api_version"] == router_module.BACKEND_RUNTIME_API_VERSION
+            assert data["runtime"]["source_revision"] == "unknown"
+            assert data["runtime"]["source_dirty"] is None
+            assert data["runtime"]["source_fingerprint"] == "unknown"
+            assert data["runtime"]["ui_asset_generation"] == "unknown"
             assert data["runtime"]["diagnostic_stages"] == [
                 "mic",
                 "echo_guard",

@@ -59,6 +59,38 @@ from pydantic import BaseModel, ConfigDict
 
 logger = logging.getLogger("s2s.search")
 
+_RUNTIME_REVISION_RE = re.compile(r"^[0-9a-f]{7,64}$", re.IGNORECASE)
+_RUNTIME_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
+_RUNTIME_ASSET_TOKEN = r"[A-Za-z0-9._-]+"
+_RUNTIME_ASSET_RE = re.compile(
+    rf"^main={_RUNTIME_ASSET_TOKEN};ws={_RUNTIME_ASSET_TOKEN};"
+    rf"chat={_RUNTIME_ASSET_TOKEN};playback={_RUNTIME_ASSET_TOKEN}$"
+)
+_MAX_RUNTIME_ASSET_LENGTH = 256
+
+
+def _runtime_identity_from_environment() -> dict[str, Any]:
+    """Capture only bounded content-free launch identity once per process."""
+    revision = os.environ.get("S2S_RUNTIME_REVISION", "").strip()
+    fingerprint = os.environ.get("S2S_RUNTIME_SOURCE_FINGERPRINT", "").strip()
+    assets = os.environ.get("S2S_UI_ASSET_GENERATION", "").strip()
+    dirty = {"0": False, "1": True}.get(os.environ.get("S2S_RUNTIME_DIRTY", "").strip())
+    return {
+        "source_revision": revision.lower() if _RUNTIME_REVISION_RE.fullmatch(revision) else "unknown",
+        "source_dirty": dirty,
+        "source_fingerprint": (
+            fingerprint.lower() if _RUNTIME_FINGERPRINT_RE.fullmatch(fingerprint) else "unknown"
+        ),
+        "ui_asset_generation": (
+            assets
+            if len(assets) <= _MAX_RUNTIME_ASSET_LENGTH and _RUNTIME_ASSET_RE.fullmatch(assets)
+            else "unknown"
+        ),
+    }
+
+
+RUNTIME_IDENTITY = _runtime_identity_from_environment()
+
 SERPER_KEY = os.environ.get("SERPER_API_KEY", "").strip()
 # Speech-to-speech load balancer URL. When set, the browser POSTs /api/session
 # (which proxies <lb>/session here, server-side) and connects to the URL the LB
@@ -93,7 +125,7 @@ MAX_RESULT_URL_CHARS = 2048
 MAX_RESULT_DATE_CHARS = 100
 MAX_RESULT_SOURCE_CHARS = 200
 MAX_ANSWER_CHARS = 1600
-LOCAL_UI_API_VERSION = 21
+LOCAL_UI_API_VERSION = 22
 HERE = os.path.dirname(os.path.abspath(__file__))
 _repo_runtime_dir = Path(HERE).parents[1] / ".runtime"
 # In the repository the legacy shared runtime is two levels above the UI.
@@ -552,6 +584,7 @@ def config():
         "lb": bool(LOAD_BALANCER_URL),
         "allowDirect": not LOAD_BALANCER_URL,
         "auth": AUTH_ENABLED,
+        "runtime": dict(RUNTIME_IDENTITY),
     }
 
 

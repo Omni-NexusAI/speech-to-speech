@@ -13,6 +13,7 @@
 - Progressive Gemma transcript previews are opt-in and ephemeral. Final transcript metadata and fallback `USER_MEMORY` come only from the primary direct-audio response; a validated transcript always wins, while memory may upgrade the existing anchor only when the transcript is absent. Missing or malformed metadata must never start a fallback request, suppress assistant/tool output, delete its retained audio anchor, enter the UI, or enter model history as a placeholder.
 - Local history retains 30 complete semantic user turns without automatic summarization and emits content-free context metrics when committed, upgraded, or trimmed. Shared and legacy LLM generation logs report only lifecycle counts; never log assistant text, tool names, arguments, outputs, transcripts, or audio.
 - The realtime backend publishes runtime identity through `/v1/pool` and `pipeline.runtime`; local UI diagnostics use it to detect stale backend code.
+- Managed runtime identity is content-free and immutable for a process lifetime: expose only launch revision, dirty flag, working-source fingerprint, and UI asset generation through the loopback frontend/backend endpoints; compare all four exactly and never recompute them from a changing checkout inside an active process.
 - Runtime echo metadata declares Adaptive as the default and the browser as owner.
   Adaptive is effective only when the client reports a validated Sonora AEC3
   WASM module with device-pair calibration; module failure falls back to Native,
