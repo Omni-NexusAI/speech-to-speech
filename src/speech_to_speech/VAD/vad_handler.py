@@ -4,6 +4,7 @@ import logging
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from queue import Queue
 from threading import Event
 from typing import Any, TypeAlias
@@ -38,6 +39,48 @@ class _PendingShortSegment:
 # held for stitching, so sub-threshold bursts cannot sum past min_speech_ms
 # and fire a false barge-in.
 _SHORT_SEGMENT_MIN_FRAGMENT_MS = 100
+
+_SILERO_REPOSITORY = "snakers4/silero-vad"
+_SILERO_CACHE_PREFIX = "snakers4_silero-vad_"
+
+
+def _load_silero_vad() -> tuple[Any, Any]:
+    """Load a valid Torch Hub checkout before consulting the network."""
+    try:
+        hub_dir = Path(torch.hub.get_dir())
+        cached_repositories = sorted(
+            (
+                path
+                for path in hub_dir.glob(f"{_SILERO_CACHE_PREFIX}*")
+                if path.is_dir() and (path / "hubconf.py").is_file()
+            ),
+            key=lambda path: path.name,
+            reverse=True,
+        )
+    except OSError as exc:
+        logger.warning("Unable to inspect the Torch Hub cache for Silero VAD: %s", type(exc).__name__)
+        cached_repositories = []
+
+    for repository in cached_repositories:
+        try:
+            return torch.hub.load(
+                str(repository),
+                "silero_vad",
+                source="local",
+                trust_repo=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Ignoring an unusable cached Silero VAD checkout (%s).",
+                type(exc).__name__,
+            )
+
+    return torch.hub.load(
+        _SILERO_REPOSITORY,
+        "silero_vad",
+        trust_repo=True,
+        skip_validation=True,
+    )
 
 
 # Optional import for audio enhancement
@@ -96,12 +139,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         self.max_speculative_audio_ms = max(0, int(max_speculative_audio_ms))
         self.short_segment_merge_ms = max(0, short_segment_merge_ms)
         self._last_turn_detection: dict | None = None
-        self.model, _ = torch.hub.load(
-            "snakers4/silero-vad",
-            "silero_vad",
-            trust_repo=True,
-            skip_validation=True,
-        )
+        self.model, _ = _load_silero_vad()
         self.iterator = VADIterator(
             self.model,
             threshold=thresh,
