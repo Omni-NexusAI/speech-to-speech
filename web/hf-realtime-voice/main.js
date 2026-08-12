@@ -19,9 +19,9 @@
 import {
   S2sWsRealtimeClient,
   prepareToolArgumentsForBrowser,
-} from "./ws/s2s-ws-client.js?v=19-search-freshness";
+} from "./ws/s2s-ws-client.js?v=20-camera-correlation";
 import { $, truncateError, DEBUG } from "./ui/dom.js";
-import { ChatView } from "./ui/chat.js?v=3-tool-privacy";
+import { ChatView, boundedCorrelationId } from "./ui/chat.js?v=4-camera-correlation";
 import { Account } from "./ui/account.js";
 import {
   SearchTurnPolicy,
@@ -1665,7 +1665,11 @@ function flashPreview() {
  * @typedef {Object} CameraCallLifecycle
  * @property {number} captureGeneration
  * @property {number} requestedAtMs
+ * @property {string} cardId
  * @property {string} callId
+ * @property {string} responseId
+ * @property {string} itemId
+ * @property {string} acceptedTurnId
  * @property {"requested"|"captured"|"unavailable"|"invalid_arguments"} captureStatus
  * @property {"pending"|"acknowledged"|"rejected"} outputStatus
  * @property {number} [completedAtMs]
@@ -1679,7 +1683,11 @@ function cameraLifecycleDetail(lifecycle, extra = {}) {
     capture_generation: lifecycle.captureGeneration,
     requested_at_ms: lifecycle.requestedAtMs,
     completed_at_ms: lifecycle.completedAtMs,
+    card_id: lifecycle.cardId,
     call_id: lifecycle.callId,
+    response_id: lifecycle.responseId,
+    item_id: lifecycle.itemId,
+    accepted_turn_id: lifecycle.acceptedTurnId,
     capture_status: lifecycle.captureStatus,
     output_status: lifecycle.outputStatus,
     width: lifecycle.width,
@@ -1688,13 +1696,23 @@ function cameraLifecycleDetail(lifecycle, extra = {}) {
   };
 }
 
-/** @param {string} name @param {string} callId @returns {CameraCallLifecycle | undefined} */
-function beginToolLifecycle(name, callId) {
+/**
+ * @param {string} name
+ * @param {string} callId
+ * @param {{ responseId?: unknown, itemId?: unknown, acceptedTurnId?: unknown }} [correlation]
+ * @returns {CameraCallLifecycle | undefined}
+ */
+function beginToolLifecycle(name, callId, correlation = {}) {
   if (name !== "camera_snapshot") return undefined;
+  const captureGeneration = ++cameraCaptureGeneration;
   const lifecycle = {
-    captureGeneration: ++cameraCaptureGeneration,
+    captureGeneration,
     requestedAtMs: Date.now(),
-    callId,
+    cardId: `camera-card-${captureGeneration}`,
+    callId: boundedCorrelationId(callId),
+    responseId: boundedCorrelationId(correlation.responseId),
+    itemId: boundedCorrelationId(correlation.itemId),
+    acceptedTurnId: boundedCorrelationId(correlation.acceptedTurnId),
     captureStatus: /** @type {const} */ ("requested"),
     outputStatus: /** @type {const} */ ("pending"),
   };
@@ -2803,9 +2821,13 @@ async function doStart(audioContext = null) {
 
   c.addEventListener("toolcall", (e) => {
     if (client !== c) return;
-    const { name, arguments: args, callId } = /** @type {CustomEvent<{ name: string; arguments: unknown; callId: string }>} */ (e).detail;
+    const { name, arguments: args, callId, responseId, itemId } = /** @type {CustomEvent<{ name: string; arguments: unknown; callId: string; responseId?: string; itemId?: string }>} */ (e).detail;
     const prepared = prepareToolArgumentsForBrowser(name, args, TOOL_DEFS[name]?.parameters);
-    const lifecycle = beginToolLifecycle(prepared.tool, callId);
+    const lifecycle = beginToolLifecycle(prepared.tool, callId, {
+      responseId,
+      itemId,
+      acceptedTurnId: searchTurnItemId,
+    });
     // Durable UI surfaces receive only schema-validated arguments or fixed,
     // content-free failure metadata. Raw protocol arguments stay transient.
     chat.onToolCall(prepared.tool, prepared.displayArguments, callId, lifecycle);

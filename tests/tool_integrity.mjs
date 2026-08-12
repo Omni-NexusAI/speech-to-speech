@@ -17,7 +17,7 @@ const {
   prepareToolArgumentsForBrowser,
   validateToolArguments,
 } = await import("../web/hf-realtime-voice/ws/s2s-ws-client.js");
-const { ChatView } = await import("../web/hf-realtime-voice/ui/chat.js");
+const { ChatView, boundedCorrelationId } = await import("../web/hf-realtime-voice/ui/chat.js");
 const {
   SearchTurnPolicy,
   WEB_SEARCH_ARGUMENT_SCHEMA,
@@ -165,8 +165,8 @@ assert.deepEqual(
 // so repeated or missing backend call IDs can never collapse actual captures.
 {
   const view = Object.create(ChatView.prototype);
-  const first = view._toolHistoryKey("call-repeat", { captureGeneration: 1 });
-  const second = view._toolHistoryKey("call-repeat", { captureGeneration: 2 });
+  const first = view._toolHistoryKey("call-repeat", { captureGeneration: 1, callId: "call-repeat" });
+  const second = view._toolHistoryKey("call-repeat", { captureGeneration: 2, callId: "call-repeat" });
   const missing = view._toolHistoryKey("", { captureGeneration: 3 });
   assert.notEqual(first, second);
   assert.match(missing, /camera:3:missing-call-id/);
@@ -176,16 +176,91 @@ assert.deepEqual(
   view._updateToolLifecycle(card, {
     captureGeneration: 2,
     requestedAtMs: 1_700_000_000_000,
+    cardId: "camera-card-2",
     callId: "call-repeat",
+    responseId: "resp-2",
+    itemId: "item-2",
+    acceptedTurnId: "turn-2",
     captureStatus: "unavailable",
     outputStatus: "acknowledged",
   });
   assert.equal(card.dataset.captureGeneration, "2");
+  assert.equal(card.dataset.cameraCardId, "camera-card-2");
   assert.equal(card.dataset.callId, "call-repeat");
+  assert.equal(card.dataset.responseId, "resp-2");
+  assert.equal(card.dataset.itemId, "item-2");
+  assert.equal(card.dataset.acceptedTurnId, "turn-2");
+  assert.equal(card.dataset.captureStatus, "unavailable");
+  assert.equal(card.dataset.outputStatus, "acknowledged");
   assert.equal(meta.hidden, false);
   assert.match(meta.textContent, /Capture #2/);
+  assert.match(meta.textContent, /response resp-2/);
+  assert.match(meta.textContent, /item item-2/);
+  assert.match(meta.textContent, /turn turn-2/);
   assert.match(meta.textContent, /unavailable/);
   assert.match(meta.textContent, /output acknowledged/);
+
+  const requested = {
+    captureGeneration: 4,
+    requestedAtMs: 1_700_000_000_001,
+    cardId: "camera-card-4",
+    callId: "call-4",
+    responseId: "resp-4",
+    itemId: "item-4",
+    acceptedTurnId: "turn-4",
+    captureStatus: "requested",
+    outputStatus: "pending",
+  };
+  view._updateToolLifecycle(card, requested);
+  assert.equal(card.dataset.captureStatus, "requested");
+  assert.equal(card.dataset.outputStatus, "pending");
+  requested.captureStatus = "captured";
+  requested.outputStatus = "acknowledged";
+  view._updateToolLifecycle(card, requested);
+  assert.equal(card.dataset.captureStatus, "captured");
+  assert.equal(card.dataset.outputStatus, "acknowledged");
+
+  const failedMeta = { hidden: true, textContent: "" };
+  const failedCard = { dataset: {}, querySelector: () => failedMeta };
+  view._updateToolLifecycle(failedCard, {
+    ...requested,
+    captureGeneration: 5,
+    cardId: "camera-card-5",
+    captureStatus: "unavailable",
+    outputStatus: "rejected",
+  });
+  assert.equal(failedCard.dataset.captureStatus, "unavailable");
+  assert.equal(failedCard.dataset.outputStatus, "rejected");
+  assert.match(failedMeta.textContent, /output rejected/);
+
+  const secret = "not a protocol id";
+  const unsafeMeta = { hidden: true, textContent: "" };
+  const unsafeCard = { dataset: {}, querySelector: () => unsafeMeta };
+  view._updateToolLifecycle(unsafeCard, {
+    ...requested,
+    cardId: secret,
+    callId: secret,
+    responseId: secret,
+    itemId: secret,
+    acceptedTurnId: secret,
+  });
+  assert.equal(boundedCorrelationId(secret), "");
+  assert.equal(boundedCorrelationId("a".repeat(129)), "");
+  assert.equal(boundedCorrelationId("a".repeat(128)), "a".repeat(128));
+  assert.equal(JSON.stringify(unsafeCard).includes(secret), false);
+
+  const cards = [];
+  view._toolHistByCall = new Map();
+  view._spawnBubble = () => ({});
+  view._bumpDismiss = () => {};
+  view._markUnread = () => {};
+  view._appendHistTool = (_name, _args, _output, lifecycle) => {
+    cards.push(lifecycle.captureGeneration);
+    return { querySelector: () => null };
+  };
+  view.onToolCall("camera_snapshot", "{}", "call-repeat", { ...requested, captureGeneration: 6 });
+  view.onToolCall("camera_snapshot", "{}", "call-repeat", { ...requested, captureGeneration: 7 });
+  assert.deepEqual(cards, [6, 7]);
 }
 
 {
@@ -229,6 +304,8 @@ function createClient() {
     name: "web_search",
     arguments: '{"query":',
     call_id: "call-malformed",
+    response_id: "resp-malformed",
+    item_id: "item-malformed",
   }));
   await client._onWsMessage(JSON.stringify({
     type: "response.function_call_arguments.done",
@@ -237,7 +314,11 @@ function createClient() {
     call_id: "call-non-string",
   }));
   assert.equal(calls[0].arguments, '{"query":');
+  assert.equal(calls[0].responseId, "resp-malformed");
+  assert.equal(calls[0].itemId, "item-malformed");
   assert.equal(calls[1].arguments, null);
+  assert.equal(calls[1].responseId, "");
+  assert.equal(calls[1].itemId, "");
   await client.close();
 }
 

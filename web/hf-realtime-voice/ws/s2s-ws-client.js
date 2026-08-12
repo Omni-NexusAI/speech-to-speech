@@ -2059,7 +2059,13 @@ export class S2sWsRealtimeClient extends EventTarget {
         const callId = typeof event.call_id === "string" ? event.call_id : "";
         if (name && callId.trim()) {
           this.dispatchEvent(new CustomEvent("toolcall", {
-            detail: { name, arguments: args, callId },
+            detail: {
+              name,
+              arguments: args,
+              callId,
+              responseId: typeof event.response_id === "string" ? event.response_id : "",
+              itemId: typeof event.item_id === "string" ? event.item_id : "",
+            },
           }));
         } else {
           // Without both fields there is no safe call/result transaction. Do

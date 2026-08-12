@@ -217,12 +217,29 @@ def test_debug_logging_is_content_free_for_user_and_assistant_transcripts():
 
 
 def test_every_camera_call_has_distinct_visible_content_free_lifecycle():
+    tool_dispatch = CLIENT_JS.split('case "response.function_call_arguments.done"', 1)[1].split("break;", 1)[0]
+    assert 'responseId: typeof event.response_id === "string" ? event.response_id : ""' in tool_dispatch
+    assert 'itemId: typeof event.item_id === "string" ? event.item_id : ""' in tool_dispatch
     assert "let cameraCaptureGeneration = 0;" in MAIN_JS
     assert "capture_generation: lifecycle.captureGeneration" in MAIN_JS
     assert "requested_at_ms: lifecycle.requestedAtMs" in MAIN_JS
+    assert "card_id: lifecycle.cardId" in MAIN_JS
+    assert "response_id: lifecycle.responseId" in MAIN_JS
+    assert "item_id: lifecycle.itemId" in MAIN_JS
+    assert "accepted_turn_id: lifecycle.acceptedTurnId" in MAIN_JS
     assert 'stage: "camera"' in MAIN_JS
     assert "argsJson" not in MAIN_JS.split("function cameraLifecycleDetail", 1)[1].split("function beginToolLifecycle", 1)[0]
-    assert 'return `camera:${lifecycle.captureGeneration}:${callId || "missing-call-id"}`' in CHAT_JS
+    assert 'return `camera:${lifecycle.captureGeneration}:${boundedCallId || "missing-call-id"}`' in CHAT_JS
+    assert "boundedCorrelationId(correlation.responseId)" in MAIN_JS
+    assert "boundedCorrelationId(correlation.itemId)" in MAIN_JS
+    assert "boundedCorrelationId(correlation.acceptedTurnId)" in MAIN_JS
+    assert "acceptedTurnId: searchTurnItemId" in MAIN_JS
+    assert "const MAX_CORRELATION_ID_LENGTH = 128" in CHAT_JS
+    assert "CORRELATION_ID_RE.test(value) ? value : \"\"" in CHAT_JS
+    assert "el.dataset.cameraCardId = cardId" in CHAT_JS
+    assert "el.dataset.responseId = responseId" in CHAT_JS
+    assert "el.dataset.itemId = itemId" in CHAT_JS
+    assert "el.dataset.acceptedTurnId = acceptedTurnId" in CHAT_JS
     assert "Capture #${lifecycle.captureGeneration}" in CHAT_JS
     assert "this._updateToolLifecycle(existing, lifecycle)" in CHAT_JS
     assert "this._appendHistImage(image, existing)" in CHAT_JS
@@ -241,10 +258,10 @@ def test_native_v3_is_the_migrated_default_and_echo_ui_is_truthful():
     assert 'const EXPECTED_BACKEND_API_VERSION = 7;' in MAIN_JS
     assert "Do not reuse a stock " in MAIN_JS
     assert "Let me check that" not in MAIN_JS
-    assert 'src="main.js?v=32-search-freshness"' in INDEX_HTML
-    assert '"./ws/s2s-ws-client.js?v=19-search-freshness"' in MAIN_JS
+    assert 'src="main.js?v=33-camera-correlation"' in INDEX_HTML
+    assert '"./ws/s2s-ws-client.js?v=20-camera-correlation"' in MAIN_JS
+    assert '"./ui/chat.js?v=4-camera-correlation"' in MAIN_JS
     assert '"./tools/web-search.js?v=1-search-freshness"' in MAIN_JS
-    assert '"./ui/chat.js?v=3-tool-privacy"' in MAIN_JS
     assert "loadAec3Worklet(ctx)" in CLIENT_JS
     assert 'new URL("mic-capture.js?v=12-aec3-fallback", base)' in CLIENT_JS
     assert 'new URL("audio-playback.js?v=16-adaptive-safe-start", base)' in CLIENT_JS

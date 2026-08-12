@@ -23,6 +23,32 @@ const WRENCH_PATH = `<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l
 const CHAT_BUBBLE_SVG = `<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>`;
 const EMPTY_STATE_HTML = `<div id="chat-empty" class="chat-empty">${CHAT_BUBBLE_SVG}<span class="chat-empty-title">No messages yet</span><span class="chat-empty-hint">Tap the orb and start talking</span></div>`;
 
+const MAX_CORRELATION_ID_LENGTH = 128;
+const CORRELATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+/**
+ * Keep protocol correlation visible without turning a server-controlled field
+ * into an unbounded or content-bearing diagnostics channel.
+ * @param {unknown} value
+ */
+export function boundedCorrelationId(value) {
+  if (typeof value !== "string" || value.length > MAX_CORRELATION_ID_LENGTH) return "";
+  return CORRELATION_ID_RE.test(value) ? value : "";
+}
+
+/**
+ * @typedef {Object} CameraLifecycle
+ * @property {number} captureGeneration
+ * @property {number} requestedAtMs
+ * @property {string} cardId
+ * @property {string} callId
+ * @property {string} responseId
+ * @property {string} itemId
+ * @property {string} acceptedTurnId
+ * @property {string} captureStatus
+ * @property {string} outputStatus
+ */
+
 export class ChatView {
   constructor() {
     /** @type {HTMLButtonElement} */
@@ -248,7 +274,7 @@ export class ChatView {
    * Append a durable tool-call row immediately; its output and optional camera
    * frame are filled into the same card when execution finishes.
    * @param {string} name @param {unknown} argsJson @param {string} output
-   * @param {{ captureGeneration: number, requestedAtMs: number, callId: string, captureStatus: string, outputStatus: string } | undefined} [lifecycle]
+   * @param {CameraLifecycle | undefined} [lifecycle]
    */
   _appendHistTool(name, argsJson, output, lifecycle) {
     const empty = this._chatHistory.querySelector(".chat-empty");
@@ -289,11 +315,12 @@ export class ChatView {
    * A camera generation is part of the history identity so every actual call
    * receives its own durable card, even if the backend omits or repeats a call ID.
    * @param {string} callId
-   * @param {{ captureGeneration?: number } | undefined} lifecycle
+   * @param {Partial<CameraLifecycle> | undefined} lifecycle
    */
   _toolHistoryKey(callId, lifecycle) {
     if (Number.isFinite(lifecycle?.captureGeneration)) {
-      return `camera:${lifecycle.captureGeneration}:${callId || "missing-call-id"}`;
+      const boundedCallId = boundedCorrelationId(lifecycle?.callId ?? callId);
+      return `camera:${lifecycle.captureGeneration}:${boundedCallId || "missing-call-id"}`;
     }
     return callId;
   }
@@ -302,20 +329,34 @@ export class ChatView {
    * Render content-free camera lifecycle information. Never include argument,
    * transcript, image, or tool-result content in this metadata line.
    * @param {HTMLElement} el
-   * @param {{ captureGeneration: number, requestedAtMs: number, callId: string, captureStatus: string, outputStatus: string } | undefined} lifecycle
+   * @param {CameraLifecycle | undefined} lifecycle
    */
   _updateToolLifecycle(el, lifecycle) {
     if (!lifecycle) return;
+    const cardId = boundedCorrelationId(lifecycle.cardId);
+    const callId = boundedCorrelationId(lifecycle.callId);
+    const responseId = boundedCorrelationId(lifecycle.responseId);
+    const itemId = boundedCorrelationId(lifecycle.itemId);
+    const acceptedTurnId = boundedCorrelationId(lifecycle.acceptedTurnId);
     el.dataset.captureGeneration = String(lifecycle.captureGeneration);
-    el.dataset.callId = lifecycle.callId || "";
+    el.dataset.cameraCardId = cardId;
+    el.dataset.callId = callId;
+    el.dataset.responseId = responseId;
+    el.dataset.itemId = itemId;
+    el.dataset.acceptedTurnId = acceptedTurnId;
+    el.dataset.captureStatus = lifecycle.captureStatus;
+    el.dataset.outputStatus = lifecycle.outputStatus;
     const meta = /** @type {HTMLElement | null} */ (el.querySelector(".hist-tool-meta"));
     if (!meta) return;
     const requested = Number.isFinite(lifecycle.requestedAtMs)
       ? new Date(lifecycle.requestedAtMs).toLocaleTimeString()
       : "time unavailable";
-    const call = lifecycle.callId || "missing call ID";
+    const call = callId || "missing call ID";
+    const response = responseId || "missing response ID";
+    const item = itemId || "missing item ID";
+    const turn = acceptedTurnId || "missing accepted turn ID";
     meta.hidden = false;
-    meta.textContent = `Capture #${lifecycle.captureGeneration} | ${requested} | ${call} | ${lifecycle.captureStatus} | output ${lifecycle.outputStatus}`;
+    meta.textContent = `Capture #${lifecycle.captureGeneration} | ${requested} | ${call} | response ${response} | item ${item} | turn ${turn} | ${lifecycle.captureStatus} | output ${lifecycle.outputStatus}`;
   }
 
   /** Tag an assistant history row as interrupted (user barged in mid-reply).
@@ -462,7 +503,7 @@ export class ChatView {
 
   /** The model called a tool — reserve its durable history position immediately.
    *  @param {string} name @param {unknown} argsJson @param {string} callId
-   *  @param {{ captureGeneration: number, requestedAtMs: number, callId: string, captureStatus: string, outputStatus: string } | undefined} [lifecycle] */
+   *  @param {CameraLifecycle | undefined} [lifecycle] */
   onToolCall(name, argsJson, callId, lifecycle) {
     this._bumpDismiss(this._spawnBubble("tool", name));
     const historyKey = this._toolHistoryKey(callId, lifecycle);
@@ -493,7 +534,7 @@ export class ChatView {
 
   /** The tool finished — update its durable card (and any captured image).
    *  @param {string} name @param {unknown} argsJson @param {string} output @param {string} [image] @param {string} [callId]
-   *  @param {{ captureGeneration: number, requestedAtMs: number, callId: string, captureStatus: string, outputStatus: string } | undefined} [lifecycle] */
+   *  @param {CameraLifecycle | undefined} [lifecycle] */
   onToolResult(name, argsJson, output, image, callId = "", lifecycle) {
     const historyKey = this._toolHistoryKey(callId, lifecycle);
     let existing = historyKey ? this._toolHistByCall.get(historyKey) : null;
