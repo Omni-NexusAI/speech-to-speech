@@ -1,6 +1,7 @@
 // @ts-check
 
 import { AEC3_FRAME_MS, AEC3_OUTPUT_RATE, Aec3WasmSession } from "./aec3-abi.js";
+import { StrictEchoGate, classifyStrictEcho } from "./strict-echo-gate.js";
 
 const DEFAULT_CHUNK_MS = 40;
 const GATE_ATTACK_MS = 5;
@@ -88,6 +89,8 @@ class Aec3CaptureProcessor extends AudioWorkletProcessor {
     this._lastMetrics = null;
     this._lastPlaybackActive = false;
     this._lastSuppressing = false;
+    this._lastCandidateMs = 0;
+    this._strictGate = new StrictEchoGate(AEC3_FRAME_MS);
 
     this._calibration = {
       delayMs: 0,
@@ -145,7 +148,7 @@ class Aec3CaptureProcessor extends AudioWorkletProcessor {
         suppressionStrength: clamp(data.suppressionStrength, 0, 1, this._calibration.suppressionStrength),
         leakageThreshold: clamp(data.leakageThreshold, 0.05, 1, this._calibration.leakageThreshold),
         doubleTalkSensitivity: clamp(data.doubleTalkSensitivity, 0, 1, this._calibration.doubleTalkSensitivity),
-        echoTailMs: clamp(data.echoTailMs, 0, 1000, this._calibration.echoTailMs),
+        echoTailMs: clamp(data.echoTailMs, 350, 1000, this._calibration.echoTailMs),
       };
       this._postStatus();
     } else if (data.kind === "echo_reset") {
@@ -154,6 +157,7 @@ class Aec3CaptureProcessor extends AudioWorkletProcessor {
       this._chunkWrite = 0;
       this._referenceTailSamples = 0;
       this._processedSamples = 0;
+      this._strictGate.reset();
       try {
         this._session?.reset();
       } catch (error) {
@@ -164,11 +168,16 @@ class Aec3CaptureProcessor extends AudioWorkletProcessor {
   }
 
   _resolveMode() {
+    const previousMode = this._effectiveMode;
     if (this._requestedMode === "native") this._effectiveMode = "native";
     else if (this._requestedMode === "adaptive") {
       this._effectiveMode = this._moduleReady ? "adaptive" : "native";
     } else {
       this._effectiveMode = this._moduleReady ? "strict" : "strict-fallback";
+    }
+    if (previousMode !== this._effectiveMode) {
+      this._strictGate.reset();
+      this._lastCandidateMs = 0;
     }
   }
 
@@ -196,6 +205,7 @@ class Aec3CaptureProcessor extends AudioWorkletProcessor {
       frameSamples: this._frameSamples,
       delayMs: this._calibration.delayMs,
       outputLatencyMs: this._calibration.outputLatencyMs,
+      echoTailMs: this._calibration.echoTailMs,
       error: this._moduleError,
     });
   }
@@ -213,25 +223,6 @@ class Aec3CaptureProcessor extends AudioWorkletProcessor {
       referenceRms,
       playbackActive: referenceRms >= REFERENCE_ACTIVE_RMS || this._referenceTailSamples > 0,
     };
-  }
-
-  _strictShouldSuppress(playbackActive, metrics) {
-    if (!playbackActive) return false;
-    if (!this._moduleReady) return true;
-    if (metrics?.doubleTalk === true) return false;
-    const residual = metrics?.residualEchoLikelihood;
-    if (!Number.isFinite(residual)) return true;
-    const captureRms = Number(metrics?.captureRms);
-    const outputRms = Number(metrics?.outputRms);
-    const outputRatio = Number.isFinite(captureRms) && captureRms > 1e-6
-      && Number.isFinite(outputRms)
-      ? outputRms / captureRms
-      : 0;
-    const nearEndFloor = 0.65 - (0.5 * this._calibration.doubleTalkSensitivity);
-    if (outputRatio >= nearEndFloor && residual < 0.8) return false;
-    const strength = this._calibration.suppressionStrength;
-    const threshold = this._calibration.leakageThreshold * (1.2 - 0.7 * strength);
-    return residual >= threshold;
   }
 
   _resampleTo16k(input) {
@@ -309,7 +300,7 @@ class Aec3CaptureProcessor extends AudioWorkletProcessor {
       configuredDelayMs: this._calibration.delayMs + this._calibration.outputLatencyMs,
       modelReady: this._moduleReady,
       predictionConfidence: residual === null ? null : Math.max(0, Math.min(1, 1 - residual)),
-      candidateMs: 0,
+      candidateMs: this._lastCandidateMs,
       suppressedMs: this._suppressedMs,
       suppressing,
       doubleTalk: metrics?.doubleTalk ?? null,
@@ -343,19 +334,32 @@ class Aec3CaptureProcessor extends AudioWorkletProcessor {
       }
     }
 
-    const suppressing = this._effectiveMode.startsWith("strict")
-      && this._strictShouldSuppress(playbackActive, metrics);
+    let suppressing = false;
+    if (this._effectiveMode === "strict") {
+      const evidence = classifyStrictEcho(playbackActive, metrics, this._calibration);
+      const decision = this._strictGate.consume(output, {
+        playbackActive,
+        ...evidence,
+      });
+      for (const retainedFrame of decision.emit) {
+        this._appendOutput(retainedFrame, rms(retainedFrame));
+      }
+      this._suppressedMs += decision.suppressedFrames * AEC3_FRAME_MS;
+      suppressing = decision.suppressing;
+      this._lastCandidateMs = decision.pendingMs;
+    } else if (this._effectiveMode === "strict-fallback" && playbackActive) {
+      // A missing or failed AEC3 module has no trustworthy near-end evidence.
+      // Strict therefore remains fail closed for referenced playback and tail.
+      this._suppressedMs += AEC3_FRAME_MS;
+      suppressing = true;
+      this._lastCandidateMs = 0;
+    } else {
+      this._appendOutput(output, rms(output));
+      this._lastCandidateMs = 0;
+    }
     this._lastMetrics = metrics;
     this._lastPlaybackActive = playbackActive;
     this._lastSuppressing = suppressing;
-    if (suppressing) {
-      // Fail closed by omitting the 10 ms frame. Never substitute zero PCM.
-      this._suppressedMs += AEC3_FRAME_MS;
-    } else {
-      // Adaptive output is the real AEC3-processed capture. Native fallback is
-      // untouched browser-captured PCM. No NLMS/predictor residual is uploaded.
-      this._appendOutput(output, rms(output));
-    }
     this.port.postMessage({ kind: "level", rms: captureRms });
     this._postMetric(captureRms, referenceRms, playbackActive, suppressing, metrics);
   }

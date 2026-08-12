@@ -15,7 +15,12 @@ const GATE_ATTACK_MS = 5;
 const GATE_HOLD_MS = 250;
 const GATE_RELEASE_MS = 80;
 const REFERENCE_ACTIVE_RMS = 0.001;
-const ECHO_TAIL_MS = 350;
+const DEFAULT_ECHO_TAIL_MS = 350;
+
+function clamp(value, minimum, maximum, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(minimum, Math.min(maximum, number)) : fallback;
+}
 
 function rms(samples) {
   if (!samples.length) return 0;
@@ -40,6 +45,7 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
     this._echoMode = "native";
     this._nativeAec = false;
     this._echoTailRemaining = 0;
+    this._echoTailMs = DEFAULT_ECHO_TAIL_MS;
     this._suppressedMs = 0;
     this._metricCounter = 0;
 
@@ -68,6 +74,9 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
         this._echoMode = requested === "strict" ? "strict" : "native";
         this._nativeAec = !!data.nativeAec;
         this._postStatus();
+      } else if (data?.kind === "echo_calibration") {
+        this._echoTailMs = clamp(data.echoTailMs, 350, 1000, this._echoTailMs);
+        this._postStatus();
       } else if (data?.kind === "echo_reset") {
         this._echoTailRemaining = 0;
         this._suppressedMs = 0;
@@ -86,6 +95,7 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
       effectiveMode: this._echoMode,
       nativeAec: this._nativeAec,
       referenceWired: true,
+      echoTailMs: this._echoTailMs,
       error: this._requestedMode === "adaptive"
         ? "AEC3 module unavailable; Adaptive resolved to Native"
         : "",
@@ -137,7 +147,7 @@ class MicCaptureProcessor extends AudioWorkletProcessor {
       const microphoneRms = rms(microphone);
       const referenceRms = rms(reference);
       if (referenceRms >= REFERENCE_ACTIVE_RMS) {
-        this._echoTailRemaining = Math.round((ECHO_TAIL_MS / 1000) * TARGET_RATE);
+        this._echoTailRemaining = Math.round((this._echoTailMs / 1000) * TARGET_RATE);
       } else {
         this._echoTailRemaining = Math.max(0, this._echoTailRemaining - this._chunkSamples);
       }
