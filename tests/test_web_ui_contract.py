@@ -250,29 +250,31 @@ def test_every_camera_call_has_distinct_visible_content_free_lifecycle():
 def test_native_v3_is_the_migrated_default_and_echo_ui_is_truthful():
     assert 'echoGuardVersion: "s2s.ws.echoGuardVersion"' in MAIN_JS
     assert 'localStorage.setItem(STORAGE_KEYS.echoGuardVersion, "3")' in MAIN_JS
-    assert 'value="native" selected>Native browser AEC (default)' in INDEX_HTML
-    assert 'Adaptive (AEC3 reference cancellation)' in INDEX_HTML
+    assert 'value="adaptive" selected>Adaptive (AEC3 reference cancellation, default)' in INDEX_HTML
+    assert '<option value="native">Native browser AEC</option>' in INDEX_HTML
     assert 'value="off"' not in INDEX_HTML
     assert 'requested === "strict" ? "strict" : "native"' in MIC_CAPTURE_JS
     assert 'const EXPECTED_UI_API_VERSION = 21;' in MAIN_JS
     assert 'const EXPECTED_BACKEND_API_VERSION = 7;' in MAIN_JS
     assert "Do not reuse a stock " in MAIN_JS
     assert "Let me check that" not in MAIN_JS
-    assert 'src="main.js?v=33-camera-correlation"' in INDEX_HTML
-    assert '"./ws/s2s-ws-client.js?v=20-camera-correlation"' in MAIN_JS
-    assert '"./ui/chat.js?v=4-camera-correlation"' in MAIN_JS
+    assert 'src="main.js?v=34-opaque-echo-route"' in INDEX_HTML
+    assert '"./ws/s2s-ws-client.js?v=21-opaque-echo-route"' in MAIN_JS
+    assert '"./ui/chat.js?v=5-opaque-echo-route"' in MAIN_JS
     assert '"./tools/web-search.js?v=1-search-freshness"' in MAIN_JS
+    assert '"../worklets/aec3/aec3-loader.js?v=5-echo-route"' in CLIENT_JS
     assert "loadAec3Worklet(ctx)" in CLIENT_JS
-    assert 'new URL("mic-capture.js?v=12-aec3-fallback", base)' in CLIENT_JS
+    assert 'new URL("mic-capture.js?v=13-opaque-echo-route", base)' in CLIENT_JS
     assert 'new URL("audio-playback.js?v=16-adaptive-safe-start", base)' in CLIENT_JS
     assert "new AudioWorkletNode(ctx, aec3.processorName" in CLIENT_JS
 
 
-def test_aec3_calibration_is_device_pair_scoped_and_persisted():
+def test_aec3_calibration_is_opaque_route_scoped_and_persisted():
     server = (ROOT / "web" / "hf-realtime-voice" / "server.py").read_text(encoding="utf-8")
     for control_id in (
         "diagnostics-echo-device-pair",
         "diagnostics-echo-output-latency",
+        "diagnostics-echo-calibration-status",
         "diagnostics-echo-save",
         "diagnostics-echo-use-measured",
     ):
@@ -282,11 +284,27 @@ def test_aec3_calibration_is_device_pair_scoped_and_persisted():
         "suppressionStrength",
         "leakageThreshold",
         "doubleTalkSensitivity",
+        "echoTailMs",
     ):
         assert f'data-echo-calibration-key="{key}"' in INDEX_HTML
-    assert "echoCalibrations: settings.echoCalibrations" in MAIN_JS
-    assert "this._echoDevicePair" in CLIENT_JS
-    assert "microphoneId" in CLIENT_JS and "outputId" in CLIENT_JS
+    assert "sanitizeEchoCalibrations(s.echoCalibrations)" in MAIN_JS
+    assert "this._echoRouteKey" in CLIENT_JS
+    assert "fingerprintEchoRoute(microphoneMaterial, outputMaterial)" in CLIENT_JS
+    assert "this._echoCalibrationCollector.add" in CLIENT_JS
+    assert 'mediaDevices.addEventListener("devicechange"' in CLIENT_JS
+    assert 'ctx.addEventListener("sinkchange"' in CLIENT_JS
+    assert 'mediaDevices.removeEventListener("devicechange"' in CLIENT_JS
+    assert 'this._ctx.removeEventListener("sinkchange"' in CLIENT_JS
+    assert "routeKey !== this._echoRouteKey || routeEpoch !== this._echoRouteEpoch" in CLIENT_JS
+    assert "this._echoDevicePair" not in CLIENT_JS
+    assert "device_pair" not in CLIENT_JS
+    assert "client !== savingClient" in MAIN_JS
+    assert "echoRouteIdentityMatches(latestEchoStatus, routeKey, routeEpoch)" in MAIN_JS
+    assert "loadSanitizedEchoCalibrations(localStorage" in MAIN_JS
+    assert "Strict-only suppression strength" in INDEX_HTML
+    assert "Strict-only leakage threshold" in INDEX_HTML
+    assert "Strict-only double-talk sensitivity" in INDEX_HTML
+    assert 'data-echo-calibration-key="echoTailMs" type="number" min="350" max="1000"' in INDEX_HTML
     assert '"echoCalibrations",' in server
 
 

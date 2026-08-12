@@ -81,14 +81,20 @@ decoder-block arrival evidence. It is unrelated to the **Adaptive** echo mode.
 
 ## Echo modes
 
-- **Native** uses browser AEC and is the default.
-- **Adaptive** uses the authenticated AEC3 worklet when available and otherwise
+- **Native** uses browser AEC.
+- **Adaptive** is the default, uses the authenticated AEC3 worklet when available, and otherwise
   resolves to Native.
 - **Strict** withholds uncertain capture through the echo tail instead of
   manufacturing silence.
 
 The echo reference is exact scheduled playback PCM, never a clone reference
-recording.
+recording. Resolved microphone and output identifiers are transient input to an
+opaque SHA-256 route fingerprint; they never enter settings, UI, metrics, or
+logs. Route changes reset the AEC cohort and reload that route's finite bounded
+calibration. "Use measured" is enabled only after at least 20 playback-active,
+no-double-talk samples over at least two seconds pass robust median/p95/jitter
+checks. Echo tail is bounded to 350–1000 ms; suppression, leakage, and
+double-talk tuning are Strict-only.
 
 ## Tool
 

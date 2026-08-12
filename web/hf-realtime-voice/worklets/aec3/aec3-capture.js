@@ -1,7 +1,7 @@
 // @ts-check
 
-import { AEC3_FRAME_MS, AEC3_OUTPUT_RATE, Aec3WasmSession } from "./aec3-abi.js";
-import { StrictEchoGate, classifyStrictEcho } from "./strict-echo-gate.js";
+import { AEC3_FRAME_MS, AEC3_OUTPUT_RATE, Aec3WasmSession } from "./aec3-abi.js?v=3-opaque-echo-route";
+import { StrictEchoGate, classifyStrictEcho } from "./strict-echo-gate.js?v=2-opaque-echo-route";
 
 const DEFAULT_CHUNK_MS = 40;
 const GATE_ATTACK_MS = 5;

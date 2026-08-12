@@ -67,7 +67,7 @@
  *   before it's sent. Tunable live via `setNoiseGate`.
  * @property {EchoGuardMode} [echoGuard] Playback-reference echo suppression.
  * @property {Record<string, EchoCalibration>} [echoCalibrations] Saved AEC3
- *   calibration indexed by microphone/output-device pair.
+ *   calibration indexed only by an opaque microphone/output-route digest.
  * @property {Record<string, any>} [pipelineConfig] Conversation-scoped model and TTS routing.
  * @property {PlaybackConfig} [playbackConfig] Browser-only snapshot of the
  *   selected provider's validated delivery mode and resolved tuning profile.
@@ -120,7 +120,14 @@ import { OrbVisualiser, VIS_FFT_SIZE } from "./orb-visualizer.js";
 import {
   aec3ProcessorOptions,
   loadAec3Worklet,
-} from "../worklets/aec3/aec3-loader.js";
+} from "../worklets/aec3/aec3-loader.js?v=5-echo-route";
+import {
+  EchoRouteCalibration,
+  fingerprintEchoRoute,
+  normalizeEchoCalibration,
+  sanitizeEchoCalibrations,
+  upsertEchoCalibration,
+} from "../echo-route-calibration.js?v=1-opaque-route";
 
 /** Build an Error carrying a `code` (and optional extra fields) so callers can
  *  branch on the failure kind: "limit" | "queue-full" | "queue-expired" | "aborted".
@@ -671,35 +678,6 @@ export class AdaptivePlaybackPolicyStore {
     this._persist();
   }
 }
-const DEFAULT_ECHO_CALIBRATION = Object.freeze({
-  delayMs: 0,
-  suppressionStrength: 0.65,
-  leakageThreshold: 0.65,
-  doubleTalkSensitivity: 0.5,
-  echoTailMs: 350,
-});
-
-/** @param {Partial<EchoCalibration> | null | undefined} value */
-function normalizeEchoCalibration(value) {
-  const clamp = (candidate, minimum, maximum, fallback) => {
-    const number = Number(candidate);
-    return Number.isFinite(number) ? Math.max(minimum, Math.min(maximum, number)) : fallback;
-  };
-  return {
-    delayMs: clamp(value?.delayMs, 0, 500, DEFAULT_ECHO_CALIBRATION.delayMs),
-    suppressionStrength: clamp(
-      value?.suppressionStrength, 0, 1, DEFAULT_ECHO_CALIBRATION.suppressionStrength,
-    ),
-    leakageThreshold: clamp(
-      value?.leakageThreshold, 0.05, 1, DEFAULT_ECHO_CALIBRATION.leakageThreshold,
-    ),
-    doubleTalkSensitivity: clamp(
-      value?.doubleTalkSensitivity, 0, 1, DEFAULT_ECHO_CALIBRATION.doubleTalkSensitivity,
-    ),
-    echoTailMs: clamp(value?.echoTailMs, 0, 1000, DEFAULT_ECHO_CALIBRATION.echoTailMs),
-  };
-}
-
 export class S2sWsRealtimeClient extends EventTarget {
   /** @param {WsClientOptions} options */
   constructor(options) {
@@ -740,12 +718,20 @@ export class S2sWsRealtimeClient extends EventTarget {
     /** @type {NoiseGate} Mic noise gate; off by default. */
     this._noiseGate = options.noiseGate ?? { enabled: false, thresholdDb: -45 };
     /** @type {EchoGuardMode} */
-    this._echoGuard = options.echoGuard ?? "native";
+    this._echoGuard = options.echoGuard ?? "adaptive";
     /** @type {Record<string, EchoCalibration>} */
-    this._echoCalibrations = options.echoCalibrations ?? {};
-    this._echoDevicePair = "";
-    /** @type {EchoCalibration | null} */
-    this._echoCalibration = null;
+    this._echoCalibrations = sanitizeEchoCalibrations(options.echoCalibrations);
+    this._echoRouteKey = "";
+    this._echoRouteEpoch = 0;
+    this._echoRouteSerial = 0;
+    this._echoRouteState = "pending";
+    this._echoCalibrationCollector = new EchoRouteCalibration();
+    this._echoCalibrationResult = this._echoCalibrationCollector.result();
+    /** @type {EchoCalibration} */
+    this._echoCalibration = normalizeEchoCalibration(null);
+    this._echoOutputLatencyMs = 0;
+    this._echoDeviceChangeListener = null;
+    this._echoSinkChangeListener = null;
     this._aec3Status = null;
     /** @type {WebSocket | null} */
     this._ws = null;
@@ -1443,6 +1429,169 @@ export class S2sWsRealtimeClient extends EventTarget {
     };
   }
 
+  _currentOutputLatencyMs() {
+    const seconds = Number(this._ctx?.outputLatency);
+    return Number.isFinite(seconds) ? Math.max(0, Math.min(500, seconds * 1000)) : 0;
+  }
+
+  /**
+   * Resolve the current physical route and immediately reduce its identifiers
+   * to one domain-separated digest. Device IDs, group IDs, and labels never
+   * leave this stack frame or become object state.
+   * @param {AudioContext} ctx
+   * @param {MediaStreamTrack | undefined} micTrack
+   */
+  async _fingerprintCurrentEchoRoute(ctx, micTrack) {
+    const mediaDevices = globalThis.navigator?.mediaDevices;
+    let devices = [];
+    if (mediaDevices && typeof mediaDevices.enumerateDevices === "function") {
+      try {
+        devices = await mediaDevices.enumerateDevices();
+      } catch {
+        devices = [];
+      }
+    }
+    if (!devices.length) return "";
+    const micSettings = micTrack?.getSettings?.() || {};
+    const requestedMic = typeof micSettings.deviceId === "string" ? micSettings.deviceId : "";
+    if (!requestedMic) return "";
+    const micDevice = devices.find((device) => (
+      device.kind === "audioinput" && device.deviceId === requestedMic
+    ));
+    if (!micDevice) return "";
+
+    const requestedOutput = typeof ctx.sinkId === "string" && ctx.sinkId
+      ? ctx.sinkId
+      : "default";
+    const outputDevice = requestedOutput !== "default"
+      ? devices.find((device) => (
+        device.kind === "audiooutput" && device.deviceId === requestedOutput
+      ))
+      : devices.find((device) => (
+        device.kind === "audiooutput" && device.deviceId === "default"
+      ));
+    if (!outputDevice) return "";
+
+    const microphoneMaterial = [
+      requestedMic,
+      micDevice?.deviceId || "",
+      micDevice?.groupId || "",
+      micDevice?.label || "",
+    ].join("\u0000");
+    const outputMaterial = [
+      requestedOutput,
+      outputDevice?.deviceId || "",
+      outputDevice?.groupId || "",
+      outputDevice?.label || "",
+    ].join("\u0000");
+    return fingerprintEchoRoute(microphoneMaterial, outputMaterial);
+  }
+
+  _dispatchEchoStatus(extra = {}) {
+    const detail = {
+      ...(this._aec3Status || {}),
+      routeKey: this._echoRouteKey,
+      routeEpoch: this._echoRouteEpoch,
+      routeState: this._echoRouteState,
+      outputLatencyMs: this._currentOutputLatencyMs(),
+      calibration: this._echoCalibration,
+      calibrationResult: this._echoCalibrationResult,
+      ...extra,
+    };
+    this.dispatchEvent(new CustomEvent("echo-status", { detail }));
+  }
+
+  _postEchoCalibration() {
+    const outputLatencyMs = this._currentOutputLatencyMs();
+    this._echoOutputLatencyMs = outputLatencyMs;
+    this._captureNode?.port.postMessage({
+      kind: "echo_calibration",
+      ...this._echoCalibration,
+      outputLatencyMs,
+    });
+  }
+
+  /** @param {"initial"|"devicechange"|"sinkchange"} source */
+  async _refreshEchoRoute(source) {
+    const ctx = this._ctx;
+    if (!ctx || this._closed) return false;
+    const serial = ++this._echoRouteSerial;
+    const micTrack = this.options.micStream?.getAudioTracks?.()[0];
+    let routeKey = "";
+    try {
+      routeKey = await this._fingerprintCurrentEchoRoute(ctx, micTrack);
+    } catch {
+      routeKey = "";
+    }
+    if (this._closed || this._ctx !== ctx || serial !== this._echoRouteSerial) return false;
+
+    if (routeKey === this._echoRouteKey && this._echoRouteState !== "pending") {
+      this._echoRouteState = routeKey ? "ready" : "unavailable";
+      this._postEchoCalibration();
+      this._dispatchEchoStatus({ routeChange: `${source}_unchanged` });
+      return true;
+    }
+
+    this._echoRouteKey = routeKey;
+    this._echoRouteEpoch += 1;
+    this._echoRouteState = routeKey ? "ready" : "unavailable";
+    this._echoCalibrationCollector.reset();
+    this._echoCalibrationResult = this._echoCalibrationCollector.result({
+      outputLatencyMs: this._currentOutputLatencyMs(),
+    });
+    this._echoCalibration = normalizeEchoCalibration(
+      routeKey ? this._echoCalibrations[routeKey] : null,
+    );
+    this._captureNode?.port.postMessage({ kind: "echo_reset" });
+    this._postEchoCalibration();
+    this._dispatchEchoStatus({ routeChange: source });
+    return true;
+  }
+
+  _installEchoRouteListeners(ctx) {
+    const mediaDevices = globalThis.navigator?.mediaDevices;
+    this._echoDeviceChangeListener = () => {
+      void this._refreshEchoRoute("devicechange");
+    };
+    if (mediaDevices && typeof mediaDevices.addEventListener === "function") {
+      try {
+        mediaDevices.addEventListener("devicechange", this._echoDeviceChangeListener);
+      } catch {
+        // Sandboxed browsers may deny device notifications; initial routing remains valid.
+      }
+    }
+    this._echoSinkChangeListener = () => {
+      void this._refreshEchoRoute("sinkchange");
+    };
+    if (typeof ctx.addEventListener === "function") {
+      try {
+        ctx.addEventListener("sinkchange", this._echoSinkChangeListener);
+      } catch {
+        // AudioContext sink events are optional and can be blocked by the sandbox.
+      }
+    }
+  }
+
+  _removeEchoRouteListeners() {
+    const mediaDevices = globalThis.navigator?.mediaDevices;
+    if (this._echoDeviceChangeListener && mediaDevices?.removeEventListener) {
+      try {
+        mediaDevices.removeEventListener("devicechange", this._echoDeviceChangeListener);
+      } catch {
+        // ignored
+      }
+    }
+    if (this._echoSinkChangeListener && this._ctx?.removeEventListener) {
+      try {
+        this._ctx.removeEventListener("sinkchange", this._echoSinkChangeListener);
+      } catch {
+        // ignored
+      }
+    }
+    this._echoDeviceChangeListener = null;
+    this._echoSinkChangeListener = null;
+  }
+
   async _setupAudio() {
     // Prefer a context the caller already created + resumed inside the tap
     // gesture (required on iOS). Fall back to creating one here for callers
@@ -1467,22 +1616,11 @@ export class S2sWsRealtimeClient extends EventTarget {
     await ctx.audioWorklet.addModule(new URL("audio-playback.js?v=16-adaptive-safe-start", base).href);
     const aec3 = await loadAec3Worklet(ctx);
     if (!aec3.available) {
-      await ctx.audioWorklet.addModule(new URL("mic-capture.js?v=12-aec3-fallback", base).href);
+      await ctx.audioWorklet.addModule(new URL("mic-capture.js?v=13-opaque-echo-route", base).href);
     }
 
     const micTrack = this.options.micStream?.getAudioTracks?.()[0];
-    const micSettings = micTrack?.getSettings?.() || {};
-    const microphoneId = micSettings.deviceId || micTrack?.label || "default-microphone";
-    const outputId = typeof ctx.sinkId === "string" && ctx.sinkId
-      ? ctx.sinkId
-      : "default-output";
-    this._echoDevicePair = `${microphoneId}::${outputId}`;
-    this._echoCalibration = normalizeEchoCalibration(
-      this._echoCalibrations[this._echoDevicePair],
-    );
-    const outputLatencyMs = Number.isFinite(ctx.outputLatency)
-      ? Math.max(0, ctx.outputLatency * 1000)
-      : 0;
+    await this._refreshEchoRoute("initial");
 
     const captureNode = new AudioWorkletNode(ctx, aec3.processorName, {
       numberOfInputs: 2,
@@ -1498,6 +1636,18 @@ export class S2sWsRealtimeClient extends EventTarget {
         // Raw pre-gate mic RMS for the Settings meter.
         this.dispatchEvent(new CustomEvent("input-level", { detail: { rms: data.rms } }));
       } else if (data?.kind === "echo_metric") {
+        const outputLatencyMs = this._currentOutputLatencyMs();
+        if (Math.abs(outputLatencyMs - this._echoOutputLatencyMs) >= 0.5) {
+          this._postEchoCalibration();
+        }
+        const doubleTalk = data.doubleTalk == null ? null : !!data.doubleTalk;
+        this._echoCalibrationCollector.add({
+          lagMs: data.lagMs,
+          timestampMs: performance.now(),
+          playbackActive: data.playbackActive === true,
+          doubleTalk,
+        });
+        this._echoCalibrationResult = this._echoCalibrationCollector.result({ outputLatencyMs });
         this.dispatchEvent(new CustomEvent("pipeline-metric", {
           detail: {
             stage: "echo_guard",
@@ -1516,53 +1666,50 @@ export class S2sWsRealtimeClient extends EventTarget {
               erle_db: Number.isFinite(data.erleDb) ? Number(data.erleDb) : null,
               lag_ms: Number.isFinite(data.lagMs) ? Number(data.lagMs) : null,
               output_latency_ms: outputLatencyMs,
-              device_pair: this._echoDevicePair,
+              route_epoch: this._echoRouteEpoch,
+              calibration_accepted: this._echoCalibrationResult.accepted,
+              calibration_reason: this._echoCalibrationResult.reason,
+              calibration_samples: this._echoCalibrationResult.sampleCount,
+              calibration_span_ms: this._echoCalibrationResult.spanMs,
+              calibration_median_ms: this._echoCalibrationResult.medianMs,
+              calibration_p95_ms: this._echoCalibrationResult.p95Ms,
+              calibration_jitter_ms: this._echoCalibrationResult.jitterMs,
               model_ready: !!data.modelReady,
               prediction_confidence: Number.isFinite(data.predictionConfidence)
                 ? Number(data.predictionConfidence)
                 : null,
               candidate_ms: Number(data.candidateMs || 0),
               suppressed_ms: Number(data.suppressedMs || 0),
-              double_talk: data.doubleTalk == null ? null : !!data.doubleTalk,
+              double_talk: doubleTalk,
               double_talk_source: data.doubleTalkSource || null,
               playback_active: !!data.playbackActive,
             },
           },
         }));
+        this._dispatchEchoStatus();
       } else if (data?.kind === "aec3_status") {
         this._aec3Status = {
           ...data,
-          devicePair: this._echoDevicePair,
-          outputLatencyMs,
-          calibration: this._echoCalibration,
           loaderAvailable: aec3.available,
           loaderReason: aec3.reason || "",
         };
-        this.dispatchEvent(new CustomEvent("echo-status", { detail: this._aec3Status }));
+        this._dispatchEchoStatus();
       } else if (data?.kind === "aec3_error") {
-        this.dispatchEvent(new CustomEvent("echo-status", {
-          detail: {
-            available: false,
-            requestedMode: this._echoGuard,
-            effectiveMode: this._echoGuard === "strict" ? "strict-fallback" : "native",
-            devicePair: this._echoDevicePair,
-            outputLatencyMs,
-            calibration: this._echoCalibration,
-            error: data.error || "AEC3 worklet failed",
-          },
-        }));
+        this._dispatchEchoStatus({
+          available: false,
+          requestedMode: this._echoGuard,
+          effectiveMode: this._echoGuard === "strict" ? "strict-fallback" : "native",
+          error: "AEC3 worklet failed",
+        });
       }
     };
+    this._captureNode = captureNode;
     // Push the initial gate config now that the worklet exists.
     captureNode.port.postMessage({ kind: "gate", ...this._noiseGate });
     const nativeAec = !!micTrack?.getSettings?.().echoCancellation;
     captureNode.port.postMessage({ kind: "echo_guard", mode: this._echoGuard, nativeAec });
-    captureNode.port.postMessage({
-      kind: "echo_calibration",
-      ...this._echoCalibration,
-      outputLatencyMs,
-    });
-    this._captureNode = captureNode;
+    this._postEchoCalibration();
+    this._installEchoRouteListeners(ctx);
 
     const micSrc = ctx.createMediaStreamSource(this.options.micStream);
     micSrc.connect(captureNode);
@@ -2554,26 +2701,31 @@ export class S2sWsRealtimeClient extends EventTarget {
 
   /** @param {EchoGuardMode} mode */
   setEchoGuard(mode) {
-    this._echoGuard = ["native", "adaptive", "strict"].includes(mode) ? mode : "native";
+    this._echoGuard = ["native", "adaptive", "strict"].includes(mode) ? mode : "adaptive";
     const micTrack = this.options.micStream?.getAudioTracks?.()[0];
     const nativeAec = !!micTrack?.getSettings?.().echoCancellation;
     this._captureNode?.port.postMessage({ kind: "echo_guard", mode: this._echoGuard, nativeAec });
   }
 
-  /** Persisted by the UI under the current microphone/output-device pair. */
-  setEchoCalibration(calibration) {
-    this._echoCalibration = normalizeEchoCalibration(calibration);
-    if (this._echoDevicePair) {
-      this._echoCalibrations[this._echoDevicePair] = this._echoCalibration;
+  /**
+   * Apply calibration only to the exact opaque route generation presented to
+   * the UI. An async device or sink change makes a stale save harmless.
+   * @param {Record<string, unknown>} calibration
+   * @param {string} routeKey
+   * @param {number} routeEpoch
+   * @returns {boolean}
+   */
+  setEchoCalibration(calibration, routeKey, routeEpoch) {
+    if (!routeKey || routeKey !== this._echoRouteKey || routeEpoch !== this._echoRouteEpoch) {
+      return false;
     }
-    const outputLatencyMs = Number.isFinite(this._ctx?.outputLatency)
-      ? Math.max(0, this._ctx.outputLatency * 1000)
-      : 0;
-    this._captureNode?.port.postMessage({
-      kind: "echo_calibration",
-      ...this._echoCalibration,
-      outputLatencyMs,
-    });
+    this._echoCalibration = normalizeEchoCalibration(calibration);
+    this._echoCalibrations = upsertEchoCalibration(
+      this._echoCalibrations, routeKey, this._echoCalibration,
+    );
+    this._postEchoCalibration();
+    this._dispatchEchoStatus();
+    return true;
   }
 
   /** @param {Record<string, unknown>} event */
@@ -2587,6 +2739,8 @@ export class S2sWsRealtimeClient extends EventTarget {
     // `_pollQueue` throws "aborted" and connect() unwinds cleanly.
     if (!this._closed) this._invalidatePlayback("stop");
     this._closed = true;
+    this._echoRouteSerial += 1;
+    this._removeEchoRouteListeners();
     this._sessionConfigured = false;
     this._rejectInitialConfig(new Error("Connection closed before pipeline configuration completed"));
     this._muted = true;
@@ -2674,6 +2828,9 @@ export class S2sWsRealtimeClient extends EventTarget {
     this._micSrc = null;
     this._micAnalyser = null;
     this._outAnalyser = null;
+    this._echoRouteKey = "";
+    this._echoRouteState = "closed";
+    this._echoCalibrationCollector.reset();
     this._pendingPlaybackConfigs.length = 0;
     this._activePlaybackTurn = null;
     this._anonymousPlaybackResponseId = "";

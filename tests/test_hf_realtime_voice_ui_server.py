@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -1041,6 +1042,9 @@ def test_remote_model_connection_test_redacts_key(monkeypatch):
 def test_hf_ui_persistent_preferences_are_atomic_and_exclude_api_keys(tmp_path, monkeypatch):
     server = _load_ui_server_module()
     monkeypatch.setattr(server, "UI_SETTINGS_PATH", tmp_path / "hf_realtime_ui_settings.json")
+    many_routes = {
+        f"route_{index:064x}": {"delayMs": index} for index in range(18)
+    }
 
     result = server._write_public_ui_settings(
         {
@@ -1053,13 +1057,18 @@ def test_hf_ui_persistent_preferences_are_atomic_and_exclude_api_keys(tmp_path, 
             "modelUrl": "http://127.0.0.1:8818",
             "fullBufferTts": False,
             "echoCalibrations": {
-                "mic-a::output-b": {
+                "mic-a::output-b": {"delayMs": 99},
+                f"route_{'b' * 64}": {"delayMs": math.nan},
+                f"route_{'c' * 64}": {"delayMs": 10**10000},
+                **many_routes,
+                f"route_{'a' * 64}": {
                     "delayMs": 72,
                     "suppressionStrength": 0.8,
                     "leakageThreshold": 4,
                     "doubleTalkSensitivity": -1,
+                    "echoTailMs": 0,
                     "unexpected": 99,
-                }
+                },
             },
             "modelApiKey": "must-not-persist",
         }
@@ -1072,15 +1081,58 @@ def test_hf_ui_persistent_preferences_are_atomic_and_exclude_api_keys(tmp_path, 
         "qwen3tts-audiocpp": "low-latency",
         "faster": "provider-default",
     }
-    assert saved["echoCalibrations"]["mic-a::output-b"] == {
+    assert saved["echoCalibrations"][f"route_{'a' * 64}"] == {
         "delayMs": 72.0,
         "suppressionStrength": 0.8,
         "leakageThreshold": 1.0,
         "doubleTalkSensitivity": 0.0,
+        "echoTailMs": 350.0,
     }
+    assert "mic-a::output-b" not in saved["echoCalibrations"]
+    assert f"route_{'b' * 64}" not in saved["echoCalibrations"]
+    assert f"route_{'c' * 64}" not in saved["echoCalibrations"]
+    assert len(saved["echoCalibrations"]) == 16
+    assert f"route_{0:064x}" not in saved["echoCalibrations"]
     assert "modelApiKey" not in saved
     assert "must-not-persist" not in server.UI_SETTINGS_PATH.read_text(encoding="utf-8")
     assert not server.UI_SETTINGS_PATH.with_suffix(".tmp").exists()
+
+
+def test_hf_ui_echo_route_order_survives_write_read_and_newest_eviction(tmp_path, monkeypatch):
+    server = _load_ui_server_module()
+    monkeypatch.setattr(server, "UI_SETTINGS_PATH", tmp_path / "hf_realtime_ui_settings.json")
+    initial = {
+        f"route_{index:064x}": {"delayMs": index}
+        for index in range(16, 32)
+    }
+    server._write_public_ui_settings({"echoCalibrations": initial})
+    loaded = server._read_public_ui_settings()["echoCalibrations"]
+    newest = f"route_{'0' * 63}a"
+    loaded[newest] = {"delayMs": 77}
+    server._write_public_ui_settings({"echoCalibrations": loaded})
+    reloaded = server._read_public_ui_settings()["echoCalibrations"]
+
+    assert list(reloaded)[-1] == newest
+    assert f"route_{16:064x}" not in reloaded
+    assert f"route_{31:064x}" in reloaded
+
+
+def test_hf_ui_read_scrubs_current_and_legacy_raw_echo_routes(tmp_path, monkeypatch):
+    server = _load_ui_server_module()
+    current = tmp_path / "current" / "hf_realtime_ui_settings.json"
+    legacy = tmp_path / "legacy" / "hf_realtime_ui_settings.json"
+    current.parent.mkdir(parents=True)
+    legacy.parent.mkdir(parents=True)
+    payload = {"echoCalibrations": {"mic-a::output-b": {"delayMs": 99}}}
+    current.write_text(json.dumps(payload), encoding="utf-8")
+    legacy.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(server, "UI_SETTINGS_PATH", current)
+    monkeypatch.setattr(server, "_LEGACY_UI_SETTINGS_PATH", legacy)
+    monkeypatch.setattr(server, "_ui_settings_default", current)
+
+    assert server._read_public_ui_settings()["echoCalibrations"] == {}
+    assert "mic-a::output-b" not in current.read_text(encoding="utf-8")
+    assert "mic-a::output-b" not in legacy.read_text(encoding="utf-8")
 
 
 def test_hf_ui_normalizes_legacy_audio_cpp_provider_settings(tmp_path, monkeypatch):

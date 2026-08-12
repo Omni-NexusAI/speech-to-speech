@@ -145,9 +145,9 @@ after Stop, barge-in, replacement, disconnect, or cancellation. Network
 
 ## Echo control
 
-- **Native** is the safe default and uses the browser's built-in echo
-  cancellation, noise suppression, and automatic gain control.
-- **Adaptive** uses the bundled Sonora/WebRTC AEC3 worklet only after manifest,
+- **Native** uses the browser's built-in echo cancellation, noise suppression,
+  and automatic gain control.
+- **Adaptive** is the default and uses the bundled Sonora/WebRTC AEC3 worklet only after manifest,
   SHA-256, ABI, compile, and worklet loading succeed. Failure resolves
   truthfully to Native.
 - **Strict** uses the reference-aware path more aggressively and withholds
@@ -155,9 +155,15 @@ after Stop, barge-in, replacement, disconnect, or cancellation. Network
   silence.
 
 The capture path receives the exact PCM scheduled for playback, never the static
-voice-clone reference. Calibration is stored per microphone/output-device pair.
-AEC3 and physical speaker-loopback behavior remain experimental across device
-pairs and remote-audio routing.
+voice-clone reference. Calibration is stored under an opaque microphone/output
+route fingerprint; raw device identifiers are never persisted or shown. Route
+changes reset the AEC measurement cohort and load that route's settings. The
+measured-delay action becomes available only after at least 20 quiet,
+playback-active samples over at least two seconds pass the median/p95/jitter
+stability checks. Echo tail is adjustable from 350–1000 ms, while suppression,
+leakage, and double-talk controls apply only to Strict. AEC3 and physical
+speaker-loopback behavior remain experimental across device pairs and
+remote-audio routing.
 
 ## Tools
 
@@ -209,7 +215,7 @@ local direct WebSocket contract.
 ## Limits
 
 - Native audio.cpp streaming and adaptive playback learning are experimental.
-- AEC3 still needs device-pair-specific speaker-loopback and double-talk
+- AEC3 still needs route-specific speaker-loopback and double-talk
   validation.
 - Provider `Auto` language support is reported from the explicit provider
   capability policy, not inferred from the general speech-validation request.

@@ -61,7 +61,7 @@ def test_release_defaults_match_responses_api_parakeet_qwen3_realtime_profile():
 def test_runtime_echo_guard_descriptor_matches_client_owned_aec3_contract():
     descriptor = ECHO_GUARD_RUNTIME_DESCRIPTOR
 
-    assert descriptor["default"] == "native"
+    assert descriptor["default"] == "adaptive"
     assert descriptor["modes"] == ["native", "adaptive", "strict"]
     assert descriptor["reference"] == "post_gain_resampled_scheduled_playback_pcm"
     assert descriptor["ownership"] == "client"
@@ -69,7 +69,7 @@ def test_runtime_echo_guard_descriptor_matches_client_owned_aec3_contract():
         "implementation": "sonora_aec3_wasm",
         "activation": "validated_module_only",
         "availability": "client_reported",
-        "calibration": "per_microphone_output_device_pair",
+        "calibration": "per_opaque_microphone_output_route_fingerprint",
         "failure_mode": "native",
     }
     assert descriptor["strict"] == {"failure_mode": "fail_closed"}

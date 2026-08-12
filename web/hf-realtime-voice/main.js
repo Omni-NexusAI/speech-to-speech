@@ -19,15 +19,22 @@
 import {
   S2sWsRealtimeClient,
   prepareToolArgumentsForBrowser,
-} from "./ws/s2s-ws-client.js?v=20-camera-correlation";
+} from "./ws/s2s-ws-client.js?v=21-opaque-echo-route";
 import { $, truncateError, DEBUG } from "./ui/dom.js";
-import { ChatView, boundedCorrelationId } from "./ui/chat.js?v=4-camera-correlation";
+import { ChatView, boundedCorrelationId } from "./ui/chat.js?v=5-opaque-echo-route";
 import { Account } from "./ui/account.js";
 import {
   SearchTurnPolicy,
   WEB_SEARCH_ARGUMENT_SCHEMA,
   searchPolicyOutput,
 } from "./tools/web-search.js?v=1-search-freshness";
+import {
+  echoRouteIdentityMatches,
+  isOpaqueEchoRouteKey,
+  loadSanitizedEchoCalibrations,
+  sanitizeEchoCalibrations,
+  upsertEchoCalibration,
+} from "./echo-route-calibration.js?v=1-opaque-route";
 
 const DEFAULT_VOICE = "";
 const DEFAULT_INSTRUCTIONS =
@@ -132,7 +139,7 @@ function loadSettings() {
   // "off" was the historical name for browser-native AEC.  Migrate it
   // truthfully and keep Native as the safe default while AEC3 is unavailable.
   const echoGuard = storedEchoGuard === "strict" ? "strict" :
-    storedEchoGuard === "adaptive" ? "adaptive" : "native";
+    storedEchoGuard === "native" ? "native" : "adaptive";
   if (echoGuardVersion !== "3") {
     localStorage.setItem(STORAGE_KEYS.echoGuard, echoGuard);
     localStorage.setItem(STORAGE_KEYS.echoGuardVersion, "3");
@@ -185,6 +192,7 @@ function loadGateThreshold() {
 /** @param {ReturnType<typeof loadSettings>} s */
 function saveSettings(s) {
   s.voiceByBackend = { ...(s.voiceByBackend || {}), [s.ttsBackend]: s.voice };
+  s.echoCalibrations = sanitizeEchoCalibrations(s.echoCalibrations);
   localStorage.setItem(STORAGE_KEYS.directUrl, s.directUrl);
   localStorage.setItem(STORAGE_KEYS.voice, s.voice);
   localStorage.setItem(STORAGE_KEYS.instructions, s.instructions);
@@ -216,12 +224,7 @@ function saveSettings(s) {
 }
 
 function loadEchoCalibrations() {
-  try {
-    const value = JSON.parse(localStorage.getItem(STORAGE_KEYS.echoCalibrations) || "{}");
-    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
-  } catch {
-    return {};
-  }
+  return loadSanitizedEchoCalibrations(localStorage, STORAGE_KEYS.echoCalibrations);
 }
 
 function publicSettingsPayload(s) {
@@ -233,7 +236,7 @@ function publicSettingsPayload(s) {
     instructions: s.instructions,
     noiseGate: s.noiseGate,
     echoGuard: s.echoGuard,
-    echoCalibrations: s.echoCalibrations || {},
+    echoCalibrations: sanitizeEchoCalibrations(s.echoCalibrations),
     fullBufferTts: s.fullBufferTts,
     liveTranscript: s.liveTranscript,
     maxResponseTokens: s.maxResponseTokens,
@@ -252,6 +255,9 @@ async function restorePersistentSettings() {
     if (!payload?.settings || typeof payload.settings !== "object") return;
     // Preserve any browser-local API key already present on this device.
     settings = { ...settings, ...payload.settings, modelApiKey: settings.modelApiKey };
+    settings.echoCalibrations = sanitizeEchoCalibrations(
+      payload.settings.echoCalibrations ?? settings.echoCalibrations,
+    );
     settings.ttsBackend = normalizeTtsProvider(settings.ttsBackend);
     settings.voiceByBackend = normalizeTtsProviderMap(
       payload.settings.voiceByBackend || settings.voiceByBackend || {},
@@ -371,6 +377,7 @@ const diagnosticsAudioStatus = $("#diagnostics-audio-status");
 const diagnosticsAudioMetrics = $("#diagnostics-audio-metrics");
 const diagnosticsEchoDevicePair = $("#diagnostics-echo-device-pair");
 const diagnosticsEchoOutputLatency = $("#diagnostics-echo-output-latency");
+const diagnosticsEchoCalibrationStatus = $("#diagnostics-echo-calibration-status");
 const diagnosticsEchoSave = $("#diagnostics-echo-save");
 const diagnosticsEchoUseMeasured = $("#diagnostics-echo-use-measured");
 const diagnosticsEchoInputs = Array.from(document.querySelectorAll("[data-echo-calibration-key]"));
@@ -813,11 +820,11 @@ function echoCalibrationFromControls() {
     if (Number.isFinite(number)) calibration[input.dataset.echoCalibrationKey] = number;
   }
   return {
-    delayMs: Math.max(0, Math.min(500, Number(calibration.delayMs) || 0)),
-    suppressionStrength: Math.max(0, Math.min(1, Number(calibration.suppressionStrength) || 0)),
-    leakageThreshold: Math.max(0.05, Math.min(1, Number(calibration.leakageThreshold) || 0.65)),
-    doubleTalkSensitivity: Math.max(0, Math.min(1, Number(calibration.doubleTalkSensitivity) || 0)),
-    echoTailMs: Number(latestEchoStatus?.calibration?.echoTailMs) || 350,
+    delayMs: Math.max(0, Math.min(500, Number.isFinite(calibration.delayMs) ? calibration.delayMs : 0)),
+    suppressionStrength: Math.max(0, Math.min(1, Number.isFinite(calibration.suppressionStrength) ? calibration.suppressionStrength : 0.65)),
+    leakageThreshold: Math.max(0.05, Math.min(1, Number.isFinite(calibration.leakageThreshold) ? calibration.leakageThreshold : 0.65)),
+    doubleTalkSensitivity: Math.max(0, Math.min(1, Number.isFinite(calibration.doubleTalkSensitivity) ? calibration.doubleTalkSensitivity : 0.5)),
+    echoTailMs: Math.max(350, Math.min(1000, Number.isFinite(calibration.echoTailMs) ? calibration.echoTailMs : 350)),
   };
 }
 
@@ -829,14 +836,22 @@ function paintEchoStatus(status) {
     const value = calibration[input.dataset.echoCalibrationKey];
     if (Number.isFinite(Number(value))) input.value = String(value);
   }
-  diagnosticsEchoDevicePair.textContent = status.devicePair || "device pair pending";
+  const routeKey = isOpaqueEchoRouteKey(status.routeKey) ? status.routeKey : "";
+  const routeEpoch = Number.isSafeInteger(status.routeEpoch) ? status.routeEpoch : 0;
+  diagnosticsEchoDevicePair.textContent = routeKey
+    ? `Opaque route ${routeKey.slice(6, 14)}… · epoch ${routeEpoch}`
+    : "opaque route pending";
   diagnosticsEchoOutputLatency.textContent =
     `Output latency: ${Number(status.outputLatencyMs || 0).toFixed(1)} ms`;
+  const result = status.calibrationResult || {};
+  const accepted = result.accepted === true && Number.isFinite(Number(result.delayMs));
+  diagnosticsEchoUseMeasured.disabled = !accepted;
+  diagnosticsEchoCalibrationStatus.textContent = accepted
+    ? `Stable calibration: ${result.sampleCount} samples over ${Number(result.spanMs).toFixed(0)} ms · median ${Number(result.medianMs).toFixed(1)} ms · p95 ${Number(result.p95Ms).toFixed(1)} ms · jitter ${Number(result.jitterMs).toFixed(1)} ms.`
+    : `Calibration pending: ${Number(result.sampleCount || 0)} samples · ${String(result.reason || "collecting")}.`;
   const requested = status.requestedMode || settings.echoGuard;
   const effective = status.effectiveMode || (requested === "strict" ? "strict-fallback" : "native");
-  const engine = status.available
-    ? status.engine || "AEC3"
-    : status.error || status.loaderReason || "Native browser AEC fallback";
+  const engine = status.available ? "verified AEC3" : "Native browser AEC fallback";
   diagnosticsAudioStatus.textContent =
     `Requested/effective echo: ${requested}/${effective} · reference ${status.referenceWired === false ? "missing" : "wired"} · ${engine}.`;
   setDiagnosticWarning(
@@ -848,28 +863,40 @@ function paintEchoStatus(status) {
 }
 
 async function saveActiveEchoCalibration({ useMeasuredDelay = false } = {}) {
-  const pair = latestEchoStatus?.devicePair;
-  if (!pair) {
-    diagnosticsAudioStatus.textContent = "Start a conversation before saving device-pair calibration.";
+  const routeKey = latestEchoStatus?.routeKey;
+  const routeEpoch = latestEchoStatus?.routeEpoch;
+  if (!isOpaqueEchoRouteKey(routeKey) || !Number.isSafeInteger(routeEpoch)) {
+    diagnosticsAudioStatus.textContent = "Start a conversation before saving route calibration.";
     return;
   }
   if (useMeasuredDelay) {
-    const echo = [...pipelineMetrics].reverse().find((metric) => metric.stage === "echo_guard");
-    const measured = Number(echo?.detail?.lag_ms);
-    const outputLatency = Number(latestEchoStatus?.outputLatencyMs || 0);
-    if (!Number.isFinite(measured)) {
-      diagnosticsAudioStatus.textContent = "No stable AEC3 delay measurement is available yet.";
+    const result = latestEchoStatus?.calibrationResult;
+    if (result?.accepted !== true || !Number.isFinite(Number(result.delayMs))) {
+      diagnosticsAudioStatus.textContent = "A stable quiet-playback calibration is not available yet.";
       return;
     }
     const delayInput = diagnosticsEchoInputs.find(
       (input) => input.dataset.echoCalibrationKey === "delayMs",
     );
-    if (delayInput) delayInput.value = String(Math.max(0, Math.round(measured - outputLatency)));
+    if (delayInput) delayInput.value = String(Math.max(0, Math.round(Number(result.delayMs))));
   }
   const calibration = echoCalibrationFromControls();
-  settings.echoCalibrations = { ...(settings.echoCalibrations || {}), [pair]: calibration };
-  client?.setEchoCalibration(calibration);
+  const savingClient = client;
+  if (!savingClient?.setEchoCalibration(calibration, routeKey, routeEpoch)) {
+    diagnosticsAudioStatus.textContent = "The audio route changed; review the new route before saving.";
+    return;
+  }
+  settings.echoCalibrations = upsertEchoCalibration(
+    settings.echoCalibrations, routeKey, calibration,
+  );
   const saved = await saveSettings(settings);
+  if (
+    client !== savingClient
+    || !echoRouteIdentityMatches(latestEchoStatus, routeKey, routeEpoch)
+  ) {
+    diagnosticsAudioStatus.textContent = "The audio route changed while saving; review the active route.";
+    return;
+  }
   if (!saved.ok) {
     diagnosticsAudioStatus.textContent = `Calibration save failed: ${saved.error}`;
     return;
@@ -2427,7 +2454,7 @@ function readSettingsFromForm() {
     voiceByBackend: { ...(settings.voiceByBackend || {}), [backend]: voice },
     instructions: inputInstructions.value.trim() || DEFAULT_INSTRUCTIONS,
     noiseGate: readGateThreshold(),
-    echoGuard: ["native", "adaptive", "strict"].includes(inputEchoGuard.value) ? inputEchoGuard.value : "native",
+    echoGuard: ["native", "adaptive", "strict"].includes(inputEchoGuard.value) ? inputEchoGuard.value : "adaptive",
     echoCalibrations: settings.echoCalibrations || {},
     fullBufferTts: inputFullBufferTts.checked,
     liveTranscript: inputLiveTranscript.checked,

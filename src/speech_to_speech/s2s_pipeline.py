@@ -91,7 +91,7 @@ logging.getLogger("numba").setLevel(logging.WARNING)  # quiet down numba logs
 
 
 ECHO_GUARD_RUNTIME_DESCRIPTOR = {
-    "default": "native",
+    "default": "adaptive",
     "modes": ["native", "adaptive", "strict"],
     "reference": "post_gain_resampled_scheduled_playback_pcm",
     "ownership": "client",
@@ -99,7 +99,7 @@ ECHO_GUARD_RUNTIME_DESCRIPTOR = {
         "implementation": "sonora_aec3_wasm",
         "activation": "validated_module_only",
         "availability": "client_reported",
-        "calibration": "per_microphone_output_device_pair",
+        "calibration": "per_opaque_microphone_output_route_fingerprint",
         "failure_mode": "native",
     },
     "strict": {

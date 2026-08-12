@@ -40,6 +40,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -128,6 +129,8 @@ PUBLIC_UI_SETTING_KEYS = {
     "voiceByBackend",
     "ttsProfileByBackend",
 }
+ECHO_ROUTE_KEY_RE = re.compile(r"route_[0-9a-f]{64}")
+MAX_ECHO_CALIBRATION_ROUTES = 16
 TTS_BACKENDS = {
     "faster": {
         "endpoint": "http://127.0.0.1:8881/v1", "requiredModel": "1.7B-Base",
@@ -176,17 +179,74 @@ DEFAULT_VOICE_LIBRARY_DIR = Path(
 app = FastAPI(title="s2s-demo")
 
 
+def _sanitize_echo_calibrations(value: Any) -> dict[str, dict[str, float]]:
+    """Retain only bounded calibration keyed by the browser's opaque route digest."""
+    if not isinstance(value, dict):
+        return {}
+    limits = {
+        "delayMs": (0.0, 500.0),
+        "suppressionStrength": (0.0, 1.0),
+        "leakageThreshold": (0.05, 1.0),
+        "doubleTalkSensitivity": (0.0, 1.0),
+        "echoTailMs": (350.0, 1000.0),
+    }
+    calibrations: dict[str, dict[str, float]] = {}
+    for route_key, calibration in value.items():
+        if (
+            not isinstance(route_key, str)
+            or ECHO_ROUTE_KEY_RE.fullmatch(route_key) is None
+            or not isinstance(calibration, dict)
+        ):
+            continue
+        cleaned: dict[str, float] = {}
+        for field, (minimum, maximum) in limits.items():
+            candidate = calibration.get(field)
+            if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
+                continue
+            try:
+                candidate = float(candidate)
+            except (OverflowError, ValueError):
+                continue
+            if not math.isfinite(candidate):
+                continue
+            cleaned[field] = max(minimum, min(maximum, candidate))
+        if cleaned:
+            calibrations[route_key] = cleaned
+            if len(calibrations) > MAX_ECHO_CALIBRATION_ROUTES:
+                del calibrations[next(iter(calibrations))]
+    return calibrations
+
+
+def _atomic_write_public_ui_settings(path: Path, saved: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    # Preserve nested insertion order: echo calibration eviction is newest-first,
+    # not lexicographic by opaque digest.
+    temporary.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
 def _read_public_ui_settings() -> dict[str, Any]:
     """Load local non-secret UI settings, if the managed frontend has saved any."""
     paths = (UI_SETTINGS_PATH, _LEGACY_UI_SETTINGS_PATH) if UI_SETTINGS_PATH == _ui_settings_default else (UI_SETTINGS_PATH,)
+    selected: dict[str, Any] | None = None
     for path in paths:
         try:
-            saved = json.loads(path.read_text(encoding="utf-8"))
+            loaded = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if isinstance(saved, dict):
-            return _normalize_tts_provider_settings(saved)
-    return {}
+        if not isinstance(loaded, dict):
+            continue
+        saved = _normalize_tts_provider_settings(loaded)
+        if "echoCalibrations" in saved:
+            saved["echoCalibrations"] = _sanitize_echo_calibrations(
+                saved.get("echoCalibrations")
+            )
+        if saved != loaded:
+            _atomic_write_public_ui_settings(path, saved)
+        if selected is None:
+            selected = saved
+    return selected or {}
 
 
 def _write_public_ui_settings(payload: dict[str, Any]) -> dict[str, Any]:
@@ -210,32 +270,10 @@ def _write_public_ui_settings(payload: dict[str, Any]) -> dict[str, Any]:
                 and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", profile_id)
             }
         elif key == "echoCalibrations" and isinstance(value, dict):
-            limits = {
-                "delayMs": (0.0, 500.0),
-                "suppressionStrength": (0.0, 1.0),
-                "leakageThreshold": (0.05, 1.0),
-                "doubleTalkSensitivity": (0.0, 1.0),
-                "echoTailMs": (0.0, 1000.0),
-            }
-            calibrations: dict[str, dict[str, float]] = {}
-            for pair, calibration in list(value.items())[:16]:
-                if not isinstance(pair, str) or not isinstance(calibration, dict):
-                    continue
-                cleaned: dict[str, float] = {}
-                for field, (minimum, maximum) in limits.items():
-                    candidate = calibration.get(field)
-                    if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
-                        continue
-                    cleaned[field] = max(minimum, min(maximum, float(candidate)))
-                if cleaned:
-                    calibrations[pair[:512]] = cleaned
-            existing[key] = calibrations
+            existing[key] = _sanitize_echo_calibrations(value)
         elif isinstance(value, (str, int, float, bool)):
             existing[key] = value
-    UI_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temporary = UI_SETTINGS_PATH.with_suffix(".tmp")
-    temporary.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary.replace(UI_SETTINGS_PATH)
+    _atomic_write_public_ui_settings(UI_SETTINGS_PATH, existing)
     return existing
 
 

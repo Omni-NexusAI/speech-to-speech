@@ -87,12 +87,28 @@
   storage only, excluded from every UI-server persistence payload and response.
 - Keep model inference controls separate from TTS controls, and place Voice directly beneath TTS Backend in the vertically scrolling settings layout.
 - Stop invalidates the active client before asynchronous teardown; closed-client mic, playback, tool, and WebSocket events must never change the idle UI or enter a replacement conversation.
-- Feed the exact generated playback PCM into the capture worklet as a non-audible reference; never substitute the static clone recording. Native browser AEC is the default. Adaptive uses only the SHA-verified, import-free bundled AEC3 module; any manifest, ABI, hash, compile, or worklet failure resolves truthfully to Native. Strict suspends uncertain upload through the echo tail without inserting zero PCM.
+- Feed the exact generated playback PCM into the capture worklet as a non-audible reference; never substitute the static clone recording. Adaptive is the default and uses only the SHA-verified, import-free bundled AEC3 module; any manifest, ABI, hash, compile, or worklet failure resolves truthfully to Native. Strict suspends uncertain upload through the echo tail without inserting zero PCM.
 - Keep one generation-tagged playback worklet FIFO across phrase chunks and same-turn tool continuations. Validated native audio.cpp playback freezes one acknowledged model/clone/profile/effective-settings signature for the complete accepted user turn, including tool continuations; Faster, Groxaxo, and buffered fallback remain immediate. The cold ceiling is the acknowledged first plus steady decoder-block duration, with conservative 800/1280/1760 ms built-in fallbacks and a 2000 ms custom fallback when metadata is invalid. Learn warm starts only from logical decoder-block sample boundaries after two clean full-prime responses, using the last-eight p95 gap plus 64 ms jitter and never less than first-block duration plus 160 ms. A real underrun immediately restores the full ceiling and requires three clean full-prime recoveries. Preserve every input sample, flush a short ended stream, re-arm cancellation only after accepted current-generation PCM, and reject stale-generation tails. Retire completed response snapshots into a bounded tombstone set so long sessions do not leak memory or reopen late PCM.
 - Adaptive safe-start diagnostics are content-free and response-scoped: expose cold ceiling, effective target/mode, latest logical block gap, p95, fixed 64 ms jitter, queued duration, underrun/re-prime counters, learning state, and a bounded fallback reason. Never expose the raw signature, model, clone, prompt, transcript, or audio content through playback metrics or persisted learning state.
 - Treat worklet `started` and `drained` as the exclusive audible/UI speaking lifecycle. Network PCM, transcript, content-part, and `response.done` events may advance protocol state or release response/tool locks, but must not claim or end audible playback.
 - Keep native `echoCancellation`, `noiseSuppression`, and `autoGainControl` enabled and expose requested/effective mode, module availability, calibration, reference wiring, and double-talk status in diagnostics. The response-length setting remains independent.
-- Persist delay, strict suppression, leakage, and double-talk calibration by microphone/output-device pair. Feed the worklet the active AudioContext output latency and keep Sonora's derived `aec3-output-evidence` label distinct from WebRTC's private internal double-talk state.
+- Reduce resolved microphone/output routes immediately to a domain-separated
+  SHA-256 fingerprint; raw device IDs, group IDs, and labels are transient
+  digest input only and must never be retained, logged, persisted, rendered, or
+  emitted in diagnostics. Fail closed without a persistence key when either
+  physical route cannot be resolved. A changed route advances an async-guarded
+  epoch, resets AEC state and the measurement cohort, and reloads only that
+  route's calibration; an unchanged fingerprint refreshes latency without a
+  reset. Remove route listeners during teardown.
+- Persist at most 16 finite, normalized opaque-route calibrations. Legacy raw
+  keys are discarded in browser-local load/save, public settings, and server
+  GET/PUT paths. Delay remains available to Adaptive and Strict; suppression,
+  leakage, and double-talk controls are Strict-only, while `echoTailMs` is
+  bounded to 350–1000 ms. "Use measured" requires at least 20 quiet,
+  playback-active, no-double-talk samples spanning at least two seconds and an
+  accepted median/p95/jitter result after current output-latency adjustment.
+  Keep Sonora's derived `aec3-output-evidence` label distinct from WebRTC's
+  private internal double-talk state.
 
 ## Child DOX Index
 

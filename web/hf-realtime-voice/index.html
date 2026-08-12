@@ -249,18 +249,20 @@
          </details>
           <details><summary>Echo and live measurements</summary>
             <p id="diagnostics-audio-status">AEC3 is verified when a conversation starts; Native remains the fallback.</p>
-            <p class="diagnostics-audio-note"><strong id="diagnostics-echo-device-pair">device pair pending</strong> · <span id="diagnostics-echo-output-latency">Output latency: pending</span></p>
+            <p class="diagnostics-audio-note"><strong id="diagnostics-echo-device-pair">opaque route pending</strong> · <span id="diagnostics-echo-output-latency">Output latency: pending</span></p>
+            <p id="diagnostics-echo-calibration-status" class="diagnostics-audio-note">Calibration pending: start quiet playback to collect a stable route measurement.</p>
             <div class="diagnostics-tuning-grid">
               <label>Reference delay (ms)<input data-echo-calibration-key="delayMs" type="number" min="0" max="500" step="1" value="0"></label>
-              <label>Strict suppression strength<input data-echo-calibration-key="suppressionStrength" type="number" min="0" max="1" step="0.05" value="0.65"></label>
-              <label>Leakage threshold<input data-echo-calibration-key="leakageThreshold" type="number" min="0.05" max="1" step="0.05" value="0.65"></label>
-              <label>Double-talk sensitivity<input data-echo-calibration-key="doubleTalkSensitivity" type="number" min="0" max="1" step="0.05" value="0.5"></label>
+              <label>Strict-only suppression strength<input data-echo-calibration-key="suppressionStrength" type="number" min="0" max="1" step="0.05" value="0.65"></label>
+              <label>Strict-only leakage threshold<input data-echo-calibration-key="leakageThreshold" type="number" min="0.05" max="1" step="0.05" value="0.65"></label>
+              <label>Strict-only double-talk sensitivity<input data-echo-calibration-key="doubleTalkSensitivity" type="number" min="0" max="1" step="0.05" value="0.5"></label>
+              <label>Echo tail (ms)<input data-echo-calibration-key="echoTailMs" type="number" min="350" max="1000" step="10" value="350"></label>
             </div>
             <div class="diagnostics-tuning-actions">
               <button id="diagnostics-echo-save" type="button">Save device calibration</button>
               <button id="diagnostics-echo-use-measured" type="button">Use measured delay</button>
             </div>
-            <p class="diagnostics-audio-note">Calibration is saved separately for this microphone/output pair. Adaptive keeps AEC3-processed near-end speech eligible for barge-in; Strict can fail closed.</p>
+            <p class="diagnostics-audio-note">Calibration is saved under an opaque microphone/output-route fingerprint. Adaptive keeps AEC3-processed near-end speech eligible for barge-in; Strict can fail closed.</p>
             <pre id="diagnostics-audio-metrics">Waiting for latency, model, profile, echo, and GPU metrics.</pre>
           </details>
          </div>
@@ -470,11 +472,11 @@
             <label class="field">
               <span>Assistant echo guard</span>
               <select id="echo-guard">
-                <option value="native" selected>Native browser AEC (default)</option>
-                <option value="adaptive">Adaptive (AEC3 reference cancellation)</option>
+                <option value="native">Native browser AEC</option>
+                <option value="adaptive" selected>Adaptive (AEC3 reference cancellation, default)</option>
                 <option value="strict">Strict</option>
               </select>
-              <small>Native browser AEC is the default. Adaptive uses the verified playback-reference AEC3 module and falls back truthfully to Native if loading fails. Strict pauses uncertain mic upload without manufacturing silence.</small>
+              <small>Adaptive is the default and uses the verified playback-reference AEC3 module, falling back truthfully to Native if loading fails. Strict pauses uncertain mic upload without manufacturing silence.</small>
             </label>
 
             <div class="field local-mode-field">
@@ -581,6 +583,6 @@
       </div>
     </dialog>
 
-  <script type="module" src="main.js?v=33-camera-correlation"></script>
+  <script type="module" src="main.js?v=34-opaque-echo-route"></script>
   </body>
 </html>

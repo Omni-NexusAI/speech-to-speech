@@ -2,13 +2,18 @@ import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 
 import {
+  echoRouteIdentityMatches,
   EchoRouteCalibration,
   fingerprintEchoRoute,
+  loadSanitizedEchoCalibrations,
+  sanitizeEchoCalibrations,
+  upsertEchoCalibration,
 } from "../web/hf-realtime-voice/echo-route-calibration.js";
 import {
   StrictEchoGate,
   classifyStrictEcho,
 } from "../web/hf-realtime-voice/worklets/aec3/strict-echo-gate.js";
+import { S2sWsRealtimeClient } from "../web/hf-realtime-voice/ws/s2s-ws-client.js";
 
 const calibration = {
   suppressionStrength: 0.65,
@@ -26,6 +31,140 @@ assert.equal(routeA.includes("microphone"), false, "fingerprints never expose ra
 await assert.rejects(
   fingerprintEchoRoute("mic", "out", /** @type {any} */ (null)),
   /unavailable/,
+);
+await assert.rejects(fingerprintEchoRoute("", "out", webcrypto.subtle), /unavailable/);
+await assert.rejects(fingerprintEchoRoute("mic", "", webcrypto.subtle), /unavailable/);
+
+const legacyRawRoute = "microphone-device-a::remote-output-a";
+let storedRoutes = {};
+for (let index = 0; index < 18; index += 1) {
+  const route = await fingerprintEchoRoute("mic", `output-${index}`, webcrypto.subtle);
+  storedRoutes = upsertEchoCalibration(storedRoutes, route, {
+    delayMs: index,
+    suppressionStrength: 0.65,
+    leakageThreshold: 0.65,
+    doubleTalkSensitivity: index === 17 ? 0 : 0.5,
+    echoTailMs: index === 17 ? 0 : 1001,
+  });
+}
+storedRoutes[legacyRawRoute] = { delayMs: 999 };
+const sanitizedRoutes = sanitizeEchoCalibrations(storedRoutes);
+assert.equal(Object.keys(sanitizedRoutes).length, 16, "only the newest 16 opaque routes persist");
+assert.equal(legacyRawRoute in sanitizedRoutes, false, "legacy raw route identifiers are discarded");
+const newestRoute = await fingerprintEchoRoute("mic", "output-17", webcrypto.subtle);
+assert.equal(sanitizedRoutes[newestRoute].doubleTalkSensitivity, 0, "a valid zero remains zero");
+assert.equal(sanitizedRoutes[newestRoute].echoTailMs, 350, "echo tail uses the safety floor");
+
+const browserStorage = new Map([
+  ["echo", JSON.stringify({
+    [legacyRawRoute]: { delayMs: 99 },
+    [routeA]: { delayMs: 120, echoTailMs: 600 },
+  })],
+]);
+const storage = {
+  getItem: (key) => browserStorage.get(key) ?? null,
+  setItem: (key, value) => browserStorage.set(key, value),
+  removeItem: (key) => browserStorage.delete(key),
+};
+const loadedRoutes = loadSanitizedEchoCalibrations(storage, "echo");
+assert.deepEqual(Object.keys(loadedRoutes), [routeA]);
+assert.equal(browserStorage.get("echo").includes(legacyRawRoute), false,
+  "browser load erases legacy raw route material from backing storage");
+assert.equal(echoRouteIdentityMatches({ routeKey: routeA, routeEpoch: 3 }, routeA, 3), true);
+assert.equal(echoRouteIdentityMatches({ routeKey: routeB, routeEpoch: 4 }, routeA, 3), false,
+  "a deferred save cannot commit after the route changes");
+
+const routeClient = new S2sWsRealtimeClient({ directUrl: "ws://invalid", voice: "", instructions: "" });
+const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+Object.defineProperty(globalThis, "navigator", {
+  configurable: true,
+  value: {
+    mediaDevices: {
+      enumerateDevices: async () => [
+        { kind: "audioinput", deviceId: "mic-a", groupId: "group-a", label: "Microphone" },
+        { kind: "audiooutput", deviceId: "default", groupId: "group-b", label: "Speakers" },
+      ],
+    },
+  },
+});
+const resolvedRoute = await routeClient._fingerprintCurrentEchoRoute(
+  { sinkId: "" },
+  { getSettings: () => ({ deviceId: "mic-a" }) },
+);
+assert.match(resolvedRoute, /^route_[0-9a-f]{64}$/);
+globalThis.navigator.mediaDevices.enumerateDevices = async () => [];
+assert.equal(
+  await routeClient._fingerprintCurrentEchoRoute(
+    { sinkId: "" },
+    { getSettings: () => ({ deviceId: "mic-a" }) },
+  ),
+  "",
+  "enumeration failure disables route persistence",
+);
+globalThis.navigator.mediaDevices.enumerateDevices = async () => [
+  { kind: "audioinput", deviceId: "mic-a", groupId: "group-a", label: "Microphone" },
+];
+assert.equal(
+  await routeClient._fingerprintCurrentEchoRoute(
+    { sinkId: "" },
+    { getSettings: () => ({ deviceId: "mic-a" }) },
+  ),
+  "",
+  "an unresolved default output fails closed",
+);
+globalThis.navigator.mediaDevices.enumerateDevices = async () => [
+  { kind: "audiooutput", deviceId: "default", groupId: "group-b", label: "Speakers" },
+];
+assert.equal(
+  await routeClient._fingerprintCurrentEchoRoute(
+    { sinkId: "" },
+    { getSettings: () => ({ deviceId: "default" }) },
+  ),
+  "",
+  "an unresolved default microphone fails closed",
+);
+if (originalNavigator) Object.defineProperty(globalThis, "navigator", originalNavigator);
+else delete globalThis.navigator;
+
+const makeRouteRefreshClient = () => {
+  const instance = new S2sWsRealtimeClient({
+    directUrl: "ws://invalid", voice: "", instructions: "",
+  });
+  instance._ctx = { outputLatency: 0 };
+  instance._captureNode = { port: { postMessage: () => {} } };
+  instance._dispatchEchoStatus = () => {};
+  return instance;
+};
+const refreshClient = makeRouteRefreshClient();
+refreshClient._fingerprintCurrentEchoRoute = async () => routeA;
+await refreshClient._refreshEchoRoute("initial");
+assert.equal(refreshClient._echoRouteEpoch, 1);
+refreshClient._echoCalibrationCollector.add({
+  lagMs: 100, timestampMs: 0, playbackActive: true, doubleTalk: false,
+});
+await refreshClient._refreshEchoRoute("devicechange");
+assert.equal(refreshClient._echoRouteEpoch, 1, "an unchanged route does not advance its epoch");
+assert.equal(
+  refreshClient._echoCalibrationCollector.result().sampleCount,
+  1,
+  "an unchanged route preserves its calibration cohort",
+);
+refreshClient._fingerprintCurrentEchoRoute = async () => routeB;
+await refreshClient._refreshEchoRoute("sinkchange");
+assert.equal(refreshClient._echoRouteEpoch, 2, "a changed route advances its epoch");
+assert.equal(
+  refreshClient._echoCalibrationCollector.result().sampleCount,
+  0,
+  "a changed route clears the old calibration cohort",
+);
+const unresolvedRefreshClient = makeRouteRefreshClient();
+unresolvedRefreshClient._fingerprintCurrentEchoRoute = async () => "";
+await unresolvedRefreshClient._refreshEchoRoute("initial");
+await unresolvedRefreshClient._refreshEchoRoute("devicechange");
+assert.equal(
+  unresolvedRefreshClient._echoRouteEpoch,
+  1,
+  "repeated unresolved route notifications do not keep resetting AEC state",
 );
 
 for (const centerMs of [80, 150, 300]) {
