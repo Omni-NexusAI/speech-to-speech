@@ -199,6 +199,7 @@ class ConnState(BaseModel):
     speculative_user_turn_id: Optional[str] = None
     speculative_user_turn_revision: Optional[int] = None
     speculative_user_speech_stopped_at_s: Optional[float] = None
+    speculative_response_language_code: Optional[str] = None
     speculative_user_item_id: Optional[str] = None
     speculative_input_item_id: Optional[str] = None
     speculative_audio_duration_s: float = 0.0
@@ -557,6 +558,10 @@ class RealtimeService:
             return []
 
         self._observe_turn_event(event)
+        if isinstance(event, SpeechStartedEvent):
+            # Response language belongs to one accepted semantic turn and its
+            # complete tool transaction. A new admission must not inherit it.
+            self._state(conn_id).speculative_response_language_code = None
         if isinstance(event, AssistantTextEvent):
             return self.response.on_assistant_text(
                 conn_id,
@@ -647,6 +652,8 @@ class RealtimeService:
             st.speculative_user_turn_id = event.turn_id
             st.speculative_user_turn_revision = event.turn_revision
             st.speculative_user_speech_stopped_at_s = event.speech_stopped_at_s
+            if event.direct_audio_completed:
+                st.speculative_response_language_code = event.language_code
 
         # Direct Gemma commits one accepted semantic user item before any
         # assistant/tool state, upgrading audio to validated text when present.

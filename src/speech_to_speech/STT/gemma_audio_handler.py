@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import threading
+import unicodedata
 import wave
 from collections.abc import Iterator
 from io import BytesIO
@@ -36,6 +37,9 @@ from speech_to_speech.utils.utils import _generate_id
 
 logger = logging.getLogger(__name__)
 
+DIRECT_AUDIO_TEMPERATURE = 0.1
+DIRECT_AUDIO_TOP_P = 0.9
+
 
 def _response_max_tokens(value: Any, fallback: Any = 384) -> int:
     """Return a bounded spoken-response limit without affecting live previews."""
@@ -50,43 +54,61 @@ _MEMORY_MARKER = "USER_MEMORY:"
 _RESPONSE_MARKER = "ASSISTANT_RESPONSE:"
 _LANGUAGE_MARKER = "ASSISTANT_LANGUAGE:"
 _PREAMBLE_MARKER = "ASSISTANT_PREAMBLE:"
+_CAMERA_CONTEXT_MARKER = "CAMERA_CONTEXT:"
 _PREVIEW_TRANSCRIPT_MARKER = "TRANSCRIPT:"
 _FINAL_TRANSCRIPT_RE = re.compile(
     r"(?ims)^\s*(?:USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER)\s*:\s*(.+?)"
-    r"(?=^\s*(?:USER_MEMORY|ASSISTANT_LANGUAGE|ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:|\Z)"
+    r"(?=^\s*(?:USER_MEMORY|ASSISTANT_LANGUAGE|CAMERA_CONTEXT|ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|"
+    r"ASSISTANT|RESPONSE)\s*:|\Z)"
 )
 _FINAL_MEMORY_RE = re.compile(
     r"(?ims)^\s*USER_MEMORY\s*:\s*(.+?)"
-    r"(?=^\s*(?:USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER|ASSISTANT_LANGUAGE|ASSISTANT_PREAMBLE|"
-    r"ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:|\Z)"
+    r"(?=^\s*(?:USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER|ASSISTANT_LANGUAGE|CAMERA_CONTEXT|"
+    r"ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:|\Z)"
 )
 _ASSISTANT_RESPONSE_RE = re.compile(
     r"(?ims)^\s*(?:ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:\s*(.+?)"
     r"(?=^\s*(?:USER_MEMORY|USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER|ASSISTANT_LANGUAGE|"
-    r"ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:|\Z)"
+    r"CAMERA_CONTEXT|ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:|\Z)"
 )
 _ASSISTANT_LANGUAGE_RE = re.compile(r"(?im)^\s*ASSISTANT_LANGUAGE\s*:\s*([^\r\n]+)")
+_CAMERA_CONTEXT_RE = re.compile(r"(?im)^\s*CAMERA_CONTEXT\s*:\s*([^\r\n]+)")
 _ASSISTANT_PREAMBLE_RE = re.compile(
     r"(?ims)^\s*ASSISTANT_PREAMBLE\s*:\s*(.+?)"
-    r"(?=^\s*(?:USER_MEMORY|USER_TRANSCRIPT|ASSISTANT_LANGUAGE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:|\Z)"
+    r"(?=^\s*(?:USER_MEMORY|USER_TRANSCRIPT|ASSISTANT_LANGUAGE|CAMERA_CONTEXT|ASSISTANT_RESPONSE|"
+    r"ASSISTANT|RESPONSE)\s*:|\Z)"
 )
 _MEMORY_CONTROL_MARKER_RE = re.compile(
     r"(?i)(?:USER_MEMORY|USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER|ASSISTANT_LANGUAGE|"
-    r"ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:"
+    r"CAMERA_CONTEXT|ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:"
 )
 _OUTPUT_MARKER_RE = re.compile(r"(?im)^\s*(?:ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:")
 _CONTROL_LINE_RE = re.compile(
     r"(?im)^\s*(?:USER_MEMORY|USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER|ASSISTANT_LANGUAGE|"
-    r"ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:[^\r\n]*(?:\r?\n|$)"
+    r"CAMERA_CONTEXT|ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:[^\r\n]*(?:\r?\n|$)"
 )
 _TRAILING_RESPONSE_CONTROL_RE = re.compile(
     r"(?im)^\s*(?:USER_MEMORY|USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER|ASSISTANT_LANGUAGE|"
-    r"ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:"
+    r"CAMERA_CONTEXT|ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:"
 )
 _MAX_USER_MEMORY_CHARS = 600
 _SENTENCE_RE = re.compile(r"(.+?[.!?](?:\s+|$))", re.DOTALL)
+
+
+def _failure_sentinel_key(value: str) -> str:
+    normalized = " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+    start = 0
+    end = len(normalized)
+    while start < end and unicodedata.category(normalized[start])[0] in {"P", "Z"}:
+        start += 1
+    while end > start and unicodedata.category(normalized[end - 1])[0] in {"P", "Z"}:
+        end -= 1
+    return normalized[start:end]
+
+
 _TRANSCRIPT_FAILURE_SENTINELS = frozenset(
-    {
+    _failure_sentinel_key(value)
+    for value in {
         "inaudible",
         "unintelligible",
         "garbled",
@@ -111,8 +133,128 @@ _TRANSCRIPT_FAILURE_SENTINELS = frozenset(
         "could not transcribe the audio",
         "transcription failed",
         "transcription unavailable",
+        "无法听清",
+        "无法理解音频",
+        "音频不清晰",
+        "音频无法辨认",
+        "未检测到语音",
+        "未检测到可理解的语音",
+        "无法转录音频",
+        "转录失败",
+        "聞き取れません",
+        "音声が不明瞭です",
+        "音声を理解できません",
+        "音声を認識できません",
+        "発話が検出されませんでした",
+        "文字起こしに失敗しました",
+        "알아들을 수 없습니다",
+        "오디오가 불명확합니다",
+        "음성을 이해할 수 없습니다",
+        "음성이 감지되지 않았습니다",
+        "알아들을 수 있는 음성이 감지되지 않았습니다",
+        "전사에 실패했습니다",
+        "unverständlich",
+        "audio unverständlich",
+        "unklares audio",
+        "keine sprache erkannt",
+        "keine verständliche sprache erkannt",
+        "audio konnte nicht verstanden werden",
+        "transkription fehlgeschlagen",
+        "incompréhensible",
+        "audio incompréhensible",
+        "audio peu clair",
+        "aucune parole détectée",
+        "aucune parole intelligible détectée",
+        "impossible de comprendre l'audio",
+        "échec de la transcription",
+        "неразборчиво",
+        "неразборчивый звук",
+        "аудио неразборчиво",
+        "речь не обнаружена",
+        "разборчивая речь не обнаружена",
+        "не удалось понять аудио",
+        "не удалось расшифровать аудио",
+        "ошибка транскрипции",
+        "inaudível",
+        "ininteligível",
+        "áudio ininteligível",
+        "áudio pouco claro",
+        "nenhuma fala detectada",
+        "nenhuma fala inteligível detectada",
+        "não foi possível entender o áudio",
+        "falha na transcrição",
+        "ininteligible",
+        "audio ininteligible",
+        "audio poco claro",
+        "no se detectó habla",
+        "no se detectó habla inteligible",
+        "no se pudo entender el audio",
+        "no se pudo transcribir el audio",
+        "falló la transcripción",
+        "inudibile",
+        "incomprensibile",
+        "audio incomprensibile",
+        "audio poco chiaro",
+        "nessun parlato rilevato",
+        "nessun parlato intelligibile rilevato",
+        "impossibile comprendere l'audio",
+        "trascrizione non riuscita",
     }
 )
+
+_ASSISTANT_LANGUAGE_ALIASES = {
+    "auto": "Auto",
+    "automatic": "Auto",
+    "mixed": "Auto",
+    "mixed language": "Auto",
+    "multilingual": "Auto",
+    "zh": "Chinese",
+    "zh-cn": "Chinese",
+    "zh-hans": "Chinese",
+    "zh-hant": "Chinese",
+    "cmn": "Chinese",
+    "chinese": "Chinese",
+    "中文": "Chinese",
+    "汉语": "Chinese",
+    "漢語": "Chinese",
+    "普通话": "Chinese",
+    "en": "English",
+    "en-us": "English",
+    "en-gb": "English",
+    "english": "English",
+    "ja": "Japanese",
+    "jp": "Japanese",
+    "japanese": "Japanese",
+    "日本語": "Japanese",
+    "ko": "Korean",
+    "kr": "Korean",
+    "korean": "Korean",
+    "한국어": "Korean",
+    "de": "German",
+    "german": "German",
+    "deutsch": "German",
+    "fr": "French",
+    "french": "French",
+    "français": "French",
+    "francais": "French",
+    "ru": "Russian",
+    "russian": "Russian",
+    "русский": "Russian",
+    "pt": "Portuguese",
+    "pt-br": "Portuguese",
+    "pt-pt": "Portuguese",
+    "portuguese": "Portuguese",
+    "português": "Portuguese",
+    "portugues": "Portuguese",
+    "es": "Spanish",
+    "spanish": "Spanish",
+    "español": "Spanish",
+    "espanol": "Spanish",
+    "castellano": "Spanish",
+    "it": "Italian",
+    "italian": "Italian",
+    "italiano": "Italian",
+}
 
 
 class GemmaAudioSTTHandler(BaseSTTHandler):
@@ -507,25 +649,31 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         system_parts = [self.system_prompt]
         if session_instructions:
             system_parts.append(session_instructions)
-        system_parts.append(
-            "Treat accepted user audio as an ordinary semantic user message. Infer its likely intent from the whole "
+        semantic_instructions = (
+            "Treat accepted user input as an ordinary semantic user message. Infer its likely intent from the whole "
             "accepted turn and answer naturally or call an appropriate provided tool. It may use any language, accent, "
             "or code-switching. Follow the language or languages naturally used in the current utterance unless the user "
-            "or session instructions request another response language. Do not mention transcription, audio quality, "
-            "garbling, attached audio, or internal audio processing unless the user explicitly asks about that topic. "
-            "USER_TRANSCRIPT is optional display metadata and must never replace or gate the semantic response. "
-            "Emit USER_TRANSCRIPT only when the exact words are confidently available. Otherwise emit USER_MEMORY as "
-            "one short, content-faithful semantic paraphrase of the user's current intent, resolving ordinary references "
-            "from conversation context without adding facts. Never emit both fields, and never fill either field with an "
-            "audio, transcription, or failure label. USER_MEMORY is hidden session context, not an answer or a tool result, "
-            "and must not gate, alter, or replace the assistant response or tool call. If exact words are available, "
-            "begin with:\n"
-            "USER_TRANSCRIPT: <exact short transcript, preferred when available>\n"
-            "Otherwise begin with:\n"
-            "USER_MEMORY: <short semantic paraphrase when USER_TRANSCRIPT is omitted>\n"
-            "After that, continue with:\n"
+            "or session instructions request another response language. Stay focused on the user's intended topic unless "
+            "the user explicitly asks about system internals. "
+            "For every meaningful accepted turn, begin with USER_MEMORY as one short, affirmative, content-faithful "
+            "semantic paraphrase of what the user means. Preserve names, numbers, negation, ordinary references, and the "
+            "language of the request; resolve references from conversation context without adding facts. Omit USER_MEMORY "
+            "only when no meaningful intent is recoverable; in that rare case, ask one short, context-specific question "
+            "using natural wording that varies with the conversation. USER_MEMORY is hidden session context, not an answer or a tool "
+            "result, and must not gate, alter, or replace the assistant response or tool call. Begin meaningful turns with:\n"
+            "USER_MEMORY: <short affirmative semantic paraphrase>\n"
+            "Then continue with:\n"
             "ASSISTANT_LANGUAGE: <single language name for a monolingual spoken answer; Auto for a mixed-language "
             "or otherwise unspecified spoken answer>\n"
+        )
+        if self._camera_tool_available(vad_audio):
+            semantic_instructions += (
+                "CAMERA_CONTEXT: <current, historical, or none>\n"
+                "Use current when the user asks what is visible now, asks you to look again, or asks what changed; this "
+                "requires a new camera_snapshot before any result-dependent answer. Use historical only for a question "
+                "explicitly about a prior observation. Use none when no camera context is involved. Then continue with:\n"
+            )
+        semantic_instructions += (
             "ASSISTANT_RESPONSE: <your spoken answer>\n"
             "When a provided tool is needed, call it in the same response and never fabricate its result. Before the "
             "function call, provide one brief, natural acknowledgement whose wording fits the specific request and "
@@ -534,11 +682,10 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             "compatibility. Do not emit a result-dependent ASSISTANT_RESPONSE until the tool result is available. "
             "Ask a brief, content-focused follow-up only when the request itself lacks a detail needed to complete it. "
             "Resolve pronouns, references, and requests such as 'do that in reverse' from the retained conversation and "
-            "completed tool results; never treat an ordinary contextual follow-up as an audio or transcription failure. "
-            "A prior camera image is historical context, not a live view. If the user asks what is visible now or what "
-            "changed, call camera_snapshot again before answering and do not claim freshness from an earlier image. "
+            "completed tool results, then continue the conversation naturally. "
             "Do not wrap plain-text responses in JSON or Markdown."
         )
+        system_parts.append(semantic_instructions)
         user_content: list[dict[str, Any]] = []
         for image_url in self._conversation_image_urls(runtime_config):
             user_content.append({"type": "image_url", "image_url": {"url": image_url}})
@@ -573,6 +720,10 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             "stream": self.stream,
             **self.gen_kwargs,
         }
+        # Direct-audio semantics are intentionally low-variance. Keep release
+        # probes and production on the same sampling contract.
+        payload["temperature"] = DIRECT_AUDIO_TEMPERATURE
+        payload["top_p"] = DIRECT_AUDIO_TOP_P
         local_pipeline = getattr(runtime_config, "local_pipeline", None) or {}
         payload["max_tokens"] = _response_max_tokens(local_pipeline.get("max_response_tokens"), payload.get("max_tokens"))
         chat_template_kwargs = dict(payload.get("chat_template_kwargs") or {})
@@ -813,6 +964,8 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         assistant_response_closed = False
         transcript_value: str | None = None
         language_code: str | None = None
+        camera_current = False
+        suppress_response_stream = False
         full_buffer_tts = self._full_buffer_tts(getattr(vad_audio, "runtime_config", None))
         for line in response.iter_lines():
             if generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation):
@@ -844,6 +997,14 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 transcript = self._extract_transcript(before)
                 transcript_value = transcript
                 language_code = self._effective_assistant_language(before)
+                camera_available = self._camera_tool_available(vad_audio)
+                camera_context = self._extract_camera_context(before)
+                camera_current = camera_available and camera_context == "current"
+                # Hold camera-capable responses until the complete control
+                # envelope is available. A duplicate or conflicting marker may
+                # arrive later and must not retroactively invalidate prose
+                # already sent to TTS.
+                suppress_response_stream = camera_available
                 if transcript:
                     # Transcript metadata only upgrades the already persisted
                     # accepted-audio item; it is not the admission boundary.
@@ -855,6 +1016,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                         is_final=False,
                         context_committed=user_committed,
                         transcript_finalized=True,
+                        language_code=language_code,
                         generation=generation,
                     )
                 assistant_started = True
@@ -863,7 +1025,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 pending_response += str(content)
             if assistant_started and not assistant_response_closed:
                 pending_response, assistant_response_closed = self._visible_response_prefix(pending_response)
-            if assistant_started and not full_buffer_tts:
+            if assistant_started and not full_buffer_tts and not suppress_response_stream:
                 chunks, pending_response = self._pop_sentence_chunks(pending_response)
                 for chunk in chunks:
                     yield self._direct(
@@ -878,12 +1040,16 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             chat=self._conversation_chat(vad_audio),
             turn_id=getattr(vad_audio, "turn_id", None),
         )
+        tools, camera_context, _ = self._enforce_camera_context(vad_audio, raw_text, tools)
+        camera_current = camera_context == "current"
         if generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation):
             return
         preamble = self._tool_preamble(raw_text, tools) if tools else None
         final_text = (
             preamble
             if tools and preamble
+            else ""
+            if camera_current
             else pending_response.strip()
             if assistant_started
             else self._fallback_response_text(raw_text)
@@ -896,7 +1062,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             "transcript_available" if transcript else "transcript_unavailable",
             detail={"mode": "final", "source": "primary"},
         )
-        full_response = preamble or self._fallback_response_text(raw_text)
+        full_response = preamble or ("" if camera_current else self._fallback_response_text(raw_text))
         language_code = language_code or self._effective_assistant_language(raw_text)
         committed = self._commit_context(
             vad_audio,
@@ -931,6 +1097,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         transcript = self._extract_transcript(text)
         user_memory = None if transcript else self._extract_user_memory(text)
         tools = tools or []
+        tools, camera_context, _ = self._enforce_camera_context(vad_audio, text, tools)
         language_code = self._effective_assistant_language(text)
         preamble = self._tool_preamble(text, tools) if tools else None
         self._emit_metric(
@@ -939,7 +1106,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             "transcript_available" if transcript else "transcript_unavailable",
             detail={"mode": "final", "source": "primary"},
         )
-        response_text = preamble or self._fallback_response_text(text)
+        response_text = preamble or ("" if camera_context == "current" else self._fallback_response_text(text))
         if response_text:
             logger.info("Gemma audio response ready (%d characters)", len(response_text))
         committed = self._commit_context(
@@ -1064,8 +1231,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         transcript = str(value).strip().strip('"')
         if not transcript or "\n" in transcript or len(transcript) > 1200:
             return None
-        normalized = " ".join(transcript.lower().split())
-        failure_key = normalized.strip(" \t\r\n\"'`[]()<>.,!?;:")
+        failure_key = _failure_sentinel_key(transcript)
         if failure_key in _TRANSCRIPT_FAILURE_SENTINELS:
             return None
         return transcript
@@ -1094,7 +1260,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         ):
             return None
         memory = " ".join(raw_memory.split())
-        failure_key = memory.lower().strip(" \t\r\n\"'`[]()<>.,!?;:")
+        failure_key = _failure_sentinel_key(memory)
         if failure_key in _TRANSCRIPT_FAILURE_SENTINELS or _MEMORY_CONTROL_MARKER_RE.search(memory):
             return None
         return memory
@@ -1121,6 +1287,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             or _TRANSCRIPT_MARKER in transcript
             or _MEMORY_MARKER in transcript
             or _RESPONSE_MARKER in transcript
+            or _CAMERA_CONTEXT_MARKER in transcript
         ):
             return None
         transcript = transcript.strip().strip('"')
@@ -1128,11 +1295,18 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
 
     @staticmethod
     def _extract_assistant_language(text: str) -> str | None:
-        match = _ASSISTANT_LANGUAGE_RE.search(text)
-        if not match:
+        matches = _ASSISTANT_LANGUAGE_RE.findall(text)
+        if len(matches) != 1:
             return None
-        value = match.group(1).strip().strip('"')
+        value = matches[0].strip().strip('"')
         return value if value and len(value) <= 40 else None
+
+    @staticmethod
+    def _canonical_assistant_language(value: str | None) -> str:
+        if not value:
+            return "Auto"
+        key = _failure_sentinel_key(unicodedata.normalize("NFKC", str(value)).replace("_", "-"))
+        return _ASSISTANT_LANGUAGE_ALIASES.get(key, "Auto")
 
     @staticmethod
     def _effective_assistant_language(text: str) -> str:
@@ -1144,7 +1318,102 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         previous turn or the clone reference metadata.
         """
 
-        return GemmaAudioSTTHandler._extract_assistant_language(text) or "Auto"
+        return GemmaAudioSTTHandler._canonical_assistant_language(
+            GemmaAudioSTTHandler._extract_assistant_language(text)
+        )
+
+    @staticmethod
+    def _camera_tool_available(vad_audio: STTIn) -> bool:
+        runtime_config = getattr(vad_audio, "runtime_config", None)
+        session = getattr(runtime_config, "session", None)
+        for tool in getattr(session, "tools", None) or []:
+            if isinstance(tool, dict):
+                name = tool.get("name")
+                if not name and isinstance(tool.get("function"), dict):
+                    name = tool["function"].get("name")
+            else:
+                name = getattr(tool, "name", None)
+                if not name:
+                    name = getattr(getattr(tool, "function", None), "name", None)
+            if name == "camera_snapshot":
+                return True
+        return False
+
+    @staticmethod
+    def _extract_camera_context(text: str) -> str | None:
+        matches = _CAMERA_CONTEXT_RE.findall(text)
+        if len(matches) != 1:
+            return None
+        value = _failure_sentinel_key(matches[0].strip().strip('"'))
+        return value if value in {"current", "historical", "none"} else None
+
+    def _enforce_camera_context(
+        self,
+        vad_audio: STTIn,
+        text: str,
+        tools: list[ResponseFunctionToolCall],
+    ) -> tuple[list[ResponseFunctionToolCall], str | None, bool]:
+        """Enforce a model-declared live-view requirement without inferring from content.
+
+        Missing or malformed classification is privacy fail-closed: it never
+        causes a capture. Metrics contain only the enum/call identity.
+        """
+
+        if not self._camera_tool_available(vad_audio):
+            return tools, None, False
+        camera_context = self._extract_camera_context(text)
+        if camera_context is None:
+            self._emit_metric(
+                vad_audio,
+                "camera",
+                "freshness_unclassified",
+                detail={"camera_context": "unclassified", "enforced": False},
+            )
+            return tools, None, False
+        if camera_context != "current":
+            self._emit_metric(
+                vad_audio,
+                "camera",
+                "freshness_classified",
+                detail={"camera_context": camera_context, "enforced": False},
+            )
+            return tools, camera_context, False
+
+        first_camera = next((tool for tool in tools if tool.name == "camera_snapshot"), None)
+        if first_camera is None:
+            synthetic_index = len(tools)
+            injected = self._tool_calls_from_accum(
+                {synthetic_index: {"name": "camera_snapshot", "args": "{}", "id": ""}},
+                chat=self._conversation_chat(vad_audio),
+                turn_id=getattr(vad_audio, "turn_id", None),
+            )[0]
+            tools = [*tools, injected]
+            first_camera = injected
+            enforced = True
+        else:
+            # One current observation needs exactly one frame. Preserve all
+            # non-camera calls and the first model-provided camera call.
+            retained: list[ResponseFunctionToolCall] = []
+            camera_retained = False
+            for tool in tools:
+                if tool.name != "camera_snapshot":
+                    retained.append(tool)
+                elif not camera_retained:
+                    retained.append(tool)
+                    camera_retained = True
+            tools = retained
+            enforced = False
+        self._emit_metric(
+            vad_audio,
+            "camera",
+            "freshness_enforced" if enforced else "freshness_satisfied",
+            detail={
+                "camera_context": camera_context,
+                "enforced": enforced,
+                "call_id": first_camera.call_id,
+            },
+        )
+        return tools, camera_context, enforced
 
     @staticmethod
     def _extract_assistant_preamble(text: str) -> str | None:

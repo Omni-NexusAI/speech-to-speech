@@ -1043,6 +1043,7 @@ class TestDispatchPipelineEvent:
         from speech_to_speech.STT.gemma_audio_handler import GemmaAudioSTTHandler
 
         st = service._state(conn_id)
+        st.speculative_response_language_code = "Japanese"
         st.runtime_config.chat.add_item(make_user_message(f"Use {tool_name}"))
         tool = GemmaAudioSTTHandler._tool_calls_from_accum(
             {0: {"name": tool_name, "args": "{}", "id": "UNM0K7ZOZpEN5uS0vGTo1G1UnSDH8Vki"}},
@@ -1091,6 +1092,7 @@ class TestDispatchPipelineEvent:
         assert isinstance(created, ResponseCreatedEvent)
         request = text_prompt_queue.get_nowait()
         assert isinstance(request, GenerateResponseRequest)
+        assert request.language_code == "Japanese"
         duplicate = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
         assert isinstance(duplicate, RealtimeErrorEvent)
         assert duplicate.error.type == "duplicate_tool_followup"
@@ -1535,6 +1537,59 @@ class TestDispatchPipelineEvent:
         assert text_prompt_queue.empty()
         assert runtime_config.chat.buffer == []
         assert service._state(conn_id).response_pending is False
+
+    def test_direct_turn_language_is_retained_through_tools_and_reset_on_next_speech(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+    ):
+        service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(
+                transcript="",
+                language_code="Spanish",
+                turn_id="turn_spanish_tool",
+                turn_revision=0,
+                context_committed=True,
+                display_only=True,
+                direct_audio_completed=True,
+            ),
+        )
+
+        state = service._state(conn_id)
+        assert state.speculative_response_language_code == "Spanish"
+
+        state.tool_followup_ready = True
+        state.in_response = False
+        created = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert isinstance(created, ResponseCreatedEvent)
+        request = text_prompt_queue.get_nowait()
+        assert request.language_code == "Spanish"
+        assert request.turn_id == "turn_spanish_tool"
+
+        service.finish_response(conn_id)
+        service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
+        assert state.speculative_response_language_code is None
+
+    def test_conventional_stt_language_never_becomes_tool_response_language(
+        self,
+        service,
+        conn_id,
+    ):
+        service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(
+                transcript="bonjour",
+                language_code="fr",
+                turn_id="turn_conventional_stt",
+                turn_revision=0,
+            ),
+        )
+
+        assert service._state(conn_id).speculative_response_language_code is None
 
     def test_revised_transcription_replaces_speculative_user_message(self, runtime_config, should_listen):
         text_prompt_queue = Queue()

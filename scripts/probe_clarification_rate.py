@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -41,7 +42,11 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from speech_to_speech.LLM.chat import Chat, make_user_audio_message  # noqa: E402
-from speech_to_speech.STT.gemma_audio_handler import GemmaAudioSTTHandler  # noqa: E402
+from speech_to_speech.STT.gemma_audio_handler import (  # noqa: E402
+    DIRECT_AUDIO_TEMPERATURE,
+    DIRECT_AUDIO_TOP_P,
+    GemmaAudioSTTHandler,
+)
 
 _NORMAL_TURNS = 100
 _MEANINGLESS_TURNS = 8
@@ -136,6 +141,17 @@ def _code_switch_text(index: int, expression: str) -> tuple[str, str]:
     return variants[index % len(variants)]
 
 
+def _monolingual_text(culture: str, a: int, b: int) -> str:
+    variants = {
+        "en-US": f"Please give the answer in digits: {a} plus {b}.",
+        "en-GB": f"Please give the answer in digits: {a} plus {b}.",
+        "es-ES": f"Por favor, responde con d\u00edgitos: {a} m\u00e1s {b}.",
+        "de-DE": f"Bitte antworte mit Ziffern: {a} plus {b}.",
+        "ja-JP": f"{a} \u305f\u3059 {b} \u306e\u7b54\u3048\u3092\u6570\u5b57\u3067\u6559\u3048\u3066\u304f\u3060\u3055\u3044\u3002",
+    }
+    return variants[culture]
+
+
 def build_scenarios() -> tuple[list[Scenario], list[Scenario]]:
     normal: list[Scenario] = []
     rng = random.Random(_RANDOM_SEED)
@@ -158,7 +174,7 @@ def build_scenarios() -> tuple[list[Scenario], list[Scenario]]:
             elif category == "alternate_voice":
                 culture = _CULTURES[case_index % len(_CULTURES)]
                 voice_variant = 1
-                utterance = f"Please tell me the result in digits: {expression}."
+                utterance = _monolingual_text(culture, a, b)
             elif category == "moderate_noise":
                 utterance = f"Please answer in digits: {expression}."
                 noise_seed = _RANDOM_SEED + case_index
@@ -293,6 +309,41 @@ def _validate_wav(raw: bytes) -> bytes:
     return raw
 
 
+@contextmanager
+def _serial_sapi_runner():
+    """Serialize real System.Speech access across concurrent test/probe processes."""
+
+    if sys.platform != "win32":
+        yield
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.ReleaseMutex.argtypes = (wintypes.HANDLE,)
+    kernel32.ReleaseMutex.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.CreateMutexW(None, False, "Local\\HFRealtimeClarificationSapi")
+    if not handle:
+        raise SpeechSynthesisUnavailable
+    acquired = False
+    try:
+        wait_result = kernel32.WaitForSingleObject(handle, 240_000)
+        acquired = wait_result in {0x00000000, 0x00000080}
+        if not acquired:
+            raise SpeechSynthesisUnavailable
+        yield
+    finally:
+        if acquired:
+            kernel32.ReleaseMutex(handle)
+        kernel32.CloseHandle(handle)
+
+
 def synthesize_scenarios_in_memory(
     scenarios: Sequence[Scenario],
     *,
@@ -300,6 +351,17 @@ def synthesize_scenarios_in_memory(
 ) -> dict[int, SynthesizedAudio]:
     if sys.platform != "win32" and runner is subprocess.run:
         raise SpeechSynthesisUnavailable
+    if runner is subprocess.run:
+        with _serial_sapi_runner():
+            return _synthesize_scenarios_in_memory(scenarios, runner=runner)
+    return _synthesize_scenarios_in_memory(scenarios, runner=runner)
+
+
+def _synthesize_scenarios_in_memory(
+    scenarios: Sequence[Scenario],
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[bytes]],
+) -> dict[int, SynthesizedAudio]:
     common_args = [_powershell_executable(), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     voices: list[dict[str, str]] = []
@@ -408,7 +470,10 @@ def _handler(model_name: str) -> GemmaAudioSTTHandler:
     handler.system_prompt = "You are a concise conversational assistant."
     handler.audio_format = "wav"
     handler.stream = False
-    handler.gen_kwargs = {"temperature": 0.1, "top_p": 0.9}
+    handler.gen_kwargs = {
+        "temperature": DIRECT_AUDIO_TEMPERATURE,
+        "top_p": DIRECT_AUDIO_TOP_P,
+    }
     handler.base_url = ""
     handler.model_name = model_name
     handler.api_key = None
@@ -603,6 +668,7 @@ def _run_gate(
     memory_anchors = 0
     audio_anchors = 0
     tool_call_responses = 0
+    clarification_fingerprints: dict[str, int] = {}
     culture_required = 0
     culture_matched = 0
     alternate_required = 0
@@ -658,6 +724,10 @@ def _run_gate(
                 classification = classify_visible_response(parsed.visible, scenario.expected_number)
                 if scenario.normal:
                     category_counts[scenario.category][classification] += 1
+                    if classification == "clarification":
+                        normalized_visible = " ".join(re.findall(r"\w+", parsed.visible.casefold(), flags=re.UNICODE))
+                        fingerprint = hashlib.sha256(normalized_visible.encode("utf-8")).hexdigest()
+                        clarification_fingerprints[fingerprint] = clarification_fingerprints.get(fingerprint, 0) + 1
                 elif classification in {"clarification", "garbling_commentary"}:
                     meaningless_counts[classification] += 1
                 else:
@@ -674,11 +744,13 @@ def _run_gate(
     garbling_rate = round(100.0 * totals["garbling_commentary"] / _NORMAL_TURNS, 2)
     classification_complete = totals["ordinary"] + totals["clarification"] + totals["garbling_commentary"] == _NORMAL_TURNS
     voice_coverage_complete = culture_required == culture_matched and alternate_required == alternate_selected
+    repeated_stock_clarifications = sum(count - 1 for count in clarification_fingerprints.values() if count > 1)
     passed = (
         requests_attempted == _NORMAL_TURNS + _MEANINGLESS_TURNS
         and requests_completed == _NORMAL_TURNS + _MEANINGLESS_TURNS
-        and totals["clarification"] <= 5
+        and totals["clarification"] <= 1
         and totals["garbling_commentary"] == 0
+        and repeated_stock_clarifications == 0
         and classification_complete
         and tool_call_responses == 0
         and voice_coverage_complete
@@ -694,8 +766,10 @@ def _run_gate(
         "ordinary": totals["ordinary"],
         "clarifications": totals["clarification"],
         "clarification_rate_percent": clarification_rate,
-        "clarification_target_met": clarification_rate <= 2.0,
-        "clarification_maximum_met": clarification_rate <= 5.0,
+        "clarification_target_met": totals["clarification"] <= 1,
+        "clarification_maximum_met": totals["clarification"] <= 1,
+        "repeated_stock_clarifications": repeated_stock_clarifications,
+        "repeated_stock_free": repeated_stock_clarifications == 0,
         "garbling_commentary": totals["garbling_commentary"],
         "garbling_rate_percent": garbling_rate,
         "unclassified": totals["unclassified"],

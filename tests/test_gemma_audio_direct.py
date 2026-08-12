@@ -191,23 +191,48 @@ def test_gemma_audio_payload_includes_instructions_history_tools_and_disables_th
     assert "Always answer as TEST ROLE." in system_prompt
     assert "any language, accent, or code-switching" in system_prompt
     assert "Follow the language or languages naturally used in the current utterance" in system_prompt
-    assert "Do not mention transcription, audio quality, garbling" in system_prompt
-    assert "unless the user explicitly asks about that topic" in system_prompt
+    assert "begin with USER_MEMORY as one short, affirmative, content-faithful" in system_prompt
+    assert "Preserve names, numbers, negation" in system_prompt
+    assert "USER_TRANSCRIPT" not in system_prompt
+    assert "transcription" not in system_prompt.lower()
+    assert "garbl" not in system_prompt.lower()
+    assert "audio quality" not in system_prompt.lower()
     assert "English by default" not in system_prompt
     assert "semantic intent is genuinely unclear" not in system_prompt
     assert "varies with the conversation" in system_prompt
-    assert "Otherwise begin with:\nUSER_MEMORY:" in system_prompt
-    assert "\nor USER_MEMORY:" not in system_prompt
+    assert "Begin meaningful turns with:\nUSER_MEMORY:" in system_prompt
+    assert "CAMERA_CONTEXT:" not in system_prompt
     assert "Let me check that" not in system_prompt
     assert "Could you say that another way" not in system_prompt
+    assert "repeat" not in system_prompt.lower()
     assert payload["messages"][1:3] == [
         {"role": "user", "content": "Earlier question"},
         {"role": "assistant", "content": "Earlier answer"},
     ]
     assert payload["messages"][-1]["role"] == "user"
     assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert payload["temperature"] == 0.1
+    assert payload["top_p"] == 0.9
     assert payload["tools"][0]["function"]["name"] == "web_search"
     assert payload["tool_choice"] == "auto"
+
+
+def test_camera_freshness_protocol_is_requested_only_when_camera_is_advertised():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    camera_session = SimpleNamespace(
+        instructions="",
+        tools=[{"type": "function", "name": "camera_snapshot", "parameters": {"type": "object"}}],
+        tool_choice="auto",
+    )
+    vad_audio = SimpleNamespace(
+        runtime_config=SimpleNamespace(session=camera_session, chat=Chat(30), local_pipeline={})
+    )
+
+    system_prompt = handler._payload(np.zeros(1600, dtype=np.float32), vad_audio)["messages"][0]["content"]
+
+    assert "CAMERA_CONTEXT: <current, historical, or none>" in system_prompt
+    assert "requires a new camera_snapshot" in system_prompt
 
 
 def test_preview_transcript_requires_the_transcript_prefix_and_rejects_assistant_text():
@@ -351,6 +376,42 @@ def test_direct_audio_preserves_monolingual_or_auto_response_language(response, 
 
 
 @pytest.mark.parametrize(
+    ("marker", "expected"),
+    [
+        ("es", "Spanish"),
+        ("Espa\u00f1ol", "Spanish"),
+        ("Deutsch", "German"),
+        ("\u65e5\u672c\u8a9e", "Japanese"),
+        ("\ud55c\uad6d\uc5b4", "Korean"),
+        ("\u4e2d\u6587", "Chinese"),
+        ("Portugu\u00eas", "Portuguese"),
+        ("mixed language", "Auto"),
+        ("unsupported-language", "Auto"),
+    ],
+)
+def test_assistant_language_is_canonical_at_the_direct_audio_boundary(marker, expected):
+    text = f"ASSISTANT_LANGUAGE: {marker}\nASSISTANT_RESPONSE: Ready."
+
+    assert GemmaAudioSTTHandler._effective_assistant_language(text) == expected
+
+
+def test_duplicate_or_conflicting_assistant_language_markers_fail_closed_to_auto():
+    duplicate = (
+        "ASSISTANT_LANGUAGE: Spanish\n"
+        "ASSISTANT_LANGUAGE: Spanish\n"
+        "ASSISTANT_RESPONSE: Listo."
+    )
+    conflicting = (
+        "ASSISTANT_LANGUAGE: German\n"
+        "ASSISTANT_LANGUAGE: English\n"
+        "ASSISTANT_RESPONSE: Ready."
+    )
+
+    assert GemmaAudioSTTHandler._effective_assistant_language(duplicate) == "Auto"
+    assert GemmaAudioSTTHandler._effective_assistant_language(conflicting) == "Auto"
+
+
+@pytest.mark.parametrize(
     "sentinel",
     [
         "[inaudible]",
@@ -364,6 +425,28 @@ def test_failure_only_transcript_sentinels_are_rejected_exactly(sentinel):
     text = f"USER_TRANSCRIPT: {sentinel}\nASSISTANT_RESPONSE: I will answer naturally."
 
     assert GemmaAudioSTTHandler._extract_transcript(text) is None
+
+
+@pytest.mark.parametrize(
+    "sentinel",
+    [
+        "\u65e0\u6cd5\u542c\u6e05",
+        "\u805e\u304d\u53d6\u308c\u307e\u305b\u3093",
+        "\uc54c\uc544\ub4e4\uc744 \uc218 \uc5c6\uc2b5\ub2c8\ub2e4",
+        "Unverst\u00e4ndlich",
+        "Aucune parole d\u00e9tect\u00e9e",
+        "\u041d\u0435\u0440\u0430\u0437\u0431\u043e\u0440\u0447\u0438\u0432\u043e",
+        "\u00c1udio inintelig\u00edvel",
+        "No se detect\u00f3 habla",
+        "Nessun parlato rilevato",
+    ],
+)
+def test_supported_language_failure_sentinels_are_metadata_only_and_whole_field_exact(sentinel):
+    assert GemmaAudioSTTHandler._validate_transcript(f"  [{sentinel}]  ") is None
+    assert GemmaAudioSTTHandler._validate_user_memory(f"\u300c{sentinel}\u300d") is None
+    substantive = f"Explain why the label {sentinel} appeared in the report."
+    assert GemmaAudioSTTHandler._validate_transcript(substantive) == substantive
+    assert GemmaAudioSTTHandler._validate_user_memory(substantive) == substantive
 
 
 def test_transcript_failure_words_inside_real_user_content_are_preserved():
@@ -578,6 +661,207 @@ def test_semantic_memory_preserves_tool_preamble_and_call_order_without_transcri
     assert chat.buffer[0].content[0].type == "input_text"
     assert chat.buffer[0].content[0].text == "Inspect the current camera view more closely."
     assert chat.stats()["pending_tool_calls"] == 1
+
+
+def _camera_vad(turn_id="turn_camera_freshness"):
+    runtime_config = RuntimeConfig(chat=Chat(30))
+    runtime_config.session.tools = [
+        {"type": "function", "name": "camera_snapshot", "parameters": {"type": "object"}}
+    ]
+    runtime_config.session.tool_choice = "auto"
+    return SimpleNamespace(
+        audio=np.zeros(1600, dtype=np.float32),
+        mode="final",
+        runtime_config=runtime_config,
+        turn_id=turn_id,
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+
+
+def test_current_camera_context_injects_one_fresh_call_and_suppresses_result_claim():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    vad_audio = _camera_vad()
+    text = (
+        "USER_MEMORY: Check what is visible now.\n"
+        "ASSISTANT_LANGUAGE: English\n"
+        "CAMERA_CONTEXT: current\n"
+        "ASSISTANT_RESPONSE: There are three fingers."
+    )
+
+    output = list(handler._responses_from_text(text, vad_audio))[-1]
+
+    assert output.text == ""
+    assert [(tool.name, tool.arguments) for tool in output.tools] == [("camera_snapshot", "{}")]
+    assert output.tools[0].call_id.startswith("call_turn_camera_freshness_")
+
+
+def test_current_camera_context_keeps_only_one_existing_camera_call_and_explicit_preamble():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    vad_audio = _camera_vad("turn_camera_dedupe")
+    camera_calls = [
+        ResponseFunctionToolCall(
+            type="function_call",
+            name="camera_snapshot",
+            arguments="{}",
+            call_id=f"call_camera_{index}",
+            id=f"fc_camera_{index}",
+            status="completed",
+        )
+        for index in range(2)
+    ]
+    text = (
+        "USER_MEMORY: Look again at the current view.\n"
+        "ASSISTANT_LANGUAGE: English\n"
+        "CAMERA_CONTEXT: current\n"
+        "ASSISTANT_PREAMBLE: I'll take another look.\n"
+        "ASSISTANT_RESPONSE: The scene has changed."
+    )
+
+    output = list(handler._responses_from_text(text, vad_audio, tools=camera_calls))[-1]
+
+    assert output.text == "I'll take another look."
+    assert [tool.call_id for tool in output.tools] == ["call_camera_0"]
+
+
+@pytest.mark.parametrize("camera_context", ["historical", "none"])
+def test_noncurrent_camera_context_never_forces_a_capture(camera_context):
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    vad_audio = _camera_vad(f"turn_camera_{camera_context}")
+    text = (
+        "USER_MEMORY: Discuss the prior observation.\n"
+        "ASSISTANT_LANGUAGE: English\n"
+        f"CAMERA_CONTEXT: {camera_context}\n"
+        "ASSISTANT_RESPONSE: I can answer from the retained context."
+    )
+
+    output = list(handler._responses_from_text(text, vad_audio))[-1]
+
+    assert output.text == "I can answer from the retained context."
+    assert output.tools == []
+
+
+def test_out_of_order_current_camera_context_never_streams_stale_visual_prose():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
+    vad_audio = _camera_vad("turn_camera_out_of_order")
+    stream = _FakeSSEStream(
+        _sse_text(
+            "USER_MEMORY: Check what is visible now.\n"
+            "ASSISTANT_LANGUAGE: English\n"
+            "ASSISTANT_RESPONSE: A stale visual claim.\n"
+            "CAMERA_CONTEXT: current"
+        )
+    )
+
+    outputs = list(handler._consume_stream(stream, vad_audio))
+
+    assert all("stale visual claim" not in output.text.lower() for output in outputs)
+    assert len(outputs[-1].tools) == 1
+    assert outputs[-1].tools[0].name == "camera_snapshot"
+
+
+@pytest.mark.parametrize(
+    "markers",
+    [
+        "CAMERA_CONTEXT: current\nCAMERA_CONTEXT: current",
+        "CAMERA_CONTEXT: historical\nCAMERA_CONTEXT: current",
+        "CAMERA_CONTEXT: current\nCAMERA_CONTEXT: none",
+    ],
+)
+def test_duplicate_or_conflicting_camera_context_is_buffered_and_never_forces_capture(markers):
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    vad_audio = _camera_vad("turn_camera_conflict_buffered")
+    text = (
+        "USER_MEMORY: Continue with the camera context.\n"
+        "ASSISTANT_LANGUAGE: English\n"
+        f"{markers}\n"
+        "ASSISTANT_RESPONSE: A complete response."
+    )
+
+    output = list(handler._responses_from_text(text, vad_audio))[-1]
+
+    assert output.tools == []
+    assert output.text == "A complete response."
+
+
+def test_streamed_conflicting_camera_context_never_releases_prose_early_or_captures():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
+    vad_audio = _camera_vad("turn_camera_conflict_streamed")
+    stream = _FakeSSEStream(
+        _sse_text(
+            "USER_MEMORY: Continue with the camera context.\n"
+            "ASSISTANT_LANGUAGE: English\n"
+            "CAMERA_CONTEXT: historical\n"
+            "ASSISTANT_RESPONSE: A complete response.\n"
+            "CAMERA_CONTEXT: current"
+        )
+    )
+
+    outputs = list(handler._consume_stream(stream, vad_audio))
+
+    assert all(not output.text for output in outputs[:-1])
+    assert outputs[-1].text == "A complete response."
+    assert outputs[-1].tools == []
+
+
+@pytest.mark.parametrize("camera_marker", ["", "\nCAMERA_CONTEXT: maybe"])
+def test_missing_or_malformed_camera_context_is_privacy_fail_closed_and_content_free(camera_marker):
+    metrics = Queue()
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(
+        model_name="gemma-test",
+        base_url="http://127.0.0.1:8818/v1",
+        stream=False,
+        text_output_queue=metrics,
+    )
+    vad_audio = _camera_vad("turn_camera_unclassified")
+    text = (
+        "USER_MEMORY: Continue naturally.\n"
+        f"ASSISTANT_LANGUAGE: English{camera_marker}\n"
+        "ASSISTANT_RESPONSE: Done."
+    )
+
+    output = list(handler._responses_from_text(text, vad_audio))[-1]
+    emitted_metrics = []
+    while not metrics.empty():
+        emitted_metrics.append(metrics.get_nowait())
+    camera_metric = next(
+        metric
+        for metric in emitted_metrics
+        if metric.stage == "camera" and metric.status == "freshness_unclassified"
+    )
+
+    assert output.text == "Done."
+    assert output.tools == []
+    assert camera_metric.detail == {"camera_context": "unclassified", "enforced": False}
+
+
+def test_camera_context_marker_is_inert_when_camera_tool_is_disabled():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    vad_audio = SimpleNamespace(
+        runtime_config=RuntimeConfig(chat=Chat(30)),
+        turn_id="turn_camera_disabled",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+    text = (
+        "USER_MEMORY: Discuss the current topic.\n"
+        "ASSISTANT_LANGUAGE: English\n"
+        "CAMERA_CONTEXT: current\n"
+        "ASSISTANT_RESPONSE: Done."
+    )
+
+    output = list(handler._responses_from_text(text, vad_audio))[-1]
+
+    assert output.text == "Done."
+    assert output.tools == []
 
 
 def test_direct_transport_timeout_reaches_failed_end_of_response():

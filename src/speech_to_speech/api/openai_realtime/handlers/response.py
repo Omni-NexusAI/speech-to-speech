@@ -400,6 +400,11 @@ class ResponseHandler(RealtimeBaseHandler):
                 GenerateResponseRequest(
                     runtime_config=st.runtime_config,
                     response=response,
+                    language_code=(
+                        None
+                        if out_of_band or not tool_followup
+                        else st.speculative_response_language_code
+                    ),
                     turn_id=None if out_of_band else st.speculative_user_turn_id,
                     turn_revision=None if out_of_band else st.speculative_user_turn_revision,
                     speech_stopped_at_s=None if out_of_band else st.speculative_user_speech_stopped_at_s,

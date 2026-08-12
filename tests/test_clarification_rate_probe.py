@@ -401,6 +401,49 @@ def test_gate_counts_one_primary_per_turn_and_history_anchor_kinds(monkeypatch):
     assert "private.invalid" not in public_output
 
 
+def test_multilingual_cohort_alternates_pure_supported_languages_and_code_switching():
+    normal, _ = probe.build_scenarios()
+    monolingual = [scenario for scenario in normal if scenario.category == "alternate_voice"]
+    code_switched = [scenario for scenario in normal if scenario.category == "code_switch"]
+
+    assert {scenario.culture for scenario in monolingual} == {"en-US", "en-GB", "es-ES", "de-DE", "ja-JP"}
+    assert any("Por favor" in scenario.utterance and "answer" not in scenario.utterance for scenario in monolingual)
+    assert any("Bitte antworte" in scenario.utterance and "answer" not in scenario.utterance for scenario in monolingual)
+    assert any("\u7b54\u3048\u3092\u6570\u5b57\u3067" in scenario.utterance and "answer" not in scenario.utterance for scenario in monolingual)
+    assert {scenario.culture for scenario in code_switched} == {"en-US", "es-ES", "de-DE", "ja-JP"}
+
+
+@pytest.mark.parametrize(("clarification_indexes", "expected_pass"), [({0}, True), ({0, 1}, False)])
+def test_normal_clarification_gate_allows_at_most_one_and_rejects_repeated_stock(
+    monkeypatch,
+    clarification_indexes,
+    expected_pass,
+):
+    monkeypatch.setenv(probe._CREDENTIAL_ENV, "private-key")
+    normal, meaningless = probe.build_scenarios()
+    scenarios = [*normal, *meaningless]
+    calls = 0
+
+    def requester(_client, _target, _credential, _payload, _timeout):
+        nonlocal calls
+        scenario = scenarios[calls]
+        calls += 1
+        if scenario.normal and scenario.index in clarification_indexes:
+            wording = "Could you repeat that?" if scenario.index == 0 else "COULD YOU REPEAT THAT!"
+            return _response(wording)
+        if scenario.expected_number is not None:
+            return _response(str(scenario.expected_number))
+        return _response("Could you say that another way?")
+
+    report = probe.run_gate(client_factory=_Client, synthesizer=_synthesized, requester=requester)
+
+    assert report["clarifications"] == len(clarification_indexes)
+    assert report["clarification_maximum_met"] is expected_pass
+    assert report["repeated_stock_clarifications"] == max(0, len(clarification_indexes) - 1)
+    assert report["repeated_stock_free"] is expected_pass
+    assert report["gate_passed"] is expected_pass
+
+
 def test_unclassified_normal_response_fails_gate_instead_of_becoming_ordinary(monkeypatch):
     monkeypatch.setenv(probe._CREDENTIAL_ENV, "private-key")
     normal, meaningless = probe.build_scenarios()
