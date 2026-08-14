@@ -297,6 +297,11 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         # One semantic anchor per session/turn. Revisions replace its cumulative
         # WAV in place instead of creating multiple user turns.
         self._accepted_user_items: dict[tuple[str, str], tuple[str, int]] = {}
+        self._accepted_user_audio: dict[tuple[str, str], tuple[str, int]] = {}
+        # A successful model-generated memory keeps exactly one prior accepted
+        # WAV out of durable chat so the immediately following turn can correct
+        # that provisional anchor without accumulating session audio.
+        self._provisional_user_audio: dict[tuple[str, Any], tuple[tuple[str, str], str, str]] = {}
         self._accepted_user_lock = threading.Lock()
         self._active_resources: set[Any] = set()
         self._active_turn: tuple[str | None, int | None] | None = None
@@ -539,15 +544,46 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         owned = self._owned_user_context(vad_audio)
         return owned is not None and owned[1] == self._turn_revision(vad_audio)
 
-    def _commit_accepted_audio(self, vad_audio: STTIn, encoded_audio: str) -> str | None:
+    @classmethod
+    def _history_scope_key(cls, vad_audio: STTIn) -> tuple[str, Any]:
+        """Keep retained WAVs isolated to both the logical session and Chat."""
+
+        return cls._turn_key(vad_audio)[0], cls._conversation_chat(vad_audio)
+
+    def _provisional_history_audio(self, vad_audio: STTIn) -> tuple[str, str] | None:
+        """Return the previous turn's one-shot WAV overlay, if any."""
+
+        lock = getattr(self, "_accepted_user_lock", None)
+        provisional_audio = getattr(self, "_provisional_user_audio", None)
+        if lock is None or provisional_audio is None:
+            # Payload-only release probes construct this adapter without its
+            # stateful setup because they never commit accepted turns.
+            return None
+        key = self._turn_key(vad_audio)
+        scope = self._history_scope_key(vad_audio)
+        with lock:
+            provisional = provisional_audio.get(scope)
+            if provisional is None or provisional[0] == key:
+                return None
+            return provisional[1], provisional[2]
+
+    def _commit_accepted_audio(
+        self,
+        vad_audio: STTIn,
+        encoded_audio: str,
+        *,
+        consume_previous: bool = False,
+    ) -> str | None:
         """Persist one accepted turn before generation using its original mono WAV."""
 
         chat = self._conversation_chat(vad_audio)
         if chat is None:
             return None
         key = self._turn_key(vad_audio)
+        scope = self._history_scope_key(vad_audio)
         revision = self._turn_revision(vad_audio)
         with self._accepted_user_lock:
+            provisional = self._provisional_user_audio.get(scope)
             existing = self._accepted_user_items.get(key)
             if existing is not None:
                 item_id, owned_revision = existing
@@ -557,6 +593,9 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                     return item_id
                 if chat.replace_user_message_audio(item_id, encoded_audio):
                     self._accepted_user_items[key] = (item_id, revision)
+                    self._accepted_user_audio[key] = (encoded_audio, revision)
+                    if consume_previous and provisional is not None and provisional[0] != key:
+                        self._provisional_user_audio.pop(scope, None)
                     self._emit_history_metric(
                         vad_audio,
                         "user_superseded",
@@ -565,9 +604,13 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                     )
                     return item_id
                 self._accepted_user_items.pop(key, None)
+                self._accepted_user_audio.pop(key, None)
             item = chat.add_item(make_user_audio_message(encoded_audio))
             assert item.id is not None
             self._accepted_user_items[key] = (item.id, revision)
+            self._accepted_user_audio[key] = (encoded_audio, revision)
+            if consume_previous and provisional is not None and provisional[0] != key:
+                self._provisional_user_audio.pop(scope, None)
         self._emit_history_metric(vad_audio, "user_committed", input_kind="input_audio", committed=True)
         return item.id
 
@@ -626,6 +669,9 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             owned = self._accepted_user_items.get(key)
             if owned is not None and owned[1] == revision:
                 self._accepted_user_items.pop(key, None)
+            accepted_audio = self._accepted_user_audio.get(key)
+            if accepted_audio is not None and accepted_audio[1] == revision:
+                self._accepted_user_audio.pop(key, None)
 
     def _model_endpoint(self, vad_audio: STTIn | None) -> tuple[str, str, str | None]:
         runtime_config = getattr(vad_audio, "runtime_config", None) if vad_audio is not None else None
@@ -650,6 +696,27 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         system_parts = [self.system_prompt]
         if session_instructions:
             system_parts.append(session_instructions)
+
+        history: list[dict[str, Any]] = []
+        has_provisional_previous_audio = False
+        chat = getattr(runtime_config, "chat", None)
+        if chat is not None and callable(getattr(chat, "copy", None)):
+            history_chat = chat.copy()
+            owned = self._owned_user_context(vad_audio)
+            if owned is not None:
+                # The live user message below is the only representation of the
+                # current semantic turn, even while a newer cumulative revision
+                # replaces the persistent anchor.
+                history_chat.remove_user_message(owned[0])
+            provisional = self._provisional_history_audio(vad_audio)
+            if provisional is not None:
+                has_provisional_previous_audio = history_chat.replace_user_message_with_audio_for_snapshot(*provisional)
+            history = [
+                message
+                for message in ChatCompletionsApiModelHandler._chat_messages(history_chat)
+                if message.get("role") != "system"
+            ]
+
         semantic_instructions = (
             "The accepted turn may use any language, accent, or code-switching. Follow the language or languages "
             "naturally used in the current utterance unless the user or session instructions request another response "
@@ -665,6 +732,11 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             "ASSISTANT_LANGUAGE: <single language name for a monolingual spoken answer; Auto for a mixed-language "
             "or otherwise unspecified spoken answer>\n"
         )
+        if has_provisional_previous_audio:
+            semantic_instructions += (
+                "The immediately prior user audio is available only for resolving this turn. The current correction "
+                "wins; preserve it in USER_MEMORY. "
+            )
         if self._camera_tool_available(vad_audio):
             semantic_instructions += (
                 "CAMERA_CONTEXT: <current, historical, or none>\n"
@@ -687,22 +759,6 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         for image_url in self._conversation_image_urls(runtime_config):
             user_content.append({"type": "image_url", "image_url": {"url": image_url}})
         user_content.append({"type": "input_audio", "input_audio": {"data": encoded, "format": self.audio_format}})
-
-        history: list[dict[str, Any]] = []
-        chat = getattr(runtime_config, "chat", None)
-        if chat is not None and callable(getattr(chat, "copy", None)):
-            history_chat = chat.copy()
-            owned = self._owned_user_context(vad_audio)
-            if owned is not None:
-                # The live user message below is the only representation of the
-                # current semantic turn, even while a newer cumulative revision
-                # replaces the persistent anchor.
-                history_chat.remove_user_message(owned[0])
-            history = [
-                message
-                for message in ChatCompletionsApiModelHandler._chat_messages(history_chat)
-                if message.get("role") != "system"
-            ]
 
         _, model_name, _ = self._model_endpoint(vad_audio)
         payload: dict[str, Any] = {
@@ -872,14 +928,16 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         base_url, _, api_key = self._model_endpoint(vad_audio)
         url = f"{base_url}/chat/completions"
         encoded_audio = base64.b64encode(self._wav_bytes(audio)).decode("ascii")
+        payload_built = False
         try:
             # Snapshot prior history first. Otherwise current audio appears once
             # in history and once as the live user message in the same request.
             payload = self._payload(audio, vad_audio, encoded_audio=encoded_audio)
+            payload_built = True
         finally:
             # VAD admission, not optional metadata or payload serialization, is
             # the accepted-turn boundary.
-            self._commit_accepted_audio(vad_audio, encoded_audio)
+            self._commit_accepted_audio(vad_audio, encoded_audio, consume_previous=payload_built)
         response: CancellableAsyncSSEStream | None = None
         try:
             if payload.get("stream", self.stream):
@@ -1200,6 +1258,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             for tool in tools
         ]
         key = self._turn_key(vad_audio)
+        scope = self._history_scope_key(vad_audio)
         revision = self._turn_revision(vad_audio)
         with self._accepted_user_lock:
             owned = self._accepted_user_items.get(key)
@@ -1214,6 +1273,13 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             # follow-up path trims after its final assistant response commits.
             if not tools:
                 chat.trim_if_needed(None)
+            accepted_audio = self._accepted_user_audio.get(key)
+            if user_memory and accepted_audio is not None and accepted_audio[1] == revision:
+                self._provisional_user_audio[scope] = (key, user_item_id, accepted_audio[0])
+            else:
+                provisional = self._provisional_user_audio.get(scope)
+                if provisional is not None and provisional[0] == key:
+                    self._provisional_user_audio.pop(scope, None)
         self._emit_history_metric(
             vad_audio,
             "response_committed",
@@ -1277,6 +1343,8 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         super().on_session_end()
         with self._accepted_user_lock:
             self._accepted_user_items.clear()
+            self._accepted_user_audio.clear()
+            self._provisional_user_audio.clear()
         self._preview_transcripts.clear()
 
     @staticmethod

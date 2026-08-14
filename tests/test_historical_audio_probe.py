@@ -82,7 +82,7 @@ def test_probe_payloads_use_current_and_exact_historical_input_audio_shapes():
     historical = probe.build_payload("gemma-test", "noise", "historical")
 
     assert [message["role"] for message in current["messages"]] == ["system", "user"]
-    assert [part["type"] for part in current["messages"][1]["content"]] == ["input_audio", "text"]
+    assert [part["type"] for part in current["messages"][1]["content"]] == ["input_audio"]
     assert [message["role"] for message in historical["messages"]] == ["system", "user", "assistant", "user"]
     historical_audio = historical["messages"][1]["content"][0]
     assert historical_audio["type"] == "input_audio"

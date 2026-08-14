@@ -439,6 +439,28 @@ class Chat:
                 return True
         return False
 
+    def replace_user_message_with_audio_for_snapshot(self, item_id: str, audio: str) -> bool:
+        """Use one retained WAV instead of provisional text in a chat snapshot.
+
+        ``Chat.copy`` intentionally shares immutable item objects. Replace the
+        target with a deep copy before adding audio so the live bounded history
+        remains text-only and keeps the exact same turn/tool ordering.
+        """
+
+        if not audio:
+            return False
+        with self._lock:
+            for index, item in enumerate(self.buffer):
+                if not isinstance(item, RealtimeConversationItemUserMessage) or item.id != item_id:
+                    continue
+                if not any(part.type == "input_text" and part.text for part in item.content):
+                    return False
+                replacement = item.model_copy(deep=True)
+                replacement.content = [UserContent(type="input_audio", audio=audio)]
+                self.buffer[index] = replacement
+                return True
+        return False
+
     def remove_user_message(self, item_id: str) -> bool:
         """Remove an existing user message from the bounded chat buffer."""
 

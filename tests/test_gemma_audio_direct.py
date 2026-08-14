@@ -1195,7 +1195,8 @@ def test_tool_result_and_continuation_preserve_exact_atomic_order():
         "assistant",
         "user",
     ]
-    assert payload["messages"][1]["content"] == "Busca la información local y conserva el contexto en español."
+    prior_user = payload["messages"][1]["content"]
+    assert [part["type"] for part in prior_user] == ["input_audio"]
     assert payload["messages"][3]["tool_calls"][0]["id"] == "call_search_order"
     assert payload["messages"][4]["tool_call_id"] == "call_search_order"
     assert payload["messages"][5]["content"] == "Encontré el resultado."
@@ -1788,9 +1789,129 @@ def test_transcriptless_count_turn_uses_semantic_memory_for_reverse_follow_up():
 
     second = payloads[1]["messages"]
     assert [message["role"] for message in second] == ["system", "user", "assistant", "user"]
-    assert second[1]["content"] == "Count from one to ten."
+    assert [part["type"] for part in second[1]["content"]] == ["input_audio"]
     assert second[2]["content"].startswith("One, two, three")
     assert second[3]["content"][0]["type"] == "input_audio"
+
+
+def test_three_turn_foreign_token_correction_gets_exactly_one_previous_wav_opportunity():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
+    chat = Chat(30)
+    runtime_config = RuntimeConfig(chat=chat)
+    runtime_config.local_pipeline["_session_id"] = "session_foreign_token_correction"
+    payloads = []
+
+    def stream_request(_url, payload, *, api_key):
+        payloads.append(payload)
+        turn = len(payloads)
+        if turn == 1:
+            # This deliberately wrong model-generated anchor reproduces the
+            # old text-only-history bias on the following correction.
+            text = (
+                "USER_MEMORY: The user asks what the Japanese word neko means.\n"
+                "ASSISTANT_RESPONSE: Neko means cat."
+            )
+        elif turn == 2:
+            prior_content = payload["messages"][1]["content"]
+            has_retained_wav = isinstance(prior_content, list) and any(
+                part.get("type") == "input_audio" for part in prior_content
+            )
+            text = (
+                "USER_MEMORY: The user corrects the Japanese word to niku.\n"
+                "ASSISTANT_RESPONSE: Understood; niku means meat."
+                if has_retained_wav
+                else "USER_MEMORY: The user asks again about neko.\nASSISTANT_RESPONSE: Neko means cat."
+            )
+        else:
+            text = (
+                "USER_MEMORY: The user asks for the corrected word again.\n"
+                "ASSISTANT_RESPONSE: The corrected word was niku."
+            )
+        return _FakeSSEStream(_sse_text(text))
+
+    handler._stream_request = stream_request
+    for index, samples in enumerate((800, 1600, 2400), start=1):
+        list(
+            handler.process(
+                SimpleNamespace(
+                    audio=np.zeros(samples, dtype=np.float32),
+                    mode="final",
+                    runtime_config=runtime_config,
+                    turn_id=f"foreign_token_{index}",
+                    turn_revision=0,
+                    created_at_s=0.0,
+                )
+            )
+        )
+
+    assert len(payloads) == 3
+    first_audio = payloads[0]["messages"][-1]["content"][0]["input_audio"]["data"]
+    second_history = payloads[1]["messages"][1]["content"]
+    assert [part["type"] for part in second_history] == ["input_audio"]
+    assert second_history[0]["input_audio"]["data"] == first_audio
+    assert "immediately prior user audio" in payloads[1]["messages"][0]["content"]
+
+    third_messages = payloads[2]["messages"]
+    assert third_messages[1]["content"] == "The user asks what the Japanese word neko means."
+    assert [part["type"] for part in third_messages[3]["content"]] == ["input_audio"]
+    historical_audio_parts = [
+        part
+        for message in third_messages[1:-1]
+        if isinstance(message.get("content"), list)
+        for part in message["content"]
+        if part.get("type") == "input_audio"
+    ]
+    assert len(historical_audio_parts) == 1
+    assert [item.type for item in chat.buffer] == ["message", "message"] * 3
+    assert all(item.content[0].type == "input_text" for item in chat.buffer[::2])
+    assert chat.buffer[2].content[0].text == "The user corrects the Japanese word to niku."
+    assert chat.stats()["turns"] == 3
+    assert len(handler._provisional_user_audio) == 1
+
+
+def test_provisional_wav_cache_is_isolated_by_session_and_chat():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    chat = Chat(30)
+    runtime = RuntimeConfig(chat=chat)
+    runtime.local_pipeline["_session_id"] = "shared-session-label"
+    source = SimpleNamespace(runtime_config=runtime, turn_id="source", turn_revision=0)
+    handler._commit_accepted_audio(source, _encoded_silence(handler, 800))
+    assert handler._commit_context(
+        source,
+        None,
+        "Initial answer.",
+        [],
+        user_memory="The initial semantic anchor.",
+    )
+    handler._finish_user_context(source)
+
+    other_chat_runtime = RuntimeConfig(chat=Chat(30))
+    other_chat_runtime.local_pipeline["_session_id"] = "shared-session-label"
+    other_chat_payload = handler._payload(
+        np.zeros(1600, dtype=np.float32),
+        SimpleNamespace(runtime_config=other_chat_runtime, turn_id="other-chat", turn_revision=0),
+    )
+    assert [message["role"] for message in other_chat_payload["messages"]] == ["system", "user"]
+    assert "immediately prior user audio" not in other_chat_payload["messages"][0]["content"]
+
+    other_session_runtime = RuntimeConfig(chat=chat)
+    other_session_runtime.local_pipeline["_session_id"] = "different-session"
+    other_session_payload = handler._payload(
+        np.zeros(1600, dtype=np.float32),
+        SimpleNamespace(runtime_config=other_session_runtime, turn_id="other-session", turn_revision=0),
+    )
+    assert other_session_payload["messages"][1]["content"] == "The initial semantic anchor."
+    assert "immediately prior user audio" not in other_session_payload["messages"][0]["content"]
+
+    matching_payload = handler._payload(
+        np.zeros(1600, dtype=np.float32),
+        SimpleNamespace(runtime_config=runtime, turn_id="matching", turn_revision=0),
+    )
+    assert [part["type"] for part in matching_payload["messages"][1]["content"]] == ["input_audio"]
+    assert "immediately prior user audio" in matching_payload["messages"][0]["content"]
+    assert len(handler._provisional_user_audio) == 1
 
 
 def test_valid_primary_transcript_replaces_session_audio_anchor():
@@ -1851,6 +1972,62 @@ def test_cancelled_primary_retains_only_accepted_user_audio():
     assert chat.buffer[0].content[0].type == "input_audio"
 
 
+def test_cancelled_correction_consumes_prior_one_shot_wav_and_retains_latest_audio():
+    class _CancelledScope:
+        generation = 11
+
+        @staticmethod
+        def is_stale(_generation):
+            return True
+
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
+    chat = Chat(30)
+    runtime_config = RuntimeConfig(chat=chat)
+    runtime_config.local_pipeline["_session_id"] = "session_cancelled_correction"
+    payloads = []
+
+    def stream_request(_url, payload, *, api_key):
+        payloads.append(payload)
+        return _FakeSSEStream(
+            _sse_text(
+                "USER_MEMORY: The user asks about a foreign word.\n"
+                "ASSISTANT_RESPONSE: Here is the meaning."
+            )
+        )
+
+    handler._stream_request = stream_request
+    first = SimpleNamespace(
+        audio=np.zeros(800, dtype=np.float32),
+        mode="final",
+        runtime_config=runtime_config,
+        turn_id="first",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+    list(handler.process(first))
+    assert len(handler._provisional_user_audio) == 1
+
+    handler.cancel_scope = _CancelledScope()
+    second = SimpleNamespace(
+        audio=np.zeros(1600, dtype=np.float32),
+        mode="final",
+        runtime_config=runtime_config,
+        turn_id="cancelled_correction",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+    assert list(handler.process(second)) == []
+
+    assert len(payloads) == 2
+    assert [part["type"] for part in payloads[1]["messages"][1]["content"]] == ["input_audio"]
+    assert handler._provisional_user_audio == {}
+    assert handler._accepted_user_audio == {}
+    assert [item.type for item in chat.buffer] == ["message", "message", "message"]
+    assert chat.buffer[0].content[0].type == "input_text"
+    assert chat.buffer[2].content[0].type == "input_audio"
+
+
 def test_payload_serialization_failure_still_retains_accepted_user_audio():
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
@@ -1874,6 +2051,56 @@ def test_payload_serialization_failure_still_retains_accepted_user_audio():
     assert outputs[-1].error == "Direct audio model request failed: RuntimeError"
     assert [item.type for item in chat.buffer] == ["message"]
     assert chat.buffer[0].content[0].type == "input_audio"
+
+
+def test_payload_serialization_failure_preserves_prior_correction_wav_opportunity():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
+    chat = Chat(30)
+    runtime_config = RuntimeConfig(chat=chat)
+    runtime_config.local_pipeline["_session_id"] = "session_payload_failure_correction"
+    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(
+        _sse_text(
+            "USER_MEMORY: The model-generated foreign token is provisional.\n"
+            "ASSISTANT_RESPONSE: Initial answer."
+        )
+    )
+    first = SimpleNamespace(
+        audio=np.zeros(800, dtype=np.float32),
+        mode="final",
+        runtime_config=runtime_config,
+        turn_id="first",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+    list(handler.process(first))
+    retained_before = dict(handler._provisional_user_audio)
+    original_payload = handler._payload
+
+    def fail_payload(*_args, **_kwargs):
+        raise RuntimeError("serialization failed")
+
+    handler._payload = fail_payload
+    failed = SimpleNamespace(
+        audio=np.zeros(1600, dtype=np.float32),
+        mode="final",
+        runtime_config=runtime_config,
+        turn_id="failed",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+    outputs = list(handler.process(failed))
+
+    assert outputs[-1].error == "Direct audio model request failed: RuntimeError"
+    assert handler._provisional_user_audio == retained_before
+    assert [item.type for item in chat.buffer] == ["message", "message", "message"]
+    assert chat.buffer[0].content[0].type == "input_text"
+    assert chat.buffer[2].content[0].type == "input_audio"
+
+    recovery = SimpleNamespace(runtime_config=runtime_config, turn_id="recovery", turn_revision=0)
+    recovery_payload = original_payload(np.zeros(2400, dtype=np.float32), recovery)
+    assert [part["type"] for part in recovery_payload["messages"][1]["content"]] == ["input_audio"]
+    assert "immediately prior user audio" in recovery_payload["messages"][0]["content"]
 
 
 def test_non_json_sse_debug_log_never_contains_stream_content(caplog):

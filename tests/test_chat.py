@@ -867,6 +867,24 @@ class TestCopyAndReset:
         clone = chat.copy()
         assert clone._user_turn_count == 2
 
+    def test_snapshot_audio_replacement_preserves_live_text_and_transaction_order(self):
+        chat = Chat(size=5)
+        user = chat.add_item(_user("provisional semantic anchor"))
+        chat.add_item(_assistant("I will check."))
+        chat.add_item(_fc("correction", "lookup"))
+        chat.add_item(_fco("correction", "done"))
+        chat.add_item(_assistant("The lookup is complete."))
+
+        clone = chat.copy()
+        assert clone.replace_user_message_with_audio_for_snapshot(user.id, "d2F2LWJhc2U2NA==") is True
+
+        assert [item.type for item in clone.buffer] == [item.type for item in chat.buffer]
+        assert clone.stats()["turns"] == chat.stats()["turns"] == 1
+        assert [part.type for part in clone.buffer[0].content] == ["input_audio"]
+        assert clone.buffer[0].content[0].audio == "d2F2LWJhc2U2NA=="
+        assert [part.type for part in chat.buffer[0].content] == ["input_text"]
+        assert chat.buffer[0].content[0].text == "provisional semantic anchor"
+
     def test_reset_clears_everything(self):
         chat = Chat(size=5)
         chat.init_chat(_system("sys"))

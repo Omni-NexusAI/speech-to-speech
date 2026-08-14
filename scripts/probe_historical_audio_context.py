@@ -99,18 +99,15 @@ def build_payload(model: str, stimulus: Stimulus, placement: Placement) -> dict[
     system_message = {
         "role": "system",
         "content": (
-            "This is a deterministic synthetic-audio capability check. When the user says CLASSIFY, inspect the "
-            "synthetic audio supplied in the conversation and reply with exactly TONE for a steady periodic signal "
-            "or NOISE for broadband noise. Do not explain."
+            "This is a deterministic synthetic-audio capability check. Inspect the synthetic audio supplied in the "
+            "conversation and reply with exactly TONE for a steady periodic signal or NOISE for broadband noise. "
+            "A later CLASSIFY message refers to the immediately preceding historical audio. Do not explain."
         ),
     }
     if placement == "current":
         messages = [
             system_message,
-            {
-                "role": "user",
-                "content": [audio_part, {"type": "text", "text": "CLASSIFY"}],
-            },
+            {"role": "user", "content": [audio_part]},
         ]
     else:
         messages = [

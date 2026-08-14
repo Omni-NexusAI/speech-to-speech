@@ -18,7 +18,8 @@
 - Use `local_realtime.ps1 -Action start|stop|restart|status` for tracked background operation. It records launcher and listening child identities, adopts exact matching legacy repo processes, falls back to `netstat` when non-elevated PowerShell cannot query `Get-NetTCPConnection`, and never stops Gemma or FasterQwen3TTS.
 - Use `probe_historical_audio_context.py` only as a content-free live capability
   gate. It runs two paired current/historical ABBA cycles with equal-RMS tone
-  and seeded-noise WAVs in memory, calibrates the endpoint's label mapping from
+  and seeded-noise WAVs in memory, keeps the current arm audio-only like the
+  production direct request, calibrates the endpoint's label mapping from
   the current-audio trials, and passes only when historical results flip and
   remain consistent by stimulus against that mapping. It must never persist or
   print audio, prompts, transcript/response text, endpoints, models, or bearer
