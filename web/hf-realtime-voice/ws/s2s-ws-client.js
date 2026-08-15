@@ -120,7 +120,7 @@ import { OrbVisualiser, VIS_FFT_SIZE } from "./orb-visualizer.js";
 import {
   aec3ProcessorOptions,
   loadAec3Worklet,
-} from "../worklets/aec3/aec3-loader.js?v=5-echo-route";
+} from "../worklets/aec3/aec3-loader.js?v=6-stateful-polyphase";
 import {
   EchoRouteCalibration,
   fingerprintEchoRoute,
@@ -1616,7 +1616,7 @@ export class S2sWsRealtimeClient extends EventTarget {
     await ctx.audioWorklet.addModule(new URL("audio-playback.js?v=16-adaptive-safe-start", base).href);
     const aec3 = await loadAec3Worklet(ctx);
     if (!aec3.available) {
-      await ctx.audioWorklet.addModule(new URL("mic-capture.js?v=13-opaque-echo-route", base).href);
+      await ctx.audioWorklet.addModule(new URL("mic-capture.js?v=14-stateful-polyphase", base).href);
     }
 
     const micTrack = this.options.micStream?.getAudioTracks?.()[0];
@@ -2744,7 +2744,7 @@ export class S2sWsRealtimeClient extends EventTarget {
     this._sessionConfigured = false;
     this._rejectInitialConfig(new Error("Connection closed before pipeline configuration completed"));
     this._muted = true;
-    this._captureNode?.port.postMessage({ kind: "echo_reset" });
+    this._captureNode?.port.postMessage({ kind: "capture_abort" });
     this._captureNode?.port.postMessage({ kind: "enable", value: false });
     for (const track of this.options.micStream?.getTracks?.() ?? []) {
       track.stop();

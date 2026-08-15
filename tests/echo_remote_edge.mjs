@@ -322,12 +322,15 @@ assert.ok(FallbackProcessor, "fallback worklet registered");
 const input = new Float32Array(1920).fill(0.2);
 const reference = new Float32Array(1920).fill(0.2);
 const silence = new Float32Array(1920);
+const lookaheadInput = new Float32Array(58).fill(0.2);
+const lookaheadSilence = new Float32Array(58);
 const buffers = (processor) => processor.messages.filter((value) => value instanceof ArrayBuffer);
 
 const strictFallback = new FallbackProcessor({ processorOptions: { chunkMs: 40 } });
 strictFallback.port.onmessage({ data: { kind: "echo_guard", mode: "strict", nativeAec: true } });
 strictFallback.port.onmessage({ data: { kind: "echo_calibration", echoTailMs: 1000 } });
 strictFallback._ingest(input, reference);
+strictFallback._ingest(lookaheadInput, lookaheadSilence);
 for (let index = 0; index < 24; index += 1) strictFallback._ingest(input, silence);
 assert.equal(buffers(strictFallback).length, 0, "fallback Strict suppresses through a 1000 ms tail");
 strictFallback._ingest(input, silence);
@@ -343,6 +346,7 @@ for (const mode of ["native", "adaptive"]) {
   const processor = new FallbackProcessor({ processorOptions: { chunkMs: 40 } });
   processor.port.onmessage({ data: { kind: "echo_guard", mode, nativeAec: true } });
   processor._ingest(input, reference);
+  processor._ingest(lookaheadInput, lookaheadSilence);
   assert.equal(buffers(processor).length, 1, `${mode} fallback preserves microphone PCM`);
 }
 

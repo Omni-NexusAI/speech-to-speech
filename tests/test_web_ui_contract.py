@@ -264,15 +264,16 @@ def test_native_v3_is_the_migrated_default_and_echo_ui_is_truthful():
     assert "frontend.ui_asset_generation === backend.ui_asset_generation" in RUNTIME_IDENTITY_JS
     assert "Do not reuse a stock " in MAIN_JS
     assert "Let me check that" not in MAIN_JS
-    assert 'src="main.js?v=35-source-identity"' in INDEX_HTML
-    assert '"./ws/s2s-ws-client.js?v=21-opaque-echo-route"' in MAIN_JS
+    assert 'src="main.js?v=36-stateful-polyphase"' in INDEX_HTML
+    assert '"./ws/s2s-ws-client.js?v=22-stateful-polyphase"' in MAIN_JS
     assert '"./ui/chat.js?v=5-opaque-echo-route"' in MAIN_JS
     assert '"./tools/web-search.js?v=1-search-freshness"' in MAIN_JS
-    assert '"../worklets/aec3/aec3-loader.js?v=5-echo-route"' in CLIENT_JS
+    assert '"../worklets/aec3/aec3-loader.js?v=6-stateful-polyphase"' in CLIENT_JS
     assert "loadAec3Worklet(ctx)" in CLIENT_JS
-    assert 'new URL("mic-capture.js?v=13-opaque-echo-route", base)' in CLIENT_JS
+    assert 'new URL("mic-capture.js?v=14-stateful-polyphase", base)' in CLIENT_JS
     assert 'new URL("audio-playback.js?v=16-adaptive-safe-start", base)' in CLIENT_JS
     assert "new AudioWorkletNode(ctx, aec3.processorName" in CLIENT_JS
+    assert 'postMessage({ kind: "capture_abort" })' in CLIENT_JS
 
 
 def test_aec3_calibration_is_opaque_route_scoped_and_persisted():

@@ -19,7 +19,7 @@
 import {
   S2sWsRealtimeClient,
   prepareToolArgumentsForBrowser,
-} from "./ws/s2s-ws-client.js?v=21-opaque-echo-route";
+} from "./ws/s2s-ws-client.js?v=22-stateful-polyphase";
 import { $, truncateError, DEBUG } from "./ui/dom.js";
 import { ChatView, boundedCorrelationId } from "./ui/chat.js?v=5-opaque-echo-route";
 import { Account } from "./ui/account.js";

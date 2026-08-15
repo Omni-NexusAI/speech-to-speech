@@ -24,14 +24,19 @@ def test_aec3_loader_and_capture_keep_truthful_fallback_contract():
     fallback = (
         ROOT / "web" / "hf-realtime-voice" / "worklets" / "mic-capture.js"
     ).read_text(encoding="utf-8")
+    resampler = (
+        ROOT / "web" / "hf-realtime-voice" / "worklets" / "capture-resampler.js"
+    ).read_text(encoding="utf-8")
 
     assert 'crypto.subtle.digest("SHA-256", wasmBytes)' in loader
     assert "WebAssembly.Module.imports(module)" in loader
     assert 'processorName: "aec3-capture"' in loader
     assert '"./aec3-abi.js?v=3-opaque-echo-route"' in loader
-    assert '"./aec3-capture.js?v=7-opaque-echo-route"' in loader
+    assert '"./aec3-capture.js?v=8-stateful-polyphase"' in loader
     assert '"./aec3-abi.js?v=3-opaque-echo-route"' in capture
     assert '"./strict-echo-gate.js?v=2-opaque-echo-route"' in capture
+    assert '"../capture-resampler.js?v=1-stateful-polyphase"' in capture
+    assert '"./capture-resampler.js?v=1-stateful-polyphase"' in fallback
     assert 'registerProcessor("aec3-capture", Aec3CaptureProcessor)' in capture
     assert capture.index("this._session.process(reference, capture") < capture.index(
         "this._appendOutput(output"
@@ -41,6 +46,10 @@ def test_aec3_loader_and_capture_keep_truthful_fallback_contract():
     assert 'requested === "strict" ? "strict" : "native"' in fallback
     assert "ECHO_NLMS_STEP" not in fallback
     assert "_echoPrediction" not in fallback
+    assert "const TAP_COUNT = (HALF_LENGTH * 2) + 1" in resampler
+    assert "const KAISER_BETA = 6.25" in resampler
+    assert "mixedChannelSample" in resampler
+    assert "drainFlushedSample" in resampler
 
 
 def test_aec3_build_is_pinned_and_reproducible():

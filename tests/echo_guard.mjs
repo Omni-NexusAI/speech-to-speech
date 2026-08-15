@@ -43,11 +43,18 @@ function audioBuffers(processor) {
   return processor.messages.filter((value) => value instanceof ArrayBuffer);
 }
 
+function completeFirstCaptureChunk(processor, microphone, playback) {
+  processor._ingest(microphone, playback);
+  // The 121-tap FIR needs 58 more 48 kHz frames before the last center of the
+  // first exact 640-sample output chunk has its 60-sample lookahead.
+  processor._ingest(new Float32Array(58).fill(0.2), new Float32Array(58));
+}
+
 const microphone = tone(997);
 const playback = tone(440);
 
 const native = configure("native");
-native._ingest(microphone, playback);
+completeFirstCaptureChunk(native, microphone, playback);
 assert.equal(audioBuffers(native).length, 1, "Native emits browser-captured microphone PCM");
 assert.ok(
   new Int16Array(audioBuffers(native)[0]).some((sample) => Math.abs(sample) > 8),
@@ -55,7 +62,7 @@ assert.ok(
 );
 
 const adaptiveFallback = configure("adaptive");
-adaptiveFallback._ingest(microphone, playback);
+completeFirstCaptureChunk(adaptiveFallback, microphone, playback);
 assert.equal(
   audioBuffers(adaptiveFallback).length,
   1,
@@ -67,7 +74,7 @@ assert.equal(status.requestedMode, "adaptive");
 assert.equal(status.effectiveMode, "native");
 
 const strict = configure("strict");
-strict._ingest(microphone, playback);
+completeFirstCaptureChunk(strict, microphone, playback);
 assert.equal(audioBuffers(strict).length, 0, "Strict omits capture during referenced playback");
 for (let frame = 0; frame < 9; frame += 1) {
   strict._ingest(microphone, new Float32Array(INPUT_SAMPLES));
