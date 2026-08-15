@@ -8,7 +8,7 @@ import re
 import threading
 import unicodedata
 import wave
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from io import BytesIO
 from time import perf_counter, time
 from typing import Any
@@ -27,6 +27,7 @@ from speech_to_speech.LLM.chat_completions_language_model import (
     _to_chat_tool_choice,
     _to_chat_tools,
 )
+from speech_to_speech.LLM.native_tool_diagnostics import NativeToolStreamDiagnostics
 from speech_to_speech.LLM.voice_prompt import VOICE_INPUT_TOOL_POLICY
 from speech_to_speech.pipeline.cancellable_http import CancellableAsyncSSEStream
 from speech_to_speech.pipeline.events import PipelineMetricEvent
@@ -749,11 +750,9 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             )
         semantic_instructions += (
             "ASSISTANT_RESPONSE: <your spoken answer>\n"
-            "When a provided tool is needed, call it in the same response and never fabricate its result. Before the "
-            "function call, provide one brief, natural acknowledgement whose wording fits the specific request and "
-            "varies with the conversation; do not reuse a stock phrase. Put it in ASSISTANT_PREAMBLE: "
-            "<acknowledgement>; plain ASSISTANT_RESPONSE text is also accepted for "
-            "compatibility. Do not emit a result-dependent ASSISTANT_RESPONSE until the tool result is available. "
+            "When a provided tool is needed, call it in the same response and never fabricate its result. You may "
+            "put one brief, natural acknowledgement in ASSISTANT_PREAMBLE: <acknowledgement>; otherwise call the "
+            "tool silently. Do not emit a result-dependent ASSISTANT_RESPONSE until the tool result is available. "
             "Do not wrap plain-text responses in JSON or Markdown."
         )
         system_parts.append(semantic_instructions)
@@ -950,7 +949,12 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 try:
                     response.wait_for_headers()
                     self._emit_metric(vad_audio, "gemma", "generating", detail={"operation": "direct_audio"})
-                    yield from self._consume_stream(response, vad_audio, generation=generation)
+                    yield from self._consume_stream(
+                        response,
+                        vad_audio,
+                        generation=generation,
+                        tool_choice=payload.get("tool_choice", "auto"),
+                    )
                 finally:
                     self._untrack_active(response)
                     response.close()
@@ -961,6 +965,9 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             self._track_active(response, vad_audio)
             raw = ""
             tool_accum: dict[int, dict[str, str]] = {}
+            tool_diagnostics = NativeToolStreamDiagnostics(
+                tool_choice=buffered_payload.get("tool_choice", "auto")
+            )
             try:
                 response.wait_for_headers()
                 for line in response.iter_lines():
@@ -977,9 +984,15 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                     choices = data.get("choices") or []
                     if not choices:
                         continue
-                    delta = choices[0].get("delta") or {}
+                    choice = choices[0]
+                    tool_diagnostics.observe_choice(choice)
+                    if not isinstance(choice, Mapping):
+                        continue
+                    delta = choice.get("delta") or {}
+                    if not isinstance(delta, Mapping):
+                        continue
                     self._accumulate_tool_deltas(delta, tool_accum)
-                    raw += str(delta.get("content") or choices[0].get("text") or "")
+                    raw += str(delta.get("content") or choice.get("text") or "")
             finally:
                 self._untrack_active(response)
                 response.close()
@@ -987,6 +1000,12 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 tool_accum,
                 chat=self._conversation_chat(vad_audio),
                 turn_id=getattr(vad_audio, "turn_id", None),
+            )
+            self._emit_metric(
+                vad_audio,
+                "gemma",
+                "tool_contract",
+                detail=tool_diagnostics.finalize(tool_accum, completed_call_count=len(tools)),
             )
             text = raw
             yield from self._responses_from_text(text, vad_audio, tools=tools, generation=generation)
@@ -1013,10 +1032,16 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 response.close()
 
     def _consume_stream(
-        self, response: CancellableAsyncSSEStream, vad_audio: STTIn, *, generation: int | None = None
+        self,
+        response: CancellableAsyncSSEStream,
+        vad_audio: STTIn,
+        *,
+        generation: int | None = None,
+        tool_choice: Any = "auto",
     ) -> Iterator[DirectAssistantResponse]:
         raw_text = ""
         tool_accum: dict[int, dict[str, str]] = {}
+        tool_diagnostics = NativeToolStreamDiagnostics(tool_choice=tool_choice)
         assistant_started = False
         pending_response = ""
         assistant_response_closed = False
@@ -1044,9 +1069,15 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             choices = data.get("choices") or []
             if not choices:
                 continue
-            delta = choices[0].get("delta") or {}
+            choice = choices[0]
+            tool_diagnostics.observe_choice(choice)
+            if not isinstance(choice, Mapping):
+                continue
+            delta = choice.get("delta") or {}
+            if not isinstance(delta, Mapping):
+                continue
             self._accumulate_tool_deltas(delta, tool_accum)
-            content = delta.get("content") or choices[0].get("text")
+            content = delta.get("content") or choice.get("text")
             if not content:
                 continue
             raw_text += str(content)
@@ -1097,6 +1128,12 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             tool_accum,
             chat=self._conversation_chat(vad_audio),
             turn_id=getattr(vad_audio, "turn_id", None),
+        )
+        self._emit_metric(
+            vad_audio,
+            "gemma",
+            "tool_contract",
+            detail=tool_diagnostics.finalize(tool_accum, completed_call_count=len(tools)),
         )
         tools, camera_context, _ = self._enforce_camera_context(vad_audio, raw_text, tools)
         camera_current = camera_context == "current"
@@ -1563,13 +1600,25 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         return chunks, text[pos:]
 
     @staticmethod
-    def _accumulate_tool_deltas(delta: dict[str, Any], tool_accum: dict[int, dict[str, str]]) -> None:
-        for tc in delta.get("tool_calls") or []:
-            index = int(tc.get("index") or 0)
+    def _accumulate_tool_deltas(delta: Mapping[str, Any], tool_accum: dict[int, dict[str, str]]) -> None:
+        fragments = delta.get("tool_calls") or []
+        if not isinstance(fragments, list):
+            return
+        for tc in fragments:
+            if not isinstance(tc, Mapping):
+                continue
+            raw_index = tc.get("index", 0)
+            if raw_index is None:
+                raw_index = 0
+            if isinstance(raw_index, bool) or not isinstance(raw_index, int) or raw_index < 0:
+                continue
+            index = raw_index
             entry = tool_accum.setdefault(index, {"name": "", "args": "", "id": ""})
             if tc.get("id"):
                 entry["id"] = str(tc["id"])
             fn = tc.get("function") or {}
+            if not isinstance(fn, Mapping):
+                continue
             if fn.get("name"):
                 entry["name"] = str(fn["name"])
             if fn.get("arguments"):
@@ -1613,12 +1662,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 source = f"{source}_deduplicated"
             call_id = canonical
             used_call_ids.add(call_id)
-            logger.info(
-                "Direct audio tool call prepared (stage=adapter name=%s call_id=%s source=%s)",
-                entry["name"],
-                call_id,
-                source,
-            )
+            logger.info("Direct audio tool call prepared (stage=adapter source=%s)", source)
             tools.append(
                 ResponseFunctionToolCall(
                     type="function_call",

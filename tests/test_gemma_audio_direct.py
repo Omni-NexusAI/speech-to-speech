@@ -2163,6 +2163,165 @@ def test_non_json_sse_debug_log_never_contains_stream_content(caplog):
     assert "Ignoring non-JSON Gemma stream event (chars=" in caplog.text
 
 
+@pytest.mark.parametrize("stream_mode", [True, False])
+def test_native_tool_contract_metric_is_single_bounded_and_content_free(stream_mode, caplog):
+    metrics = Queue()
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(
+        model_name="gemma-test",
+        base_url="http://127.0.0.1:8818/v1",
+        stream=stream_mode,
+        text_output_queue=metrics,
+    )
+    chat = Chat(30)
+    runtime_config = RuntimeConfig(chat=chat)
+    secret_name = "private_tool_name"
+    secret_arguments = '{"private_argument":"private-value"}'
+    runtime_config.session.tools = [
+        {"type": "function", "name": secret_name, "parameters": {"type": "object"}}
+    ]
+    runtime_config.session.tool_choice = "required"
+    vad_audio = SimpleNamespace(
+        audio=np.zeros(1600, dtype=np.float32),
+        mode="final",
+        runtime_config=runtime_config,
+        turn_id=f"tool_contract_{stream_mode}",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+    visible = "USER_MEMORY: The user requests the fixed lookup.\nASSISTANT_PREAMBLE: Checking."
+    lines = [
+        f"data: {json.dumps({'choices': [{'delta': {'content': visible}}]})}",
+        f"data: {json.dumps({'choices': [{'delta': {'tool_calls': [{'index': 0, 'id': 'call_private_id', 'function': {'name': secret_name, 'arguments': secret_arguments}}]}}], 'finish_reason': None})}",
+        f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'tool_calls'}]})}",
+        "data: [DONE]",
+    ]
+    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(lines)
+    caplog.set_level(logging.INFO, logger="speech_to_speech.STT.gemma_audio_handler")
+
+    outputs = list(handler.process(vad_audio))
+
+    events = []
+    while not metrics.empty():
+        events.append(metrics.get_nowait())
+    contract_events = [
+        event for event in events if event.stage == "gemma" and event.status == "tool_contract"
+    ]
+    assert len(contract_events) == 1
+    detail = contract_events[0].detail
+    assert detail == {
+        "finish_reason_category": "tool_calls",
+        "assistant_text_length": len(visible),
+        "native_tool_fragment_count": 1,
+        "completed_call_count": 1,
+        "malformed_call_category": "none",
+    }
+    assert len(outputs[-1].tools) == 1
+    assert set(detail) == {
+        "finish_reason_category",
+        "assistant_text_length",
+        "native_tool_fragment_count",
+        "completed_call_count",
+        "malformed_call_category",
+    }
+    serialized_detail = json.dumps(detail, sort_keys=True)
+    assert secret_name not in serialized_detail
+    assert "private_argument" not in serialized_detail
+    assert "private-value" not in serialized_detail
+    assert "call_private_id" not in serialized_detail
+    assert secret_name not in caplog.text
+    assert "private_argument" not in caplog.text
+    assert "private-value" not in caplog.text
+    assert "call_private_id" not in caplog.text
+    assert "stage=adapter source=native" in caplog.text
+
+
+@pytest.mark.parametrize("stream_mode", [True, False])
+def test_native_tool_contract_survives_malformed_choice_shape(stream_mode):
+    metrics = Queue()
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(
+        model_name="gemma-test",
+        base_url="http://127.0.0.1:8818/v1",
+        stream=stream_mode,
+        text_output_queue=metrics,
+    )
+    runtime_config = RuntimeConfig(chat=Chat(30))
+    vad_audio = SimpleNamespace(
+        audio=np.zeros(1600, dtype=np.float32),
+        mode="final",
+        runtime_config=runtime_config,
+        turn_id=f"malformed_choice_{stream_mode}",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+    visible = "USER_MEMORY: The user asks for a normal reply.\nASSISTANT_RESPONSE: Done."
+    lines = [
+        f"data: {json.dumps({'choices': ['private malformed payload']})}",
+        f"data: {json.dumps({'choices': [{'delta': {'content': visible}, 'finish_reason': 'stop'}]})}",
+        "data: [DONE]",
+    ]
+    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(lines)
+
+    outputs = list(handler.process(vad_audio))
+
+    events = []
+    while not metrics.empty():
+        events.append(metrics.get_nowait())
+    contract_events = [
+        event for event in events if event.stage == "gemma" and event.status == "tool_contract"
+    ]
+    assert outputs
+    assert len(contract_events) == 1
+    assert contract_events[0].detail["malformed_call_category"] == "native_fragment_shape"
+    assert "private malformed payload" not in json.dumps(contract_events[0].detail)
+
+
+@pytest.mark.parametrize("stream_mode", [True, False])
+def test_native_tool_contract_rejects_private_invalid_index_without_logging(stream_mode, caplog):
+    metrics = Queue()
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(
+        model_name="gemma-test",
+        base_url="http://127.0.0.1:8818/v1",
+        stream=stream_mode,
+        text_output_queue=metrics,
+    )
+    runtime_config = RuntimeConfig(chat=Chat(30))
+    vad_audio = SimpleNamespace(
+        audio=np.zeros(1600, dtype=np.float32),
+        mode="final",
+        runtime_config=runtime_config,
+        turn_id=f"invalid_index_{stream_mode}",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+    secret_index = "PRIVATE_MODEL_CONTROLLED_INDEX"
+    visible = "USER_MEMORY: The user asks for a normal reply.\nASSISTANT_RESPONSE: Done."
+    lines = [
+        f"data: {json.dumps({'choices': [{'delta': {'tool_calls': [{'index': secret_index, 'function': {'name': 'lookup', 'arguments': '{}'}}]}}]})}",
+        f"data: {json.dumps({'choices': [{'delta': {'content': visible}, 'finish_reason': 'stop'}]})}",
+        "data: [DONE]",
+    ]
+    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(lines)
+    caplog.set_level(logging.INFO, logger="speech_to_speech.STT.gemma_audio_handler")
+
+    outputs = list(handler.process(vad_audio))
+
+    events = []
+    while not metrics.empty():
+        events.append(metrics.get_nowait())
+    contract_events = [
+        event for event in events if event.stage == "gemma" and event.status == "tool_contract"
+    ]
+    assert outputs
+    assert len(contract_events) == 1
+    assert contract_events[0].detail["malformed_call_category"] == "native_invalid_index"
+    assert outputs[-1].tools == []
+    assert secret_index not in json.dumps(contract_events[0].detail)
+    assert secret_index not in caplog.text
+
+
 def test_legacy_notifier_does_not_duplicate_direct_transcript_when_context_is_committed():
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)

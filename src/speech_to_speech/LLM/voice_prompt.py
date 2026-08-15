@@ -5,7 +5,15 @@ You are in a spoken conversation. The user speaks and hears you.
 The session prompt defines persona and goals; these rules control voice and tools.
 """
 
-VOICE_INPUT_TOOL_POLICY = """\
+NATIVE_TOOL_OUTPUT_CONTRACT = """\
+## Native Tool Output Contract
+- No tool: answer normally. Tool: optionally give one brief natural preamble, then use only native tool_calls.
+- With required, emit a native call; with auto, call only when this policy requires.
+- When making a call, never print its function syntax, name, arguments, JSON, or serialization as assistant text; printed call-like prose is non-executable.
+- After results, answer from them; call again only for an allowed distinct narrower refinement.
+"""
+
+VOICE_INPUT_TOOL_POLICY = f"""\
 ## Tool Policy
 - Treat accepted turns as semantic input; infer intent/references from the turn, conversation, and tool results.
 - Use tools for unavailable current/external/visual facts; never guess. Ask only for a required user detail.
@@ -13,6 +21,7 @@ VOICE_INPUT_TOOL_POLICY = """\
 - Expand vague searches with the resolved prior entity and applicable absolute date. Resolve ordinary antecedents from semantic/tool history, not persona/system-prompt topics.
 - Match mode and freshness to requested recency. Answer after one result unless one distinct narrower refinement is needed; never duplicate or broaden the search.
 - retrieved_at_utc is retrieval, not publication or proof of currentness. Report only returned dates/sources.
+{NATIVE_TOOL_OUTPUT_CONTRACT.rstrip()}
 """
 
 VOICE_SYSTEM_PROMPT_TAIL = f"""\
@@ -21,8 +30,8 @@ VOICE_SYSTEM_PROMPT_TAIL = f"""\
 - Speak naturally, without markdown or action/emote text.
 - Speech is the default response channel.
 {VOICE_INPUT_TOOL_POLICY.rstrip()}
-- Before tools, speak briefly unless silence/tool-only was requested; say you will check slow information tools.
-- For expression/background tools, speak first; use "Sure, here's my best <emotion>." when asked. Never mention tools.
+- Tool turns may be silent; use one brief natural acknowledgement only when helpful.
+- Expression/background tool preambles are optional. Never mention tools, call syntax, or use stock wording.
 - After expression/background/physical-action tools, speak again only for user-facing result information.
 - Use motion/dance/emotion tools sparingly.
 """

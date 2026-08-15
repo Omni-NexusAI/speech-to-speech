@@ -68,6 +68,20 @@
   tool-order, or open-ended conversation benchmark. Resolve model routing only
   from the exact managed loopback `/api/ui-settings` response, reject redirects,
   and validate that handoff before reading or using the remote credential.
+- Use `probe_native_tool_protocol.py` only as the content-free model-level
+  native-tool release gate. Resolve the exact provider/model through the
+  redirect-rejecting managed loopback settings handoff; when provider is local,
+  require the `/api/local-pipeline` descriptor to advertise the canonical
+  `127.0.0.1:8818/v1` route and do not read a remote credential. Remote routing
+  may read only `S2S_REMOTE_MODEL_API_KEY` after the managed handoff validates.
+  Send one request each for required native selection, automatic native
+  selection, ordinary automatic/no-call output, and a fixed tool-result
+  continuation with tools disabled. Run prose-shaped and malformed-call
+  classification only against fixed in-process fixtures. Never retry, recover
+  printed syntax, execute a tool, use TTS/WebSockets, or emit/persist prompts,
+  responses, tool names/arguments/results, endpoint/model identity, or keys;
+  public evidence is limited to counts, bounded categories, timings, and
+  pass/fail.
 - Managed startup validates only Python and repository configuration. Missing
   Gemma or TTS services are status warnings; the launcher never inspects,
   starts, stops, or restarts model containers.

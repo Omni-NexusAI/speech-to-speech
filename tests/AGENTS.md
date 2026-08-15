@@ -16,6 +16,15 @@
 - Cover final transcript persistence independently from the optional floating live bubble, display-only `[User audio]` fallback, single durable semantic user history, Unicode-safe output, tool acknowledgement after response close, and dynamic history-token/context-window diagnostics.
 - Cover immediate tool output/create ordering, session-scoped provider selection, Groxaxo Base-model detection, active-stream cancellation, and bounded TTS runaway handling.
 - Direct-audio tool tests must cover opaque, already-prefixed, missing, duplicate, streaming, and buffered llama.cpp call IDs. Preserve explicit `ASSISTANT_PREAMBLE` text exactly; omitted preambles execute silently without canned substitution or `ASSISTANT_RESPONSE` rewriting.
+- Native tool-contract tests must cover required and automatic choice, printed call-like prose remaining non-executable, malformed native calls, and tool-disabled continuations. Assert the fixed five-field diagnostic shape and prove it contains no tool choice details, names, arguments, assistant text, or results.
+- Native tool-protocol probe tests must cover the redirect-rejecting managed
+  settings handoff, canonical credential-free local `127.0.0.1:8818` routing,
+  credential-after-handoff remote routing, exact required/auto/ordinary/disabled
+  request order, one-shot failure counts, streamed fragment accumulation, and
+  deterministic prose-shaped/malformed classification. Assert that public
+  success and failure output contains only bounded counts/categories/timings
+  and pass/fail, with no fixture text, response content, tool data,
+  endpoint/model identity, credentials, retries, or execution recovery.
 - Reject missing, non-string, wrong-type, and extra tool arguments before execution without echoing raw values. Preserve normal output/image/single-`response.create` ordering.
 - Browser-search tests must cover canonical optional mode/freshness defaults, Serper web/news and qdr mapping, auto-news-only same-filter fallback with explicit news staying empty, versioned bounded results with truthful dates/sources, no false retrieval-date freshness, one narrower refinement only, first-result search-only automatic choice, tool-disabled terminal/non-search follow-ups, reset boundaries, exact output/image/create order, and content-free failures/diagnostics. Shared voice-prompt tests must reject the old noisy-input, one-tool, and speak-when-unsure shortcuts; direct-audio tests must prove exact reuse of the shared semantic-input/search/reference policy.
 - Give every real camera invocation a distinct visible generation/card, including unavailable captures. Browser coverage must carry bounded content-free accepted-turn, response, item, call, card, capture-generation, capture-status, and output-acknowledgement identities across requested, captured, unavailable, acknowledged, and rejected states; repeated call IDs stay distinct, while absent or malformed optional IDs remain safe and visible as missing. Follow-ups asking about the current view or changes require a fresh snapshot rather than silently reusing an old frame.
