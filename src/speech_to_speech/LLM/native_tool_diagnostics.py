@@ -66,6 +66,21 @@ class NativeToolStreamDiagnostics:
     def __post_init__(self, tool_choice: Any) -> None:
         self._tool_choice_category = _tool_choice_category(tool_choice)
 
+    @property
+    def native_calls_allowed(self) -> bool:
+        """Whether this response-scoped choice permits any native call."""
+
+        return (
+            self._tool_choice_category != "none"
+            and not self._fragment_shape_error
+            and not self._fragment_index_error
+        )
+
+    def observe_malformed_stream_shape(self) -> None:
+        """Record a malformed top-level/container shape without retaining it."""
+
+        self._fragment_shape_error = True
+
     def observe_choice(self, choice: Any) -> None:
         """Observe one streamed ``choices[0]`` object without retaining its content."""
 
@@ -85,6 +100,14 @@ class NativeToolStreamDiagnostics:
         content = delta.get("content")
         if content is None:
             content = choice.get("text")
+        if content is not None and not isinstance(content, (str, list)):
+            self._fragment_shape_error = True
+        elif isinstance(content, list):
+            for part in content:
+                if not isinstance(part, Mapping) or (
+                    "text" in part and not isinstance(part.get("text"), str)
+                ):
+                    self._fragment_shape_error = True
         self.assistant_text_length += _assistant_text_length(content)
 
         fragments = delta.get("tool_calls")
@@ -147,11 +170,10 @@ class NativeToolStreamDiagnostics:
             if not isinstance(parsed_arguments, dict):
                 return "native_arguments_not_object"
 
+        if self._tool_choice_category == "none" and named_call_count:
+            return "native_call_disallowed"
         if named_call_count != self.completed_call_count:
             return "native_completion_count_mismatch"
-
-        if self._tool_choice_category == "none" and self.completed_call_count:
-            return "native_call_disallowed"
         if self._tool_choice_category == "required" and not self.completed_call_count:
             return "required_without_native_call"
         if self.finish_reason_category == "tool_calls" and not self.completed_call_count:

@@ -785,13 +785,13 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         chat_template_kwargs.setdefault("enable_thinking", False)
         payload["chat_template_kwargs"] = chat_template_kwargs
         tools = getattr(session, "tools", None) if session is not None else None
+        tool_choice = getattr(session, "tool_choice", None) if session is not None else None
         if tools:
             chat_tools = _to_chat_tools(tools)
             if chat_tools:
                 payload["tools"] = chat_tools
-                tool_choice = getattr(session, "tool_choice", None)
-                if tool_choice is not None:
-                    payload["tool_choice"] = _to_chat_tool_choice(tool_choice)
+        if tool_choice is not None:
+            payload["tool_choice"] = _to_chat_tool_choice(tool_choice)
         return payload
 
     def _transcription_payload(self, audio: np.ndarray, vad_audio: STTIn | None = None) -> dict[str, Any]:
@@ -849,11 +849,20 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                         data = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    if not isinstance(data, Mapping):
+                        continue
                     choices = data.get("choices") or []
+                    if not isinstance(choices, list):
+                        continue
                     if not choices:
                         continue
-                    delta = choices[0].get("delta") or {}
-                    content = delta.get("content") or choices[0].get("text")
+                    choice = choices[0]
+                    if not isinstance(choice, Mapping):
+                        continue
+                    delta = choice.get("delta") or {}
+                    if not isinstance(delta, Mapping):
+                        continue
+                    content = delta.get("content") or choice.get("text")
                     if not content:
                         continue
                     if first:
@@ -981,7 +990,13 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                         data = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    if not isinstance(data, Mapping):
+                        tool_diagnostics.observe_malformed_stream_shape()
+                        continue
                     choices = data.get("choices") or []
+                    if not isinstance(choices, list):
+                        tool_diagnostics.observe_malformed_stream_shape()
+                        continue
                     if not choices:
                         continue
                     choice = choices[0]
@@ -992,20 +1007,28 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                     if not isinstance(delta, Mapping):
                         continue
                     self._accumulate_tool_deltas(delta, tool_accum)
-                    raw += str(delta.get("content") or choice.get("text") or "")
+                    content = delta.get("content") or choice.get("text")
+                    if content is not None and not isinstance(content, str):
+                        continue
+                    raw += content or ""
             finally:
                 self._untrack_active(response)
                 response.close()
-            tools = self._tool_calls_from_accum(
-                tool_accum,
-                chat=self._conversation_chat(vad_audio),
-                turn_id=getattr(vad_audio, "turn_id", None),
+            tools = (
+                self._tool_calls_from_accum(
+                    tool_accum,
+                    chat=self._conversation_chat(vad_audio),
+                    turn_id=getattr(vad_audio, "turn_id", None),
+                )
+                if tool_diagnostics.native_calls_allowed
+                else []
             )
+            tool_detail = tool_diagnostics.finalize(tool_accum, completed_call_count=len(tools))
             self._emit_metric(
                 vad_audio,
                 "gemma",
                 "tool_contract",
-                detail=tool_diagnostics.finalize(tool_accum, completed_call_count=len(tools)),
+                detail=tool_detail,
             )
             text = raw
             yield from self._responses_from_text(text, vad_audio, tools=tools, generation=generation)
@@ -1066,7 +1089,13 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             except json.JSONDecodeError:
                 logger.debug("Ignoring non-JSON Gemma stream event (chars=%d)", len(line))
                 continue
+            if not isinstance(data, Mapping):
+                tool_diagnostics.observe_malformed_stream_shape()
+                continue
             choices = data.get("choices") or []
+            if not isinstance(choices, list):
+                tool_diagnostics.observe_malformed_stream_shape()
+                continue
             if not choices:
                 continue
             choice = choices[0]
@@ -1079,6 +1108,8 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             self._accumulate_tool_deltas(delta, tool_accum)
             content = delta.get("content") or choice.get("text")
             if not content:
+                continue
+            if not isinstance(content, str):
                 continue
             raw_text += str(content)
             if not assistant_started and _RESPONSE_MARKER in raw_text:
@@ -1124,16 +1155,21 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                         language_code=language_code,
                         generation=generation,
                     )
-        tools = self._tool_calls_from_accum(
-            tool_accum,
-            chat=self._conversation_chat(vad_audio),
-            turn_id=getattr(vad_audio, "turn_id", None),
+        tools = (
+            self._tool_calls_from_accum(
+                tool_accum,
+                chat=self._conversation_chat(vad_audio),
+                turn_id=getattr(vad_audio, "turn_id", None),
+            )
+            if tool_diagnostics.native_calls_allowed
+            else []
         )
+        tool_detail = tool_diagnostics.finalize(tool_accum, completed_call_count=len(tools))
         self._emit_metric(
             vad_audio,
             "gemma",
             "tool_contract",
-            detail=tool_diagnostics.finalize(tool_accum, completed_call_count=len(tools)),
+            detail=tool_detail,
         )
         tools, camera_context, _ = self._enforce_camera_context(vad_audio, raw_text, tools)
         camera_current = camera_context == "current"

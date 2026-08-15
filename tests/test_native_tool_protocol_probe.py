@@ -203,6 +203,7 @@ def test_live_payload_order_covers_required_auto_plain_and_tool_disabled_continu
     payloads = [call[2] for call in calls]
     assert [payload["tool_choice"] for payload in payloads] == ["required", "auto", "auto", "none"]
     assert all(payload["stream"] is True for payload in payloads)
+    assert all("Call it silently." in payloads[index]["messages"][-1]["content"] for index in (0, 1))
     assert [message["role"] for message in payloads[3]["messages"]] == [
         "system",
         "user",

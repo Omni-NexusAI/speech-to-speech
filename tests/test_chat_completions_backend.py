@@ -14,6 +14,7 @@ import queue
 import threading
 from types import SimpleNamespace
 
+import pytest
 from openai.types.realtime.conversation_item import (
     RealtimeConversationItemFunctionCall,
     RealtimeConversationItemFunctionCallOutput,
@@ -512,6 +513,60 @@ def test_tool_choice_sent_without_tools():
     _drive(h, tool_choice="none")
     assert "tools" not in captured
     assert captured["tool_choice"] == "none"
+
+
+@pytest.mark.parametrize("stream_mode", [True, False])
+def test_tool_choice_none_drops_noncompliant_provider_call(stream_mode):
+    h = _make_handler(stream=stream_mode)
+    metrics = queue.Queue()
+    h.text_output_queue = metrics
+    if stream_mode:
+        h.client.chat.completions.create = lambda **_kwargs: _FakeStream(
+            [
+                _chunk(content="The completed result is ready."),
+                _chunk(tool_calls=[_tc_delta(0, id="private_id", name="private_tool", arguments="{}")]),
+            ]
+        )
+    else:
+        h.client.chat.completions.create = lambda **_kwargs: SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="The completed result is ready.",
+                        tool_calls=[
+                            SimpleNamespace(
+                                id="private_id",
+                                function=SimpleNamespace(name="private_tool", arguments="{}"),
+                            )
+                        ],
+                    )
+                )
+            ],
+            usage=None,
+        )
+
+    text, tools, _usage, chat, end = _drive(h, tool_choice="none")
+
+    assert "completed result" in text
+    assert tools == []
+    assert chat._pending_tool_calls == {}
+    assert end is not None and end.error is None
+    events = []
+    while not metrics.empty():
+        events.append(metrics.get_nowait())
+    contract = [event for event in events if event.status == "tool_contract"]
+    assert len(contract) == 1
+    assert contract[0].detail == {
+        "operation": "post_tool",
+        "finish_reason_category": "other",
+        "assistant_text_length": len("The completed result is ready."),
+        "native_tool_fragment_count": 1,
+        "completed_call_count": 0,
+        "malformed_call_category": "native_call_disallowed",
+    }
+    rendered = json.dumps(contract[0].detail)
+    assert "private_tool" not in rendered
+    assert "private_id" not in rendered
 
 
 # ── Error propagation ─────────────────────────────────────────────────────────

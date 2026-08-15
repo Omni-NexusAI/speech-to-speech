@@ -97,6 +97,7 @@ class _Turn(BaseModel):
     turn_revision: int | None
     speech_stopped_at_s: float | None
     wants_audio: bool
+    tools_allowed: bool = True
 
 
 class _GenState(BaseModel):
@@ -109,6 +110,7 @@ class _GenState(BaseModel):
     clean_text: str = ""  # filtered text, retained for content-free length diagnostics
     input_tokens: int = 0
     output_tokens: int = 0
+    disallowed_tool_count: int = 0
 
 
 class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
@@ -349,6 +351,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
         Out-of-band turns never touch the default conversation, and a stale turn
         records nothing (it is not forwarded to the client either)."""
+        if not turn.tools_allowed:
+            state.disallowed_tool_count += 1
+            return
         state.tools.append(item)
         fc_item = RealtimeConversationItemFunctionCall(
             type="function_call",
@@ -549,6 +554,18 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                         )
                         first_output = False
                     yield output
+                if state.disallowed_tool_count:
+                    self._emit_model_metric(
+                        turn,
+                        "tool_contract",
+                        detail={
+                            "finish_reason_category": "other",
+                            "assistant_text_length": len(state.clean_text),
+                            "native_tool_fragment_count": state.disallowed_tool_count,
+                            "completed_call_count": 0,
+                            "malformed_call_category": "native_call_disallowed",
+                        },
+                    )
         except httpx.ReadTimeout:
             error_message = "Language model response timed out."
             self._emit_model_metric(
@@ -737,6 +754,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             turn_revision=turn_revision,
             speech_stopped_at_s=speech_stopped_at_s,
             wants_audio=wants_audio,
+            tools_allowed=not (isinstance(req_tool_choice, str) and req_tool_choice.casefold() == "none"),
         )
         operation: ModelOperationToken | None = None
         coordinator = getattr(self, "model_operations", None)

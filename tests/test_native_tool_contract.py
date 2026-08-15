@@ -131,6 +131,34 @@ def test_invalid_native_index_is_classified_without_retaining_its_value():
     assert secret_index not in detail.values()
 
 
+def test_unsupported_assistant_content_shape_cannot_false_pass_with_a_native_call():
+    secret_content = {"text": "PRIVATE_PRINTED_CALL_SYNTAX"}
+    diagnostics = NativeToolStreamDiagnostics(tool_choice="required")
+    diagnostics.observe_choice(
+        _choice(
+            content=secret_content,
+            tool_calls=[
+                {
+                    "index": 0,
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+            finish_reason="tool_calls",
+        )
+    )
+
+    detail = diagnostics.finalize(
+        {0: {"name": "lookup", "args": "{}", "id": ""}},
+        completed_call_count=0,
+    )
+
+    assert diagnostics.native_calls_allowed is False
+    assert detail["assistant_text_length"] == 0
+    assert detail["malformed_call_category"] == "native_fragment_shape"
+    assert "PRIVATE_PRINTED_CALL_SYNTAX" not in repr(diagnostics)
+    assert "PRIVATE_PRINTED_CALL_SYNTAX" not in detail.values()
+
+
 def test_tool_result_continuation_with_tools_disabled_is_plain_text_only():
     diagnostics = NativeToolStreamDiagnostics(tool_choice="none")
     diagnostics.observe_choice(_choice(content="The result is ready."))
@@ -145,6 +173,30 @@ def test_tool_result_continuation_with_tools_disabled_is_plain_text_only():
         "completed_call_count": 0,
         "malformed_call_category": "none",
     }
+
+
+def test_tools_disabled_classifies_named_native_call_as_disallowed_before_conversion():
+    diagnostics = NativeToolStreamDiagnostics(tool_choice="none")
+    diagnostics.observe_choice(
+        _choice(
+            tool_calls=[
+                {
+                    "index": 0,
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+            finish_reason="tool_calls",
+        )
+    )
+
+    detail = diagnostics.finalize(
+        {0: {"name": "lookup", "args": "{}", "id": ""}},
+        completed_call_count=0,
+    )
+
+    assert diagnostics.native_calls_allowed is False
+    assert detail["completed_call_count"] == 0
+    assert detail["malformed_call_category"] == "native_call_disallowed"
 
 
 def test_required_choice_without_native_call_is_content_free_failure_category():
