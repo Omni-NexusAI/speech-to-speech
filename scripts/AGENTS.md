@@ -82,6 +82,14 @@
   responses, tool names/arguments/results, endpoint/model identity, or keys;
   public evidence is limited to counts, bounded categories, timings, and
   pass/fail.
+- Use `probe_direct_audio_isolation.py` only for the fixed RAM-only model-level
+  isolation matrix. It synthesizes each English, Spanish, German, and Japanese
+  fixture once in memory, then compares fresh versus deliberately wrong
+  semantic history under short and production payload envelopes. It resolves
+  the managed target before any remote credential read, sends one non-streaming
+  primary request per cell, wipes audio/payload/response buffers, and emits
+  aggregate shape, exact-label, correction, and timing counts only. It does not
+  replay the managed WebSocket/VAD path, invoke TTS, retry, or mutate a session.
 - Managed startup validates only Python and repository configuration. Missing
   Gemma or TTS services are status warnings; the launcher never inspects,
   starts, stops, or restarts model containers.

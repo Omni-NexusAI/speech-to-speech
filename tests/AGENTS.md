@@ -25,6 +25,12 @@
   success and failure output contains only bounded counts/categories/timings
   and pass/fail, with no fixture text, response content, tool data,
   endpoint/model identity, credentials, retries, or execution recovery.
+- Direct-audio isolation-probe tests must prove one in-memory synthesis pass,
+  four fixed language fixtures, fresh/wrong-history and short/production arms,
+  exactly one audio-only non-streaming request per cell, production serializer
+  reuse without live-session mutation, buffer wiping, redirect-safe target and
+  credential ordering, and aggregate-only success/failure output. They must
+  report managed-pipeline replay as zero rather than implying browser/VAD proof.
 - Reject missing, non-string, wrong-type, and extra tool arguments before execution without echoing raw values. Preserve normal output/image/single-`response.create` ordering.
 - Browser-search tests must cover canonical optional mode/freshness defaults, Serper web/news and qdr mapping, auto-news-only same-filter fallback with explicit news staying empty, versioned bounded results with truthful dates/sources, no false retrieval-date freshness, one narrower refinement only, first-result search-only automatic choice, tool-disabled terminal/non-search follow-ups, reset boundaries, exact output/image/create order, and content-free failures/diagnostics. Shared voice-prompt tests must reject the old noisy-input, one-tool, and speak-when-unsure shortcuts; direct-audio tests must prove exact reuse of the shared semantic-input/search/reference policy.
 - Give every real camera invocation a distinct visible generation/card, including unavailable captures. Browser coverage must carry bounded content-free accepted-turn, response, item, call, card, capture-generation, capture-status, and output-acknowledgement identities across requested, captured, unavailable, acknowledged, and rejected states; repeated call IDs stay distinct, while absent or malformed optional IDs remain safe and visible as missing. Follow-ups asking about the current view or changes require a fresh snapshot rather than silently reusing an old frame.
