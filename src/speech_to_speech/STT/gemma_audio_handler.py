@@ -701,6 +701,10 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         has_provisional_previous_audio = False
         chat = getattr(runtime_config, "chat", None)
         if chat is not None and callable(getattr(chat, "copy", None)):
+            # Read the one-shot cache before taking the Chat lock in copy().
+            # Accepted-turn mutations use the opposite order, so nesting the
+            # two locks here could deadlock a concurrent cumulative revision.
+            provisional = self._provisional_history_audio(vad_audio)
             history_chat = chat.copy()
             owned = self._owned_user_context(vad_audio)
             if owned is not None:
@@ -708,7 +712,6 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 # current semantic turn, even while a newer cumulative revision
                 # replaces the persistent anchor.
                 history_chat.remove_user_message(owned[0])
-            provisional = self._provisional_history_audio(vad_audio)
             if provisional is not None:
                 has_provisional_previous_audio = history_chat.replace_user_message_with_audio_for_snapshot(*provisional)
             history = [
@@ -1242,6 +1245,11 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             return False
         transcript = self._validate_transcript(transcript)
         user_memory = None if transcript else self._validate_user_memory(user_memory)
+        key = self._turn_key(vad_audio)
+        revision = self._turn_revision(vad_audio)
+        with self._accepted_user_lock:
+            accepted = self._accepted_user_audio.get(key)
+            rollback_audio = accepted[0] if accepted is not None and accepted[1] == revision else None
         user_item_id = self._ensure_user_context(vad_audio, transcript, user_memory)
         if user_item_id is None:
             self._emit_history_metric(vad_audio, "response_uncommitted", input_kind="missing", committed=False)
@@ -1257,9 +1265,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             )
             for tool in tools
         ]
-        key = self._turn_key(vad_audio)
         scope = self._history_scope_key(vad_audio)
-        revision = self._turn_revision(vad_audio)
         with self._accepted_user_lock:
             owned = self._accepted_user_items.get(key)
             if owned != (user_item_id, revision):
@@ -1268,7 +1274,15 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             # Keep ownership validation and assistant/tool persistence in one
             # transaction. A newer cumulative revision cannot claim the anchor
             # between these two operations and receive a stale response.
-            chat.commit_assistant_response(user_item_id, assistant_text, function_calls)
+            try:
+                chat.commit_assistant_response(user_item_id, assistant_text, function_calls)
+            except Exception:
+                # Model metadata is provisional until the response-side
+                # transaction validates. Restore the admitted WAV so a failed
+                # call cannot leave an unbacked semantic guess in history.
+                if rollback_audio is not None:
+                    chat.replace_user_message_audio(user_item_id, rollback_audio)
+                raise
             # Keep unresolved function-call pairs intact; the normal tool
             # follow-up path trims after its final assistant response commits.
             if not tools:

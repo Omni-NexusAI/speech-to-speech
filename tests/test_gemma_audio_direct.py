@@ -1914,6 +1914,38 @@ def test_provisional_wav_cache_is_isolated_by_session_and_chat():
     assert len(handler._provisional_user_audio) == 1
 
 
+def test_failed_response_transaction_restores_audio_instead_of_leaving_provisional_memory(monkeypatch):
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
+    chat = Chat(30)
+    runtime = RuntimeConfig(chat=chat)
+    runtime.local_pipeline["_session_id"] = "session_failed_response_transaction"
+    vad_audio = SimpleNamespace(runtime_config=runtime, turn_id="failed-response", turn_revision=0)
+    encoded = _encoded_silence(handler, 1600)
+    user_item_id = handler._commit_accepted_audio(vad_audio, encoded)
+
+    def fail_commit(*_args, **_kwargs):
+        raise RuntimeError("response transaction rejected")
+
+    monkeypatch.setattr(chat, "commit_assistant_response", fail_commit)
+    with pytest.raises(RuntimeError, match="transaction rejected"):
+        handler._commit_context(
+            vad_audio,
+            None,
+            "A response that must not commit.",
+            [],
+            user_memory="A provisional interpretation that must roll back.",
+        )
+
+    assert chat.buffer[0].id == user_item_id
+    assert [part.type for part in chat.buffer[0].content] == ["input_audio"]
+    assert chat.buffer[0].content[0].audio == encoded
+    assert handler._provisional_user_audio == {}
+    assert handler._accepted_user_audio[handler._turn_key(vad_audio)] == (encoded, 0)
+    handler._finish_user_context(vad_audio)
+    assert [part.type for part in chat.buffer[0].content] == ["input_audio"]
+
+
 def test_valid_primary_transcript_replaces_session_audio_anchor():
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
