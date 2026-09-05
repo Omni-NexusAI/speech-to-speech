@@ -11,9 +11,10 @@ Model supports 8 languages with multiple voices per language.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from sys import platform
 from threading import Event
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 import numpy as np
 from rich.console import Console
@@ -22,6 +23,7 @@ from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.handler_types import TTSIn, TTSOut
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, EndOfResponse
+from speech_to_speech.pipeline.response_ownership import response_output_allowed
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 from speech_to_speech.utils.mlx_lock import MLXLockContext
 
@@ -71,6 +73,16 @@ KOKORO_LANG_DEFAULT_VOICES = {
     "p": "pf_dora",  # Portuguese female
     "z": "zf_xiaobei",  # Chinese female
 }
+
+
+@dataclass(frozen=True)
+class KokoroSynthesisSnapshot:
+    """Immutable voice/language/speed selection for one assistant response."""
+
+    key: tuple[object, ...]
+    voice: str
+    lang_code: str
+    speed: float
 
 
 class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
@@ -240,76 +252,147 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
         """
         speculative_turns = getattr(self, "speculative_turns", None)
         if isinstance(tts_input, EndOfResponse):
-            if speculative_turns and not speculative_turns.is_latest_after_reopen_grace(
-                tts_input.turn_id,
-                tts_input.turn_revision,
+            # A terminal is the response-scoped lifetime boundary even when
+            # ownership has already been invalidated.  Release before the
+            # admission check so stale/cancelled terminals cannot retain a
+            # voice snapshot for the rest of a long session.
+            self._release_response_synthesis_snapshot(tts_input)
+            if not response_output_allowed(
+                runtime_config=getattr(tts_input, "runtime_config", None),
+                response_epoch=tts_input.response_epoch,
+                turn_id=tts_input.turn_id,
+                turn_revision=tts_input.turn_revision,
+                speculative_turns=speculative_turns,
+                cancel_scope=getattr(self, "cancel_scope", None),
             ):
                 return
             yield AUDIO_RESPONSE_DONE
             return
 
-        if speculative_turns and not speculative_turns.is_latest_after_reopen_grace(
-            tts_input.turn_id,
-            tts_input.turn_revision,
+        if not response_output_allowed(
+            runtime_config=tts_input.runtime_config,
+            response_epoch=tts_input.response_epoch,
+            turn_id=tts_input.turn_id,
+            turn_revision=tts_input.turn_revision,
+            speculative_turns=speculative_turns,
+            cancel_scope=getattr(self, "cancel_scope", None),
         ):
             logger.debug("Dropping stale TTS input for turn=%s rev=%s", tts_input.turn_id, tts_input.turn_revision)
+            self._release_response_synthesis_snapshot(tts_input)
             return
         if speculative_turns:
             speculative_turns.commit(tts_input.turn_id, tts_input.turn_revision)
 
-        runtime_config = tts_input.runtime_config
-        response = tts_input.response
-        language_code = tts_input.language_code
+        def response_is_current() -> bool:
+            return response_output_allowed(
+                runtime_config=tts_input.runtime_config,
+                response_epoch=tts_input.response_epoch,
+                turn_id=tts_input.turn_id,
+                turn_revision=tts_input.turn_revision,
+                speculative_turns=speculative_turns,
+                cancel_scope=getattr(self, "cancel_scope", None),
+            )
+
         text = tts_input.text
+        snapshot = self._response_synthesis_snapshot(tts_input)
 
-        voice: Optional[str] = None
-        if response and response.audio and response.audio.output and response.audio.output.voice:
-            voice = str(response.audio.output.voice)
-        if not voice and runtime_config:
-            audio_cfg = runtime_config.session.audio
-            audio_output = audio_cfg.output if audio_cfg is not None else None
-            voice = str(audio_output.voice) if audio_output is not None and audio_output.voice else None
-        if voice:
-            self.voice = voice
+        try:
+            if self.backend == "mlx":
+                yield from self._process_mlx(text, snapshot, response_is_current)
+            else:
+                yield from self._process_kokoro(text, snapshot, response_is_current)
+        finally:
+            # Keep the frozen snapshot through normal multi-phrase synthesis,
+            # but release it when ownership became stale during a provider
+            # stream.  Normal completion is released by EndOfResponse.
+            if not response_is_current():
+                self._release_response_synthesis_snapshot(tts_input)
 
-        if self.backend == "mlx":
-            yield from self._process_mlx(text, language_code)
-        else:
-            yield from self._process_kokoro(text, language_code)
+    @staticmethod
+    def _snapshot_key(tts_input: TTSIn) -> tuple[object, ...]:
+        if tts_input.response_epoch is not None:
+            return ("response_epoch", int(tts_input.response_epoch))
+        if tts_input.response_id:
+            return ("response_id", str(tts_input.response_id))
+        return ("legacy", tts_input.turn_id, tts_input.turn_revision, tts_input.cancel_generation)
 
-    def _process_mlx(self, llm_sentence: str, language_code: Optional[str] = None) -> Iterator[np.ndarray]:
+    def _release_response_synthesis_snapshot(self, tts_input: TTSIn | EndOfResponse) -> None:
+        """Release only one response's immutable synthesis settings."""
+
+        snapshots = getattr(self, "_response_synthesis_snapshots", None)
+        if isinstance(snapshots, dict):
+            snapshots.pop(self._snapshot_key(tts_input), None)
+
+    def _response_synthesis_snapshot(self, tts_input: TTSIn) -> KokoroSynthesisSnapshot:
+        """Freeze settings on the first phrase instead of rereading live UI state."""
+
+        snapshots = getattr(self, "_response_synthesis_snapshots", None)
+        if snapshots is None:
+            snapshots = self._response_synthesis_snapshots = {}
+        key = self._snapshot_key(tts_input)
+        existing = snapshots.get(key)
+        if existing is not None:
+            return existing
+
+        response = tts_input.response
+        runtime_config = tts_input.runtime_config
+        admission: dict[str, Any] | None = None
+        configured = getattr(runtime_config, "response_synthesis_configs", None)
+        if isinstance(configured, dict) and tts_input.response_epoch is not None:
+            candidate = configured.get(tts_input.response_epoch)
+            admission = candidate if isinstance(candidate, dict) else None
+        admission_has_voice = isinstance(admission, dict) and "voice" in admission
+        voice = admission.get("voice") if admission_has_voice else None
+        if not admission_has_voice:
+            if response and response.audio and response.audio.output and response.audio.output.voice:
+                voice = str(response.audio.output.voice)
+            if not voice and runtime_config:
+                audio_cfg = runtime_config.session.audio
+                audio_output = audio_cfg.output if audio_cfg is not None else None
+                voice = str(audio_output.voice) if audio_output is not None and audio_output.voice else None
+        lang_code = WHISPER_LANGUAGE_TO_KOKORO_LANG.get(tts_input.language_code or "", self.lang_code)
+        # Preserve the legacy language-default fallback only when no response
+        # voice was supplied; subsequent phrases keep this same resolved voice.
+        resolved_voice = str(voice) if voice else (
+            KOKORO_LANG_DEFAULT_VOICES.get(lang_code, self.voice) if lang_code != self.lang_code else self.voice
+        )
+        snapshot = KokoroSynthesisSnapshot(
+            key=key,
+            voice=resolved_voice,
+            lang_code=lang_code,
+            speed=float(self.speed),
+        )
+        snapshots[key] = snapshot
+        return snapshot
+
+    def _process_mlx(
+        self,
+        llm_sentence: str,
+        snapshot: KokoroSynthesisSnapshot,
+        response_is_current: Callable[[], bool] | None = None,
+    ) -> Iterator[np.ndarray]:
         """Process using MLX backend with Apple Silicon optimizations."""
         from scipy.signal import resample_poly
 
         gen = self.cancel_scope.generation if self.cancel_scope else None
         with MLXLockContext(handler_name="KokoroTTS", timeout=10.0):
-            if language_code is not None:
-                new_lang_code = WHISPER_LANGUAGE_TO_KOKORO_LANG.get(language_code, self.lang_code)
-                if new_lang_code != self.lang_code:
-                    new_voice = KOKORO_LANG_DEFAULT_VOICES.get(new_lang_code, self.voice)
-                    logger.info(
-                        f"Language change detected: {self.lang_code} -> {new_lang_code}, voice: {self.voice} -> {new_voice}"
-                    )
-                    try:
-                        new_pipeline = self.model._get_pipeline(new_lang_code)
-                        new_voice_tensor = new_pipeline.load_voice(new_voice)
-                        self.lang_code = new_lang_code
-                        self.voice = new_voice
-                        self._pipeline = new_pipeline
-                        self._voice_tensor = new_voice_tensor
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to switch language/voice: {e}. Keeping current language: {self.lang_code}"
-                        )
+            pipeline = self._pipeline
+            if snapshot.lang_code != self.lang_code:
+                try:
+                    pipeline = self.model._get_pipeline(snapshot.lang_code)
+                    pipeline.load_voice(snapshot.voice)
+                except Exception as e:
+                    logger.warning("Failed to prepare frozen Kokoro language/voice: %s", e)
+                    return
 
             console.print(f"[green]ASSISTANT: {llm_sentence}")
 
             # Generate audio using the preloaded pipeline directly
             # This avoids the voice reload that happens in model.generate()
-            for result in self._pipeline(
+            for result in pipeline(
                 text=llm_sentence,
-                voice=self.voice,
-                speed=self.speed,
+                voice=snapshot.voice,
+                speed=snapshot.speed,
             ):
                 if result.audio is None:
                     continue
@@ -341,7 +424,9 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
 
                 # Yield audio in fixed-size chunks
                 for i in range(0, len(audio), self.blocksize):
-                    if gen is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(gen):
+                    if (response_is_current is not None and not response_is_current()) or (
+                        gen is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(gen)
+                    ):
                         logger.info("TTS generation cancelled (interruption)")
                         return
                     chunk = audio[i : i + self.blocksize]
@@ -351,29 +436,27 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
                     logger.debug(f"TTS yielding audio chunk: {len(chunk)} samples")
                     yield chunk
 
-    def _process_kokoro(self, llm_sentence: str, language_code: Optional[str] = None) -> Iterator[np.ndarray]:
+    def _process_kokoro(
+        self,
+        llm_sentence: str,
+        snapshot: KokoroSynthesisSnapshot,
+        response_is_current: Callable[[], bool] | None = None,
+    ) -> Iterator[np.ndarray]:
         """Process using native kokoro library."""
         from scipy.signal import resample_poly
 
         gen = self.cancel_scope.generation if self.cancel_scope else None
-        if language_code is not None:
-            new_lang_code = WHISPER_LANGUAGE_TO_KOKORO_LANG.get(language_code, self.lang_code)
-            if new_lang_code != self.lang_code:
-                new_voice = KOKORO_LANG_DEFAULT_VOICES.get(new_lang_code, self.voice)
-                logger.info(
-                    f"Language change detected: {self.lang_code} -> {new_lang_code}, voice: {self.voice} -> {new_voice}"
-                )
-                self.lang_code = new_lang_code
-                self.voice = new_voice
-                from kokoro import KPipeline
+        pipeline = self.pipeline
+        if snapshot.lang_code != self.lang_code:
+            from kokoro import KPipeline
 
-                self.pipeline = KPipeline(lang_code=self.lang_code)
+            pipeline = KPipeline(lang_code=snapshot.lang_code)
 
         console.print(f"[green]ASSISTANT: {llm_sentence}")
 
         # Generate audio using Kokoro
         # The pipeline yields tuples of (graphemes, phonemes, audio)
-        for gs, ps, audio in self.pipeline(llm_sentence, voice=self.voice, speed=self.speed):
+        for gs, ps, audio in pipeline(llm_sentence, voice=snapshot.voice, speed=snapshot.speed):
             if audio is None:
                 continue
 
@@ -393,7 +476,9 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
 
             # Yield audio in fixed-size chunks
             for i in range(0, len(audio), self.blocksize):
-                if gen is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(gen):
+                if (response_is_current is not None and not response_is_current()) or (
+                    gen is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(gen)
+                ):
                     logger.info("TTS generation cancelled (interruption)")
                     return
                 chunk = audio[i : i + self.blocksize]
@@ -403,6 +488,7 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
                 yield chunk
 
     def on_session_end(self) -> None:
+        self._response_synthesis_snapshots = {}
         self.voice = self._initial_voice
         self.lang_code = self._initial_lang_code
         if self.backend == "mlx":

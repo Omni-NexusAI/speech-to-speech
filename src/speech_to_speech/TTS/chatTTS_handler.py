@@ -14,6 +14,7 @@ from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.handler_types import TTSIn, TTSOut
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, EndOfResponse
+from speech_to_speech.pipeline.response_ownership import response_output_allowed
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 
 logging.basicConfig(
@@ -57,22 +58,40 @@ class ChatTTSHandler(BaseHandler[TTSIn, TTSOut]):
     def process(self, tts_input: TTSIn) -> Iterator[TTSOut]:
         speculative_turns = getattr(self, "speculative_turns", None)
         if isinstance(tts_input, EndOfResponse):
-            if speculative_turns and not speculative_turns.is_latest_after_reopen_grace(
-                tts_input.turn_id,
-                tts_input.turn_revision,
+            if not response_output_allowed(
+                runtime_config=getattr(tts_input, "runtime_config", None),
+                response_epoch=tts_input.response_epoch,
+                turn_id=tts_input.turn_id,
+                turn_revision=tts_input.turn_revision,
+                speculative_turns=speculative_turns,
+                cancel_scope=getattr(self, "cancel_scope", None),
             ):
                 return
             yield AUDIO_RESPONSE_DONE
             return
 
-        if speculative_turns and not speculative_turns.is_latest_after_reopen_grace(
-            tts_input.turn_id,
-            tts_input.turn_revision,
+        if not response_output_allowed(
+            runtime_config=tts_input.runtime_config,
+            response_epoch=tts_input.response_epoch,
+            turn_id=tts_input.turn_id,
+            turn_revision=tts_input.turn_revision,
+            speculative_turns=speculative_turns,
+            cancel_scope=getattr(self, "cancel_scope", None),
         ):
             logger.debug("Dropping stale TTS input for turn=%s rev=%s", tts_input.turn_id, tts_input.turn_revision)
             return
         if speculative_turns:
             speculative_turns.commit(tts_input.turn_id, tts_input.turn_revision)
+
+        def response_is_current() -> bool:
+            return response_output_allowed(
+                runtime_config=tts_input.runtime_config,
+                response_epoch=tts_input.response_epoch,
+                turn_id=tts_input.turn_id,
+                turn_revision=tts_input.turn_revision,
+                speculative_turns=speculative_turns,
+                cancel_scope=getattr(self, "cancel_scope", None),
+            )
 
         text = tts_input.text
 
@@ -92,9 +111,12 @@ class ChatTTSHandler(BaseHandler[TTSIn, TTSOut]):
             wavs = [np.array([])]
             for gen in wavs_gen:
                 if (
-                    _cancel_gen is not None
-                    and self.cancel_scope is not None
-                    and self.cancel_scope.is_stale(_cancel_gen)
+                    not response_is_current()
+                    or (
+                        _cancel_gen is not None
+                        and self.cancel_scope is not None
+                        and self.cancel_scope.is_stale(_cancel_gen)
+                    )
                 ):
                     logger.info("TTS generation cancelled (interruption)")
                     return
@@ -103,8 +125,12 @@ class ChatTTSHandler(BaseHandler[TTSIn, TTSOut]):
                 audio_chunk = librosa.resample(gen[0], orig_sr=24000, target_sr=16000)
                 audio_chunk = (audio_chunk * 32768).astype(np.int16)[0]
                 while len(audio_chunk) > self.chunk_size:
+                    if not response_is_current():
+                        return
                     yield audio_chunk[: self.chunk_size]  # Return the first chunk_size samples of the audio data
                     audio_chunk = audio_chunk[self.chunk_size :]  # Remove the samples that have already been returned
+                if not response_is_current():
+                    return
                 yield np.pad(audio_chunk, (0, self.chunk_size - len(audio_chunk)))
         else:
             wavs = wavs_gen
@@ -113,6 +139,8 @@ class ChatTTSHandler(BaseHandler[TTSIn, TTSOut]):
             audio_chunk = librosa.resample(wavs[0], orig_sr=24000, target_sr=16000)
             audio_chunk = (audio_chunk * 32768).astype(np.int16)
             for i in range(0, len(audio_chunk), self.chunk_size):
+                if not response_is_current():
+                    return
                 yield np.pad(
                     audio_chunk[i : i + self.chunk_size],
                     (0, self.chunk_size - len(audio_chunk[i : i + self.chunk_size])),

@@ -1,0 +1,34 @@
+import assert from "node:assert/strict";
+globalThis.CustomEvent = class extends Event {
+  constructor(type, init = {}) { super(type); this.detail = init.detail; }
+};
+const { S2sWsRealtimeClient } = await import("../web/hf-realtime-voice/ws/s2s-ws-client.js");
+const client = new S2sWsRealtimeClient({});
+const posted = [];
+client._playbackNode = { port: { postMessage: message => posted.push(message) } };
+client._send = () => {};
+const dispatch = event => client._onWsMessage(JSON.stringify(event));
+await dispatch({ type: "response.created", response: { id: "failed-answer" }, response_epoch: 41 });
+await dispatch({ type: "pipeline.response", response_id: "failed-answer", input_epoch: 41, response_epoch: 41 });
+await dispatch({ type: "response.audio.delta", response_id: "failed-answer", response_epoch: 41, delta: "AAAAAA==" });
+assert.equal(posted.length, 1);
+await dispatch({ type: "pipeline.metric", stage: "tts", status: "runaway_aborted", response_id: "failed-answer", response_epoch: 41 });
+assert.equal(posted.at(-1).kind, "clear", "failure must clear before the following output_audio.done can prime playback");
+await dispatch({ type: "response.output_audio.done", response_id: "failed-answer", response_epoch: 41 });
+await dispatch({ type: "response.done", response: { id: "failed-answer", status: "failed" }, response_epoch: 41 });
+assert.equal(posted.at(-1).kind, "clear");
+assert.equal(posted.at(-1).reason, "response-failed");
+assert.equal(posted.filter(item => item.kind === "end").length, 0, "failed PCM must not be flushed as a completed clip");
+const afterFailure = posted.length;
+await dispatch({ type: "response.audio.delta", response_id: "failed-answer", response_epoch: 41, delta: "AAAAAA==" });
+assert.equal(posted.length, afterFailure, "failed epoch stays tombstoned");
+await dispatch({ type: "response.created", response: { id: "next-answer" }, response_epoch: 42 });
+await dispatch({ type: "pipeline.response", response_id: "next-answer", input_epoch: 42, response_epoch: 42 });
+await dispatch({ type: "response.audio.delta", response_id: "next-answer", response_epoch: 42, delta: "AAAAAA==" });
+assert.equal(posted.at(-1).responseEpoch, 42);
+assert.equal(posted.at(-1).samples.length, 2);
+const afterNext = posted.length;
+await dispatch({ type: "pipeline.metric", stage: "tts", status: "failed", response_id: "failed-answer", response_epoch: 41 });
+await dispatch({ type: "response.done", response: { id: "failed-answer", status: "failed" }, response_epoch: 41 });
+assert.equal(posted.length, afterNext, "late old failure must not clear successor PCM");
+console.log("exact-response TTS failure playback tests passed");

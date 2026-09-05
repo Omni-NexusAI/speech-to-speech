@@ -296,7 +296,10 @@ def _vad_handler_for_iterator(iterator: _StaticVADIterator) -> VADHandler:
     handler._speculative_audio_prefix = None
     handler._last_final_wall_time = None
     handler._last_final_audio_ms = None
-    handler._pending_reopen_candidate = None
+    handler._reopen_anchor_audio_ms = None
+    handler._last_forced_new_turn_reason = None
+    handler.max_speculative_revisions = 8
+    handler.max_speculative_audio_ms = 30000
     handler.short_segment_merge_ms = 0
     handler._pending_short_segment = None
     return handler
@@ -329,7 +332,7 @@ def test_vad_interruption_uses_active_speech_duration_not_padded_segment():
     assert handler._speech_started_emitted is False
 
 
-def test_vad_pending_reopen_starts_before_active_speech_threshold():
+def test_vad_sub_threshold_continuation_does_not_create_pending_reopen():
     chunks = [torch.zeros(512) for _ in range(12)]
     iterator = _StaticVADIterator(
         triggered=True,
@@ -344,12 +347,13 @@ def test_vad_pending_reopen_starts_before_active_speech_threshold():
     handler._current_turn_id = "turn_1"
     handler._current_turn_revision = 0
     handler._last_final_audio_ms = 0
+    handler._reopen_anchor_audio_ms = 0
 
     assert list(handler.process(_audio_bytes())) == []
 
-    assert tracker.has_pending_reopen("turn_1", 0)
+    assert not tracker.has_pending_reopen("turn_1", 0)
     tracker.commit("turn_1", 0)
-    assert not tracker.is_committed("turn_1", 0)
+    assert tracker.is_committed("turn_1", 0)
     assert handler.text_output_queue.empty()
     assert handler._speech_started_emitted is False
 
@@ -587,6 +591,50 @@ def test_vad_new_turn_after_unanswered_cap():
     started = handler.text_output_queue.get_nowait()
     assert isinstance(started, SpeechStartedEvent)
     assert started.reopened is False
+
+
+def test_vad_reopen_horizon_is_anchored_to_first_soft_endpoint():
+    handler = _vad_handler_for_iterator(_StaticVADIterator(triggered=False, vad_output=None))
+    handler.unanswered_reopen_ms = 7000
+    outputs = _drive_final_segment(handler)
+    assert len(outputs) == 1
+    anchor_ms = handler._reopen_anchor_audio_ms
+    assert anchor_ms is not None
+
+    turn_id, revision, reopened = handler._ensure_turn_for_speech_start(anchor_ms + 6900)
+    assert (turn_id, revision, reopened) == ("turn_1", 1, True)
+    handler._last_final_audio_ms = anchor_ms + 6900
+
+    turn_id, revision, reopened = handler._ensure_turn_for_speech_start(anchor_ms + 7100)
+    assert (turn_id, revision, reopened) == ("turn_2", 0, False)
+
+
+def test_vad_reopen_revision_limit_forces_new_turn():
+    handler = _vad_handler_for_iterator(_StaticVADIterator(triggered=False, vad_output=None))
+    outputs = _drive_final_segment(handler)
+    assert len(outputs) == 1
+    anchor_ms = handler._reopen_anchor_audio_ms
+    assert anchor_ms is not None
+
+    for expected_revision in range(1, 9):
+        turn_id, revision, reopened = handler._ensure_turn_for_speech_start(anchor_ms + 100)
+        assert (turn_id, revision, reopened) == ("turn_1", expected_revision, True)
+
+    turn_id, revision, reopened = handler._ensure_turn_for_speech_start(anchor_ms + 100)
+    assert (turn_id, revision, reopened) == ("turn_2", 0, False)
+
+
+def test_vad_combined_audio_limit_forces_new_turn_without_dropping_prefix():
+    handler = _vad_handler_for_iterator(_StaticVADIterator(triggered=False, vad_output=None))
+    outputs = _drive_final_segment(handler)
+    assert len(outputs) == 1
+    anchor_ms = handler._reopen_anchor_audio_ms
+    assert anchor_ms is not None
+    handler._speculative_audio_prefix = np.zeros(handler.sample_rate * 30, dtype=np.float32)
+
+    turn_id, revision, reopened = handler._ensure_turn_for_speech_start(anchor_ms + 100)
+
+    assert (turn_id, revision, reopened) == ("turn_2", 0, False)
 
 
 def test_vad_does_not_hold_sub_floor_fragments():

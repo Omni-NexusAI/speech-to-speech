@@ -1,0 +1,381 @@
+// @ts-check
+
+import { AEC3_FRAME_MS, AEC3_OUTPUT_RATE, Aec3WasmSession } from "./aec3-abi.js";
+
+const DEFAULT_CHUNK_MS = 40;
+const GATE_ATTACK_MS = 5;
+const GATE_HOLD_MS = 250;
+const GATE_RELEASE_MS = 80;
+const REFERENCE_ACTIVE_RMS = 0.001;
+const DEFAULT_ECHO_TAIL_MS = 350;
+
+class FloatRing {
+  constructor(capacity) {
+    this.buffer = new Float32Array(capacity);
+    this.read = 0;
+    this.write = 0;
+    this.length = 0;
+  }
+
+  push(samples, count = samples?.length || 0) {
+    for (let index = 0; index < count; index += 1) {
+      if (this.length === this.buffer.length) {
+        this.read = (this.read + 1) % this.buffer.length;
+        this.length -= 1;
+      }
+      this.buffer[this.write] = samples && index < samples.length ? samples[index] : 0;
+      this.write = (this.write + 1) % this.buffer.length;
+      this.length += 1;
+    }
+  }
+
+  readInto(target) {
+    if (target.length > this.length) return false;
+    for (let index = 0; index < target.length; index += 1) {
+      target[index] = this.buffer[this.read];
+      this.read = (this.read + 1) % this.buffer.length;
+      this.length -= 1;
+    }
+    return true;
+  }
+
+  clear() {
+    this.read = 0;
+    this.write = 0;
+    this.length = 0;
+  }
+}
+
+function rms(samples) {
+  if (!samples.length) return 0;
+  let energy = 0;
+  for (let index = 0; index < samples.length; index += 1) energy += samples[index] * samples[index];
+  return Math.sqrt(energy / samples.length);
+}
+
+function clamp(value, minimum, maximum, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(minimum, Math.min(maximum, number)) : fallback;
+}
+
+class Aec3CaptureProcessor extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    const processorOptions = options?.processorOptions || {};
+    const chunkMs = clamp(processorOptions.chunkMs, 10, 100, DEFAULT_CHUNK_MS);
+    this._inputRate = sampleRate;
+    this._frameSamples = Math.floor(this._inputRate / 100);
+    this._chunkSamples = Math.round((AEC3_OUTPUT_RATE * chunkMs) / 1000);
+    this._micRing = new FloatRing(this._frameSamples * 8);
+    this._referenceRing = new FloatRing(this._frameSamples * 8);
+    this._micFrame = new Float32Array(this._frameSamples);
+    this._referenceFrame = new Float32Array(this._frameSamples);
+    this._resampled = new Float32Array(Math.floor(AEC3_OUTPUT_RATE / 100));
+    this._chunk = new Float32Array(this._chunkSamples);
+    this._chunkWrite = 0;
+    this._enabled = true;
+    this._requestedMode = "native";
+    this._effectiveMode = "native";
+    this._nativeAec = false;
+    this._moduleReady = false;
+    this._moduleError = "AEC3 module was not supplied";
+    this._session = null;
+    this._manifest = processorOptions.aec3Manifest || {};
+    this._processedSamples = 0;
+    this._metricFrames = 0;
+    this._suppressedMs = 0;
+    this._referenceTailSamples = 0;
+    this._lastMetrics = null;
+    this._lastPlaybackActive = false;
+    this._lastSuppressing = false;
+
+    this._calibration = {
+      delayMs: 0,
+      outputLatencyMs: 0,
+      suppressionStrength: 0.65,
+      leakageThreshold: 0.65,
+      doubleTalkSensitivity: 0.5,
+      echoTailMs: DEFAULT_ECHO_TAIL_MS,
+    };
+
+    this._gateEnabled = false;
+    this._thresholdLin = 0;
+    this._gateGain = 1;
+    this._holdRemaining = 0;
+    this._attackCoef = Math.exp(-1 / ((GATE_ATTACK_MS / 1000) * AEC3_OUTPUT_RATE));
+    this._releaseCoef = Math.exp(-1 / ((GATE_RELEASE_MS / 1000) * AEC3_OUTPUT_RATE));
+    this._holdSamples = Math.round((GATE_HOLD_MS / 1000) * AEC3_OUTPUT_RATE);
+
+    try {
+      if (!(processorOptions.aec3Module instanceof WebAssembly.Module)) {
+        throw new Error(this._moduleError);
+      }
+      const instance = new WebAssembly.Instance(processorOptions.aec3Module, {});
+      this._session = new Aec3WasmSession(instance.exports, this._inputRate);
+      this._moduleReady = true;
+      this._moduleError = "";
+    } catch (error) {
+      this._moduleReady = false;
+      this._moduleError = error instanceof Error ? error.message : String(error);
+    }
+
+    this.port.onmessage = (event) => this._onMessage(event.data);
+    this._postStatus();
+  }
+
+  _onMessage(data) {
+    if (!data || typeof data !== "object") return;
+    if (data.kind === "enable") {
+      this._enabled = !!data.value;
+    } else if (data.kind === "gate") {
+      this._gateEnabled = !!data.enabled;
+      this._thresholdLin = this._gateEnabled ? Math.pow(10, Number(data.thresholdDb) / 20) : 0;
+    } else if (data.kind === "echo_guard") {
+      const requested = data.mode === "off" ? "native" : data.mode;
+      this._requestedMode = ["native", "adaptive", "strict"].includes(requested)
+        ? requested
+        : "native";
+      this._nativeAec = !!data.nativeAec;
+      this._resolveMode();
+      this._postStatus();
+    } else if (data.kind === "echo_calibration") {
+      this._calibration = {
+        delayMs: clamp(data.delayMs, 0, 500, this._calibration.delayMs),
+        outputLatencyMs: clamp(data.outputLatencyMs, 0, 500, this._calibration.outputLatencyMs),
+        suppressionStrength: clamp(data.suppressionStrength, 0, 1, this._calibration.suppressionStrength),
+        leakageThreshold: clamp(data.leakageThreshold, 0.05, 1, this._calibration.leakageThreshold),
+        doubleTalkSensitivity: clamp(data.doubleTalkSensitivity, 0, 1, this._calibration.doubleTalkSensitivity),
+        echoTailMs: clamp(data.echoTailMs, 0, 1000, this._calibration.echoTailMs),
+      };
+      this._postStatus();
+    } else if (data.kind === "echo_reset") {
+      this._micRing.clear();
+      this._referenceRing.clear();
+      this._chunkWrite = 0;
+      this._referenceTailSamples = 0;
+      this._processedSamples = 0;
+      try {
+        this._session?.reset();
+      } catch (error) {
+        this._disableModule(error);
+      }
+      this._postStatus();
+    }
+  }
+
+  _resolveMode() {
+    if (this._requestedMode === "native") this._effectiveMode = "native";
+    else if (this._requestedMode === "adaptive") {
+      this._effectiveMode = this._moduleReady ? "adaptive" : "native";
+    } else {
+      this._effectiveMode = this._moduleReady ? "strict" : "strict-fallback";
+    }
+  }
+
+  _disableModule(error) {
+    try { this._session?.destroy(); } catch (_) {}
+    this._session = null;
+    this._moduleReady = false;
+    this._moduleError = error instanceof Error ? error.message : String(error);
+    this._resolveMode();
+    this.port.postMessage({ kind: "aec3_error", error: this._moduleError });
+  }
+
+  _postStatus() {
+    this.port.postMessage({
+      kind: "aec3_status",
+      available: this._moduleReady,
+      requestedMode: this._requestedMode,
+      effectiveMode: this._effectiveMode,
+      nativeAec: this._nativeAec,
+      referenceWired: true,
+      abiVersion: this._manifest.abiVersion || null,
+      engine: this._manifest.engine || null,
+      sourceRevision: this._manifest.sourceRevision || null,
+      frameMs: AEC3_FRAME_MS,
+      frameSamples: this._frameSamples,
+      delayMs: this._calibration.delayMs,
+      outputLatencyMs: this._calibration.outputLatencyMs,
+      error: this._moduleError,
+    });
+  }
+
+  _playbackState(reference) {
+    const referenceRms = rms(reference);
+    if (referenceRms >= REFERENCE_ACTIVE_RMS) {
+      this._referenceTailSamples = Math.round(
+        (this._calibration.echoTailMs / 1000) * this._inputRate,
+      );
+    } else {
+      this._referenceTailSamples = Math.max(0, this._referenceTailSamples - reference.length);
+    }
+    return {
+      referenceRms,
+      playbackActive: referenceRms >= REFERENCE_ACTIVE_RMS || this._referenceTailSamples > 0,
+    };
+  }
+
+  _strictShouldSuppress(playbackActive, metrics) {
+    if (!playbackActive) return false;
+    if (!this._moduleReady) return true;
+    if (metrics?.doubleTalk === true) return false;
+    const residual = metrics?.residualEchoLikelihood;
+    if (!Number.isFinite(residual)) return true;
+    const captureRms = Number(metrics?.captureRms);
+    const outputRms = Number(metrics?.outputRms);
+    const outputRatio = Number.isFinite(captureRms) && captureRms > 1e-6
+      && Number.isFinite(outputRms)
+      ? outputRms / captureRms
+      : 0;
+    const nearEndFloor = 0.65 - (0.5 * this._calibration.doubleTalkSensitivity);
+    if (outputRatio >= nearEndFloor && residual < 0.8) return false;
+    const strength = this._calibration.suppressionStrength;
+    const threshold = this._calibration.leakageThreshold * (1.2 - 0.7 * strength);
+    return residual >= threshold;
+  }
+
+  _resampleTo16k(input) {
+    const output = this._resampled;
+    const ratio = input.length / output.length;
+    if (Math.abs(ratio - 3) < 1e-6) {
+      for (let index = 0; index < output.length; index += 1) {
+        const source = index * 3;
+        output[index] = (input[source] + input[source + 1] + input[source + 2]) / 3;
+      }
+      return output;
+    }
+    for (let index = 0; index < output.length; index += 1) {
+      const sourcePosition = index * ratio;
+      const sourceIndex = Math.floor(sourcePosition);
+      const fraction = sourcePosition - sourceIndex;
+      const a = input[sourceIndex] || 0;
+      const b = input[Math.min(input.length - 1, sourceIndex + 1)] || a;
+      output[index] = a + (b - a) * fraction;
+    }
+    return output;
+  }
+
+  _appendOutput(frame, levelRms) {
+    const samples = this._resampleTo16k(frame);
+    for (let index = 0; index < samples.length; index += 1) {
+      this._chunk[this._chunkWrite] = samples[index];
+      this._chunkWrite += 1;
+      if (this._chunkWrite === this._chunk.length) {
+        this._emitChunk(levelRms);
+        this._chunkWrite = 0;
+      }
+    }
+  }
+
+  _emitChunk(levelRms) {
+    let target = 1;
+    if (this._gateEnabled) {
+      if (levelRms >= this._thresholdLin) this._holdRemaining = this._holdSamples;
+      else if (this._holdRemaining > 0) this._holdRemaining -= this._chunk.length;
+      else target = 0;
+    }
+    const output = new Int16Array(this._chunk.length);
+    let gain = this._gateGain;
+    for (let index = 0; index < this._chunk.length; index += 1) {
+      const coefficient = target > gain ? this._attackCoef : this._releaseCoef;
+      gain = target + (gain - target) * coefficient;
+      const sample = Math.max(-1, Math.min(1, this._chunk[index] * gain));
+      output[index] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+    }
+    this._gateGain = gain;
+    if (this._enabled) this.port.postMessage(output.buffer, [output.buffer]);
+  }
+
+  _postMetric(captureRms, referenceRms, playbackActive, suppressing, metrics) {
+    this._metricFrames += 1;
+    if (this._metricFrames < 10) return;
+    this._metricFrames = 0;
+    const residual = Number.isFinite(metrics?.residualEchoLikelihood)
+      ? metrics.residualEchoLikelihood
+      : null;
+    this.port.postMessage({
+      kind: "echo_metric",
+      mode: this._effectiveMode,
+      requestedMode: this._requestedMode,
+      nativeAec: this._nativeAec,
+      moduleAvailable: this._moduleReady,
+      referenceWired: true,
+      referenceRms,
+      captureRms,
+      residual,
+      residualEnergy: Number.isFinite(metrics?.outputRms) ? metrics.outputRms ** 2 : null,
+      erleDb: metrics?.erleDb ?? null,
+      lagMs: metrics?.delayMs ?? null,
+      configuredDelayMs: this._calibration.delayMs + this._calibration.outputLatencyMs,
+      modelReady: this._moduleReady,
+      predictionConfidence: residual === null ? null : Math.max(0, Math.min(1, 1 - residual)),
+      candidateMs: 0,
+      suppressedMs: this._suppressedMs,
+      suppressing,
+      doubleTalk: metrics?.doubleTalk ?? null,
+      doubleTalkSource: metrics?.doubleTalkSource || null,
+      playbackActive,
+    });
+  }
+
+  _processFrame() {
+    const capture = this._micFrame;
+    const reference = this._referenceFrame;
+    const captureRms = rms(capture);
+    const { referenceRms, playbackActive } = this._playbackState(reference);
+    const timestampMs = (this._processedSamples / this._inputRate) * 1000;
+    this._processedSamples += this._frameSamples;
+    let output = capture;
+    let metrics = null;
+
+    if (this._effectiveMode === "adaptive" || this._effectiveMode === "strict") {
+      try {
+        const result = this._session.process(reference, capture, {
+          delayMs: this._calibration.delayMs + this._calibration.outputLatencyMs,
+          timestampMs,
+          strict: this._effectiveMode === "strict",
+        });
+        output = result.output;
+        metrics = result.metrics;
+      } catch (error) {
+        this._disableModule(error);
+        output = capture;
+      }
+    }
+
+    const suppressing = this._effectiveMode.startsWith("strict")
+      && this._strictShouldSuppress(playbackActive, metrics);
+    this._lastMetrics = metrics;
+    this._lastPlaybackActive = playbackActive;
+    this._lastSuppressing = suppressing;
+    if (suppressing) {
+      // Fail closed by omitting the 10 ms frame. Never substitute zero PCM.
+      this._suppressedMs += AEC3_FRAME_MS;
+    } else {
+      // Adaptive output is the real AEC3-processed capture. Native fallback is
+      // untouched browser-captured PCM. No NLMS/predictor residual is uploaded.
+      this._appendOutput(output, rms(output));
+    }
+    this.port.postMessage({ kind: "level", rms: captureRms });
+    this._postMetric(captureRms, referenceRms, playbackActive, suppressing, metrics);
+  }
+
+  process(inputs) {
+    const microphone = inputs[0]?.[0];
+    if (!microphone || microphone.length === 0) return true;
+    const reference = inputs[1]?.[0] || null;
+    this._micRing.push(microphone, microphone.length);
+    this._referenceRing.push(reference, microphone.length);
+    while (
+      this._micRing.length >= this._frameSamples
+      && this._referenceRing.length >= this._frameSamples
+    ) {
+      this._micRing.readInto(this._micFrame);
+      this._referenceRing.readInto(this._referenceFrame);
+      this._processFrame();
+    }
+    return true;
+  }
+}
+
+registerProcessor("aec3-capture", Aec3CaptureProcessor);

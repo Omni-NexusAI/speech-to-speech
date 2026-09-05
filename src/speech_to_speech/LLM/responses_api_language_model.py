@@ -24,6 +24,7 @@ from speech_to_speech.LLM.base_openai_compatible_language_model import (
     TextDelta,
     ToolCall,
     Usage,
+    _ModelOperationCancelled,
 )
 from speech_to_speech.LLM.chat import Chat
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn
@@ -93,9 +94,12 @@ class ResponsesApiModelHandler(BaseOpenAICompatibleHandler):
             optional_kwargs["tool_choice"] = req_tool_choice
         return optional_kwargs
 
-    def _request(self, api_input: Any, optional_kwargs: dict[str, Any]) -> Any:
-        return self.client.responses.create(
-            model=self.model_name,
+    def _request(self, api_input: Any, optional_kwargs: dict[str, Any], runtime_config: Any) -> Any:
+        client, model_name, _ = self._client_for(runtime_config)
+        if not self._set_active_client(client):
+            raise _ModelOperationCancelled()
+        return client.responses.create(
+            model=model_name,
             input=api_input,
             stream=self.stream,
             extra_body=self._extra_body,

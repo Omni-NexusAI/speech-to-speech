@@ -205,6 +205,8 @@ tempCodeRunnerFile.py
 
 # Ruff stuff:
 .ruff_cache/
+.runtime/
+.claude/.scratch/
 
 # PyPI configuration file
 .pypirc
@@ -223,6 +225,10 @@ __marimo__/
 .dmypy.json
 dmypy.json
 .pytest_cache/
+.pytest-*/
+.pytest_*/
+.audio-cpp-prefix-cache-build-check/
+.tmp_launcher_diff.txt
 .hypothesis/
 .coverage*
 .coverage

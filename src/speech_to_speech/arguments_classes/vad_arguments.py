@@ -70,7 +70,19 @@ class VADHandlerArguments:
     unanswered_reopen_ms: int = field(
         default=7000,
         metadata={
-            "help": "Sanity cap (ms) for reopening a soft-ended speculative turn that has not yet been answered by any assistant output. While a turn is uncommitted, resumed speech within this window reopens the same turn instead of starting a new one. Has no effect below speculative_reopen_ms."
+            "help": "Fixed continuation horizon (ms), anchored to the first soft endpoint, for an unanswered speculative turn. Later fragments do not extend this deadline."
+        },
+    )
+    max_speculative_revisions: int = field(
+        default=8,
+        metadata={
+            "help": "Maximum number of confirmed continuation revisions that may be appended to one unanswered turn."
+        },
+    )
+    max_speculative_audio_ms: int = field(
+        default=30000,
+        metadata={
+            "help": "Maximum combined audio duration (ms) that remains eligible for speculative continuation."
         },
     )
     short_segment_merge_ms: int = field(

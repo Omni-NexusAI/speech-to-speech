@@ -12,8 +12,10 @@ from __future__ import annotations
 import json
 import queue
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 
+import pytest
 from openai.types.realtime.conversation_item import (
     RealtimeConversationItemFunctionCall,
     RealtimeConversationItemFunctionCallOutput,
@@ -276,6 +278,69 @@ def test_streaming_text_and_usage():
     assert any(getattr(i, "role", None) == "assistant" for i in chat.buffer)
 
 
+def test_streaming_outputs_preserve_response_epoch_identity():
+    """Every output from one provider request belongs to one response owner."""
+    h = _make_handler(stream=True)
+    h.client.chat.completions.create = lambda **k: _FakeStream(
+        [
+            _chunk(content="Hallo."),
+            _chunk(usage=SimpleNamespace(prompt_tokens=12, completion_tokens=5)),
+        ]
+    )
+    chat = Chat(10)
+    chat.add_item(make_user_message("Hallo"))
+    runtime_config = RuntimeConfig(
+        chat=chat,
+        session=RealtimeSessionCreateRequest(type="realtime", instructions="Du bist ein Roboter."),
+    )
+    request = GenerateResponseRequest(
+        runtime_config=runtime_config,
+        language_code="de",
+        turn_id="turn_epoch",
+        turn_revision=2,
+        input_epoch=7,
+        response_epoch=11,
+        response_id="resp_epoch_11",
+    )
+
+    outputs = list(h.process(request))
+
+    assert any(isinstance(output, LLMResponseChunk) for output in outputs)
+    assert any(isinstance(output, TokenUsage) for output in outputs)
+    assert isinstance(outputs[-1], EndOfResponse)
+    for output in outputs:
+        assert output.input_epoch == 7
+        assert output.response_epoch == 11
+        assert output.response_id == "resp_epoch_11"
+
+
+def test_stale_epoch_cannot_commit_chat_after_final_admission_check():
+    """The tracker-owned history guard closes the final check/write race."""
+
+    @contextmanager
+    def reject_history(_epoch):
+        yield False
+
+    h = _make_handler(stream=True)
+    h.client.chat.completions.create = lambda **_kwargs: _FakeStream(
+        [_chunk(content="Do not retain me."), _chunk(usage=SimpleNamespace(prompt_tokens=4, completion_tokens=3))]
+    )
+    chat = Chat(10)
+    chat.add_item(make_user_message("superseded input"))
+    runtime_config = RuntimeConfig(
+        chat=chat,
+        session=RealtimeSessionCreateRequest(type="realtime", instructions="Be concise."),
+    )
+    runtime_config.local_pipeline["_response_epoch_is_current"] = lambda epoch: epoch == 31
+    runtime_config.local_pipeline["_response_epoch_history_transaction"] = reject_history
+    request = GenerateResponseRequest(runtime_config=runtime_config, response_epoch=31)
+
+    outputs = list(h.process(request))
+
+    assert not any(getattr(item, "role", None) == "assistant" for item in chat.buffer)
+    assert not any(isinstance(output, TokenUsage) for output in outputs)
+
+
 def test_streaming_tool_call_accumulates_arguments():
     h = _make_handler(stream=True)
     # Arguments arrive split across deltas, as real servers stream them.
@@ -512,6 +577,60 @@ def test_tool_choice_sent_without_tools():
     _drive(h, tool_choice="none")
     assert "tools" not in captured
     assert captured["tool_choice"] == "none"
+
+
+@pytest.mark.parametrize("stream_mode", [True, False])
+def test_tool_choice_none_drops_noncompliant_provider_call(stream_mode):
+    h = _make_handler(stream=stream_mode)
+    metrics = queue.Queue()
+    h.text_output_queue = metrics
+    if stream_mode:
+        h.client.chat.completions.create = lambda **_kwargs: _FakeStream(
+            [
+                _chunk(content="The completed result is ready."),
+                _chunk(tool_calls=[_tc_delta(0, id="private_id", name="private_tool", arguments="{}")]),
+            ]
+        )
+    else:
+        h.client.chat.completions.create = lambda **_kwargs: SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="The completed result is ready.",
+                        tool_calls=[
+                            SimpleNamespace(
+                                id="private_id",
+                                function=SimpleNamespace(name="private_tool", arguments="{}"),
+                            )
+                        ],
+                    )
+                )
+            ],
+            usage=None,
+        )
+
+    text, tools, _usage, chat, end = _drive(h, tool_choice="none")
+
+    assert "completed result" in text
+    assert tools == []
+    assert chat._pending_tool_calls == {}
+    assert end is not None and end.error is None
+    events = []
+    while not metrics.empty():
+        events.append(metrics.get_nowait())
+    contract = [event for event in events if event.status == "tool_contract"]
+    assert len(contract) == 1
+    assert contract[0].detail == {
+        "operation": "post_tool",
+        "finish_reason_category": "other",
+        "assistant_text_length": len("The completed result is ready."),
+        "native_tool_fragment_count": 1,
+        "completed_call_count": 0,
+        "malformed_call_category": "native_call_disallowed",
+    }
+    rendered = json.dumps(contract[0].detail)
+    assert "private_tool" not in rendered
+    assert "private_id" not in rendered
 
 
 # ── Error propagation ─────────────────────────────────────────────────────────

@@ -1,0 +1,1133 @@
+import asyncio
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+
+def _load_ui_server_module():
+    ui_dir = Path(__file__).resolve().parents[1] / "web" / "hf-realtime-voice"
+    sys.path.insert(0, str(ui_dir))
+    try:
+        spec = importlib.util.spec_from_file_location("hf_realtime_voice_server", ui_dir / "server.py")
+        module = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        try:
+            sys.path.remove(str(ui_dir))
+        except ValueError:
+            pass
+
+
+def test_load_base_clone_profiles_filters_to_base_profiles(tmp_path):
+    server = _load_ui_server_module()
+    profiles = tmp_path / "profiles"
+    base = profiles / "16d9bb336799"
+    custom = profiles / "not-base"
+    base.mkdir(parents=True)
+    custom.mkdir()
+    (base / "meta.json").write_text(
+        json.dumps(
+            {
+                "profile_id": "16d9bb336799",
+                "name": "J.A.R.V.I.S",
+                "task_type": "Base",
+                "created_at": "2026-05-28T05:29:38Z",
+                "ref_text": "Systems are now fully operational.",
+                "language": "Auto",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (custom / "meta.json").write_text(
+        json.dumps({"profile_id": "custom", "name": "Vivian", "task_type": "CustomVoice"}),
+        encoding="utf-8",
+    )
+
+    voices = server._load_base_clone_profiles(tmp_path)
+
+    assert voices == [
+        {
+            "id": "16d9bb336799",
+            "voice": "clone:16d9bb336799",
+            "name": "J.A.R.V.I.S",
+            "task_type": "Base",
+            "created_at": "2026-05-28T05:29:38Z",
+            "ref_text": "Systems are now fully operational.",
+            "language": "Auto",
+        }
+    ]
+
+
+def test_audio_cpp_inventory_matches_candidate_live_backend_without_cross_filtering(tmp_path, monkeypatch):
+    server = _load_ui_server_module()
+    _base_profile(tmp_path, "16d9bb336799")
+    _base_profile(tmp_path, "47a4e1ef5258")
+    monkeypatch.setattr(server, "DEFAULT_VOICE_LIBRARY_DIR", tmp_path)
+    payload = {
+        "defaultVoice": "clone:16d9bb336799",
+        "selectedVoice": "clone:776a491528c9",
+        "voices": [
+            {"id": "16d9bb336799", "voice": "clone:16d9bb336799", "name": "Faster copy", "task_type": "Base"},
+            {"id": "22fb07ef3a80", "voice": "clone:22fb07ef3a80", "name": "Candidate A", "task_type": "Base"},
+            {"id": "47a4e1ef5258", "voice": "clone:47a4e1ef5258", "name": "Faster copy 2", "task_type": "Base"},
+            {"id": "776a491528c9", "voice": "clone:776a491528c9", "name": "Candidate B", "task_type": "Base"},
+        ],
+    }
+
+    scoped = server._scope_audio_cpp_profile_response(payload)
+
+    assert [profile["voice"] for profile in scoped["voices"]] == [
+        "clone:16d9bb336799",
+        "clone:22fb07ef3a80",
+        "clone:47a4e1ef5258",
+        "clone:776a491528c9",
+    ]
+    assert scoped["defaultVoice"] == "clone:16d9bb336799"
+    assert scoped["selectedVoice"] == "clone:776a491528c9"
+
+
+def test_live_backend_voice_inventory_disables_http_caching(monkeypatch):
+    server = _load_ui_server_module()
+
+    async def inventory(backend):
+        return {"backend": backend, "reachable": False, "voices": []}
+
+    monkeypatch.setattr(server, "_backend_voice_inventory", inventory)
+    response = server.Response()
+    result = asyncio.run(server.backend_voices("qwen3tts-audiocpp", response))
+
+    assert result["backend"] == "qwen3tts-audiocpp"
+    assert response.headers["cache-control"] == "no-store, max-age=0"
+    assert response.headers["pragma"] == "no-cache"
+
+
+def test_audio_cpp_snapshot_proxies_are_get_only_no_store_and_bounded(monkeypatch):
+    """Exercise the mounted UI server; these are not a general candidate relay."""
+    server = _load_ui_server_module()
+    calls = []
+
+    class UpstreamResponse:
+        def __init__(self, status_code, content):
+            self.status_code = status_code
+            self.content = content
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url):
+            calls.append(url)
+            if url.endswith("/voices/profiles/fail-profile"):
+                return UpstreamResponse(409, b'{"detail":"clone changed"}')
+            return UpstreamResponse(200, b'{"ok":true}')
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda **_kwargs: Client())
+    client = TestClient(server.app)
+
+    status = client.get("/api/audio-cpp/control/status")
+    profile = client.get("/api/audio-cpp/v1/voices/profiles/clone-01")
+    upstream_error = client.get("/api/audio-cpp/v1/voices/profiles/fail-profile")
+    outcome = client.get("/api/audio-cpp/audio/outcomes/0123456789abcdef0123456789abcdef")
+    malformed = client.get("/api/audio-cpp/v1/voices/profiles/%2E%2E")
+    malformed_outcome = client.get("/api/audio-cpp/audio/outcomes/not-an-outcome")
+    disallowed_method = client.post("/api/audio-cpp/control/status", content=b'{}')
+
+    assert status.request.method == "GET"
+    assert profile.request.method == "GET"
+    assert status.status_code == profile.status_code == outcome.status_code == 200
+    assert status.json() == profile.json() == outcome.json() == {"ok": True}
+    for response in (status, profile, outcome, upstream_error):
+        assert response.headers["cache-control"] == "no-store, max-age=0"
+        assert response.headers["pragma"] == "no-cache"
+    assert upstream_error.status_code == 409
+    assert upstream_error.json() == {"detail": "clone changed"}
+    assert malformed.status_code == 404
+    assert malformed_outcome.status_code == 404
+    assert disallowed_method.status_code == 405
+    assert calls == [
+        "http://127.0.0.1:8890/control/status",
+        "http://127.0.0.1:8890/v1/voices/profiles/clone-01",
+        "http://127.0.0.1:8890/v1/voices/profiles/fail-profile",
+        "http://127.0.0.1:8890/v1/audio/outcomes/0123456789abcdef0123456789abcdef",
+    ]
+
+
+def test_tuning_resolution_response_is_uncached_even_on_conflict(monkeypatch):
+    server = _load_ui_server_module()
+    calls = []
+
+    class Client:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def request(self, method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return server.httpx.Response(409, json={"detail": "profile revision changed"})
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda **kwargs: Client())
+    response = TestClient(server.app).post("/api/audio-cpp/tuning/resolve", json={"profile_id": "balanced"})
+    assert response.status_code == 409
+    assert response.headers["cache-control"] == "no-store, max-age=0"
+    assert response.headers["pragma"] == "no-cache"
+    assert calls == [("POST", "http://127.0.0.1:8890/v1/tuning/resolve", {"json": {"profile_id": "balanced"}})]
+
+
+def test_local_pipeline_reports_the_persisted_remote_model_identity(monkeypatch):
+    server = _load_ui_server_module()
+
+    class InventoryResponse:
+        status_code = 200
+
+        def json(self):
+            return {"data": [{"id": "inventory-first-but-not-selected"}]}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url):
+            return InventoryResponse()
+
+    monkeypatch.setattr(
+        server,
+        "_read_public_ui_settings",
+        lambda: {
+            "modelProvider": "remote",
+            "modelUrl": "http://192.168.0.178:8081/v1/",
+            "modelName": "gemma-4-12b",
+            "ttsBackend": "qwen3tts-audiocpp",
+        },
+    )
+    monkeypatch.setattr(server.httpx, "AsyncClient", FakeAsyncClient)
+
+    status = asyncio.run(server.local_pipeline())
+
+    assert status["gemma"] == {
+        "provider": "remote",
+        "baseUrl": "http://192.168.0.178:8081/v1",
+        "model": "gemma-4-12b",
+        "reachable": True,
+        "contextWindow": None,
+        "availableModels": ["inventory-first-but-not-selected"],
+    }
+
+
+def test_local_pipeline_ignores_remote_url_when_local_provider_is_selected(monkeypatch):
+    server = _load_ui_server_module()
+
+    class UnreachableResponse:
+        status_code = 503
+
+        def json(self):
+            return {}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url):
+            return UnreachableResponse()
+
+    monkeypatch.setenv("GEMMA_AUDIO_BASE_URL", "http://127.0.0.1:8818/v1")
+    monkeypatch.setenv("GEMMA_AUDIO_MODEL", "local-gemma")
+    monkeypatch.setattr(
+        server,
+        "_read_public_ui_settings",
+        lambda: {
+            "modelProvider": "local",
+            "modelUrl": "http://192.168.0.178:8081/v1",
+            "modelName": "stale-remote-model",
+            "ttsBackend": "faster",
+        },
+    )
+    monkeypatch.setattr(server.httpx, "AsyncClient", FakeAsyncClient)
+
+    status = asyncio.run(server.local_pipeline())
+
+    assert status["gemma"]["provider"] == "local"
+    assert status["gemma"]["baseUrl"] == "http://127.0.0.1:8818/v1"
+    assert status["gemma"]["model"] == "local-gemma"
+
+
+def _base_profile(library: Path, profile_id: str = "16d9bb336799") -> None:
+    profile_dir = library / "profiles" / profile_id
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "ref_audio.wav").write_bytes(b"RIFF\x00\x00\x00\x00WAVE")
+    (profile_dir / "meta.json").write_text(
+        json.dumps({
+            "profile_id": profile_id,
+            "name": "J.A.R.V.I.S",
+            "task_type": "Base",
+            "language": "Auto",
+            "ref_text": "Original reference.",
+            "ref_audio_filename": "ref_audio.wav",
+        }),
+        encoding="utf-8",
+    )
+
+
+def test_clone_profile_management_persists_to_configured_library(tmp_path, monkeypatch):
+    server = _load_ui_server_module()
+    _base_profile(tmp_path)
+    monkeypatch.setattr(server, "DEFAULT_VOICE_LIBRARY_DIR", tmp_path)
+
+    created = server.create_qwen3_profile(
+        server.ProfileCreateRequest(name="Copied", ref_text="Copied reference.", source_profile_id="16d9bb336799")
+    )
+    copied = next(profile for profile in created["voices"] if profile["name"] == "Copied")
+    assert (tmp_path / "profiles" / copied["id"] / "ref_audio.wav").is_file()
+
+    edited = server.edit_qwen3_profile(copied["id"], server.ProfileEditRequest(name="Renamed", language="English"))
+    assert any(profile["name"] == "Renamed" and profile["language"] == "English" for profile in edited["voices"])
+
+    selected = server.select_qwen3_profile(server.ProfileSelectRequest(profile_id=copied["id"]))
+    assert selected["selectedVoice"] == copied["voice"]
+    assert json.loads((tmp_path / "selected_profile.json").read_text(encoding="utf-8"))["profile_id"] == copied["id"]
+
+    deleted = server.delete_qwen3_profile(copied["id"])
+    assert copied["id"] not in {profile["id"] for profile in deleted["voices"]}
+
+
+def test_profile_import_requires_wav_and_preserves_base_metadata(tmp_path, monkeypatch):
+    server = _load_ui_server_module()
+    monkeypatch.setattr(server, "DEFAULT_VOICE_LIBRARY_DIR", tmp_path)
+    encoded = __import__("base64").b64encode(b"RIFF\x00\x00\x00\x00WAVEpayload").decode("ascii")
+
+    result = server.import_qwen3_profile(
+        server.ProfileImportRequest(name="Imported", ref_text="Transcript.", language="English", audio_base64=encoded)
+    )
+
+    profile = next(profile for profile in result["voices"] if profile["name"] == "Imported")
+    metadata = json.loads((tmp_path / "profiles" / profile["id"] / "meta.json").read_text(encoding="utf-8"))
+    assert metadata["task_type"] == "Base"
+    assert metadata["ref_audio_filename"] == "ref_audio.wav"
+
+
+def test_faster_model_inventory_does_not_fake_lifecycle_controls(monkeypatch):
+    server = _load_ui_server_module()
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"model_loaded": True, "capabilities": {"clone_only": True}}
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, _url):
+            return Response()
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda **kwargs: Client())
+    inventory = asyncio.run(server._faster_model_inventory())
+    assert inventory["activeModel"] == "1.7B-Base"
+    assert inventory["models"][0]["loaded"] is True
+    assert inventory["controls"] == {
+        "inventory": True, "load": False, "switch": False, "unload": False,
+        "reason": "The stable FasterQwen3TTS API is clone-only and exposes no model lifecycle endpoints.",
+    }
+
+
+def test_audio_cpp_candidate_needs_explicit_capability_validation(monkeypatch):
+    server = _load_ui_server_module()
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url):
+            return Response(
+                {"data": [{"id": "qwen3-tts-0.6b-base-bf16"}, {"id": "qwen3-tts-1.7b-base-bf16"}]}
+                if url.endswith("/models") else {
+                    "status": "ok",
+                    "backend": {
+                        "model_id": "qwen3-tts-1.7b-base-bf16",
+                        "runtime": {"state": "loaded", "progressive_phrase_pcm": True, "native_incremental_pcm": False},
+                    },
+                }
+            )
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda **kwargs: Client())
+    result = asyncio.run(server._probe_audio_cpp_candidate(run_speech_probe=False))
+
+    assert result["reachable"] is True
+    assert result["currentModel"] == "qwen3-tts-1.7b-base-bf16"
+    assert result["ready"] is False
+    assert result["streaming"] is False
+    assert result["progressivePcm"] is True
+    assert result["nativeIncrementalPcm"] is False
+    assert result["deliveryMode"] == "progressive-buffered-pcm"
+    assert result["bufferedFallback"] is True
+    assert "Validate the loaded audio.cpp model" in result["error"]
+
+
+def test_audio_cpp_validation_labels_verified_native_pcm(monkeypatch):
+    server = _load_ui_server_module()
+    seen_payloads = []
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class SpeechResponse:
+        headers = {
+            "content-type": "audio/pcm",
+            "x-tts-streaming-mode": "native-incremental-pcm",
+        }
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_bytes(self):
+            yield b"\x00\x00" * 32
+            yield b"\x01\x00" * 32
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url):
+            if url.endswith("/models"):
+                return Response({"data": [{"id": "qwen3-tts-1.7b-base-bf16"}]})
+            if url.endswith("/voices"):
+                return Response({"data": [{"id": "candidate-profile"}]})
+            return Response({
+                "status": "ok",
+                "backend": {
+                    "model_id": "qwen3-tts-1.7b-base-bf16",
+                    "runtime": {
+                        "state": "loaded",
+                        "progressive_phrase_pcm": True,
+                        "native_incremental_pcm": True,
+                        "sample_rate": 24000,
+                    },
+                },
+            })
+
+        def stream(self, _method, _url, *, json):
+            seen_payloads.append(json)
+            return SpeechResponse()
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda **_kwargs: Client())
+
+    result = asyncio.run(
+        server._probe_audio_cpp_candidate(run_speech_probe=True, profile_id="candidate-profile")
+    )
+
+    assert seen_payloads == [{
+        "model": "qwen3-tts-1.7b-base-bf16",
+        "input": "Capability check.",
+        "voice": "clone:candidate-profile",
+        "response_format": "pcm",
+        "stream": True,
+    }]
+    assert result["ready"] is True
+    assert result["nativeStreaming"] is True
+    assert result["mode"] == "native-incremental-pcm"
+    assert result["bufferedFallback"] is False
+    assert result["speechProbe"]["chunks"] == 2
+    assert result["speechProbe"]["bytes"] == 128
+    assert result["speechProbe"]["streamingModeHeader"] == "native-incremental-pcm"
+    assert result["speechProbe"]["nativeHeaderValid"] is True
+    assert result["speechProbe"]["incrementalEvidence"] is True
+
+
+@pytest.mark.parametrize(
+    ("streaming_header", "speech_chunks", "failure_text"),
+    [
+        (None, [b"first", b"second"], "exact X-TTS-Streaming-Mode"),
+        ("progressive-buffered-pcm", [b"first", b"second"], "exact X-TTS-Streaming-Mode"),
+        ("native-incremental-pcm", [b"complete-buffered-body"], "fewer than two nonempty PCM chunks"),
+    ],
+)
+def test_audio_cpp_validation_does_not_relabel_buffered_body_as_native(
+    monkeypatch, streaming_header, speech_chunks, failure_text
+):
+    server = _load_ui_server_module()
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class SpeechResponse:
+        def __init__(self):
+            self.headers = {"content-type": "audio/pcm"}
+            if streaming_header is not None:
+                self.headers["x-tts-streaming-mode"] = streaming_header
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        async def aiter_bytes(self):
+            for chunk in speech_chunks:
+                yield chunk
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url):
+            if url.endswith("/models"):
+                return Response({"data": [{"id": "qwen3-tts-1.7b-base-bf16"}]})
+            if url.endswith("/voices"):
+                return Response({"data": [{"id": "candidate-profile"}]})
+            return Response({
+                "status": "ok",
+                "backend": {
+                    "model_id": "qwen3-tts-1.7b-base-bf16",
+                    "runtime": {
+                        "state": "loaded",
+                        "progressive_phrase_pcm": True,
+                        "native_incremental_pcm": True,
+                    },
+                },
+            })
+
+        def stream(self, _method, _url, *, json):
+            return SpeechResponse()
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda **_kwargs: Client())
+
+    result = asyncio.run(
+        server._probe_audio_cpp_candidate(run_speech_probe=True, profile_id="candidate-profile")
+    )
+
+    assert result["ready"] is True
+    assert result["nativeStreaming"] is False
+    assert result["streaming"] is False
+    assert result["bufferedSpeech"] is True
+    assert result["bufferedFallback"] is True
+    assert result["deliveryMode"] == "buffered-fallback"
+    assert failure_text in result["nativeProbeError"]
+    assert result["speechProbe"]["nativeHeaderValid"] is (
+        streaming_header == "native-incremental-pcm"
+    )
+    assert result["speechProbe"]["incrementalEvidence"] is (len(speech_chunks) >= 2)
+
+
+def test_audio_cpp_saved_fallback_is_not_relabelled_native_without_a_new_probe(monkeypatch):
+    server = _load_ui_server_module()
+    monkeypatch.setattr(
+        server,
+        "_read_public_ui_settings",
+        lambda: {
+            "ttsBackend": "qwen3tts-audiocpp",
+            "voice": "clone:candidate-profile",
+            "voiceByBackend": {"qwen3tts-audiocpp": "clone:candidate-profile"},
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_find_tts_validation",
+        lambda *_args: {
+            "model": "qwen3-tts-1.7b-base-bf16",
+            "voice": "clone:candidate-profile",
+            "speech": True,
+            "deliveryMode": "buffered-fallback",
+            "nativeStreaming": False,
+        },
+    )
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url):
+            if url.endswith("/health"):
+                return Response({
+                    "backend": {
+                        "model_id": "qwen3-tts-1.7b-base-bf16",
+                        "runtime": {
+                            "state": "loaded",
+                            "progressive_phrase_pcm": True,
+                            "native_incremental_pcm": True,
+                        },
+                    }
+                })
+            if url.endswith("/models"):
+                return Response({"data": [{"id": "qwen3-tts-1.7b-base-bf16"}]})
+            return Response({"data": [{"id": "candidate-profile"}]})
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda **_kwargs: Client())
+
+    result = asyncio.run(server._probe_audio_cpp_candidate(run_speech_probe=False))
+
+    assert result["ready"] is True
+    assert result["nativeIncrementalPcm"] is True
+    assert result["nativeStreaming"] is False
+    assert result["deliveryMode"] == "buffered-fallback"
+    assert result["bufferedFallback"] is True
+    assert "revalidate to prove native chunks" in " ".join(result["limitations"])
+
+
+def test_audio_cpp_same_origin_speech_proxy_relays_chunks_and_closes_on_disconnect(monkeypatch):
+    server = _load_ui_server_module()
+
+    class Upstream:
+        status_code = 200
+        headers = {
+            "content-type": "audio/pcm",
+            "x-tts-streaming-mode": "native-incremental-pcm",
+        }
+        is_error = False
+        closed = False
+
+        async def aiter_raw(self):
+            yield b"first"
+            yield b"second"
+
+        async def aclose(self):
+            self.closed = True
+
+    upstream = Upstream()
+
+    class Client:
+        closed = False
+
+        def build_request(self, method, url, *, json):
+            assert method == "POST"
+            assert url.endswith("/audio/speech")
+            assert json["stream"] is True
+            return object()
+
+        async def send(self, _request, *, stream):
+            assert stream is True
+            return upstream
+
+        async def aclose(self):
+            self.closed = True
+
+    client = Client()
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda **_kwargs: client)
+
+    class Request:
+        checks = 0
+
+        async def json(self):
+            return {"stream": True, "response_format": "pcm"}
+
+        async def is_disconnected(self):
+            self.checks += 1
+            return self.checks > 1
+
+    response = asyncio.run(server.proxy_audio_cpp_speech(Request()))
+
+    async def collect():
+        return [chunk async for chunk in response.body_iterator]
+
+    chunks = asyncio.run(collect())
+    assert chunks == [b"first"]
+    assert response.headers["x-tts-streaming-mode"] == "native-incremental-pcm"
+    assert upstream.closed is True
+    assert client.closed is True
+
+
+def test_voice_studio_test_uses_root_health_and_public_clone_contract(tmp_path, monkeypatch):
+    server = _load_ui_server_module()
+    _base_profile(tmp_path, "candidate-profile")
+    monkeypatch.setattr(server, "DEFAULT_VOICE_LIBRARY_DIR", tmp_path)
+    urls = []
+    speech_payload = {}
+
+    class Response:
+        def __init__(self, payload=None, content=b"RIFFaudio", headers=None):
+            self.payload = payload or {}
+            self.content = content
+            self.headers = headers or {"content-type": "application/json"}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url):
+            urls.append(url)
+            return Response({
+                "backend": {
+                    "model_id": "qwen3-tts-1.7b-base-bf16",
+                    "runtime": {"state": "loaded"},
+                }
+            })
+
+        async def post(self, url, json):
+            urls.append(url)
+            if url.endswith("/audio/speech"):
+                speech_payload.update(json)
+                return Response(content=b"RIFFaudio", headers={"content-type": "audio/wav"})
+            return Response()
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda **_kwargs: Client())
+    request = server.VoiceStudioSynthesisRequest(
+        model_id="qwen3-tts-1.7b-base-bf16",
+        profile_id="candidate-profile",
+        text="Test phrase.",
+    )
+
+    response = asyncio.run(server.voice_studio_test(request))
+
+    assert "http://127.0.0.1:8890/health" in urls
+    assert speech_payload == {
+        "model": "qwen3-tts-1.7b-base-bf16",
+        "input": "Test phrase.",
+        "voice": "clone:candidate-profile",
+        "response_format": "wav",
+        "language": "Auto",
+        "stream": False,
+    }
+    assert response.body == b"RIFFaudio"
+    assert response.media_type == "audio/wav"
+
+
+def test_load_base_clone_profiles_handles_missing_library(tmp_path):
+    server = _load_ui_server_module()
+
+    assert server._load_base_clone_profiles(tmp_path / "missing") == []
+
+
+def test_tts_backend_status_reports_faster_and_voice_studio_model(monkeypatch):
+    server = _load_ui_server_module()
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url):
+            if url.endswith("/health"):
+                return Response(
+                    {
+                        "model_loaded": True,
+                        "capabilities": {"native_pcm_streaming": True, "clone_only": True},
+                    }
+                )
+            return Response(
+                {"state": "loaded", "current": "0.6B-Base", "loaded_models": ["0.6B-Base"]}
+            )
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda **kwargs: Client())
+
+    faster = asyncio.run(server._probe_tts_backend("faster", server.TTS_BACKENDS["faster"]))
+    groxaxo = asyncio.run(server._probe_tts_backend("groxaxo", server.TTS_BACKENDS["groxaxo"]))
+
+    assert faster["ready"] is True
+    assert faster["currentModel"] == "1.7B-Base"
+    assert groxaxo["ready"] is True
+    assert groxaxo["currentModel"] == "0.6B-Base"
+
+
+def test_local_ui_identity_keeps_upstream_credit_and_shows_local_provider_slots():
+    ui_dir = Path(__file__).resolve().parents[1] / "web" / "hf-realtime-voice"
+    html = (ui_dir / "index.html").read_text(encoding="utf-8")
+    main_js = (ui_dir / "main.js").read_text(encoding="utf-8")
+
+    assert "Built by" in html
+    assert "Modified by" in html
+    assert "Omni-NexusAI" in html
+    assert "https://github.com/Omni-NexusAI/speech-to-speech" in html
+    assert 'id="local-provider-gemma"' in html
+    assert 'id="local-provider-tts"' in html
+    assert 'set("local-provider-gemma"' in main_js
+    assert 'set("local-provider-tts"' in main_js
+
+
+def test_live_transcript_toggle_only_controls_the_floating_user_bubble():
+    ui_dir = Path(__file__).resolve().parents[1] / "web" / "hf-realtime-voice"
+    main_js = (ui_dir / "main.js").read_text(encoding="utf-8")
+    chat_js = (ui_dir / "ui" / "chat.js").read_text(encoding="utf-8")
+
+    assert "showUserBubble: settings.liveTranscript" in main_js
+    assert "if (options.showUserBubble && (d.partial" in chat_js
+    assert "this._pendingUserHist || this._appendHistMsg" in chat_js
+    assert "Speech could not be transcribed." not in main_js
+    assert "discardPendingUserTurn" not in chat_js
+
+
+def test_tool_output_is_acknowledged_before_one_post_tool_response():
+    ui_dir = Path(__file__).resolve().parents[1] / "web" / "hf-realtime-voice"
+    main_js = (ui_dir / "main.js").read_text(encoding="utf-8")
+    client_js = (ui_dir / "ws" / "s2s-ws-client.js").read_text(encoding="utf-8")
+
+    assert main_js.index("sessionClient.sendToolOutput") < main_js.index("sessionClient.requestToolResponse")
+    assert main_js.index("sessionClient.requestToolResponse") < main_js.index("await outputAck")
+    assert "requestToolResponse(opts = {})" in client_js
+    assert 'this._send({ type: "response.create" })' in client_js
+
+
+def test_local_ui_teardown_isolates_closed_client_events():
+    ui_dir = Path(__file__).resolve().parents[1] / "web" / "hf-realtime-voice"
+    main_js = (ui_dir / "main.js").read_text(encoding="utf-8")
+    client_js = (ui_dir / "ws" / "s2s-ws-client.js").read_text(encoding="utf-8")
+
+    assert "if (client !== c) return;" in main_js
+    assert "const closingClient = client;\n  client = null;" in main_js
+    assert "runTool(c, name, args, callId)" in main_js
+    assert 'if (this._closed && status !== "closed") return;' in client_js
+    assert 'this._captureNode?.port.postMessage({ kind: "enable", value: false });' in client_js
+    assert 'if (!this._closed) this._invalidatePlayback("stop");' in client_js
+    assert 'kind: "clear",' in client_js
+    assert "generation: this._playbackGeneration" in client_js
+
+
+def test_diagnostics_use_transcription_and_dynamic_context_tokens():
+    ui_dir = Path(__file__).resolve().parents[1] / "web" / "hf-realtime-voice"
+    main_js = (ui_dir / "main.js").read_text(encoding="utf-8")
+
+    assert '"transcription"' in main_js
+    assert '"gemma_preview"' not in main_js
+    assert "history_tokens" in main_js
+    assert "contextWindow" in main_js
+
+
+def test_remote_model_connection_test_redacts_key(monkeypatch):
+    server = _load_ui_server_module()
+    calls = []
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class Client:
+        def __init__(self, **kwargs):
+            calls.append(("client", kwargs))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url):
+            calls.append(("get", url))
+            if url.endswith("/models"):
+                return Response({"data": [{"id": "remote-audio-model"}]})
+            return Response({"default_generation_settings": {"n_ctx": 32768}})
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", Client)
+    result = asyncio.run(
+        server.test_model_endpoint(
+            server.ModelTestRequest(
+                provider="remote",
+                base_url="http://10.0.0.60:8080",
+                model="configured-model",
+                api_key="secret",
+            )
+        )
+    )
+
+    assert result["model"] == "remote-audio-model"
+    assert result["context_window"] == 32768
+    assert result["api_key_set"] is True
+    assert "api_key" not in result
+    assert calls[0][1]["headers"] == {"Authorization": "Bearer secret"}
+    assert all("127.0.0.1:8818" not in str(call) for call in calls)
+
+
+def test_hf_ui_persistent_preferences_are_atomic_and_exclude_api_keys(tmp_path, monkeypatch):
+    server = _load_ui_server_module()
+    monkeypatch.setattr(server, "UI_SETTINGS_PATH", tmp_path / "hf_realtime_ui_settings.json")
+
+    result = server._write_public_ui_settings(
+        {
+            "ttsBackend": "qwen3tts-audiocpp",
+            "ttsProfileByBackend": {
+                "qwen3tts-audiocpp": "low-latency",
+                "faster": "provider-default",
+                "foreign": "must-not-persist",
+            },
+            "modelUrl": "http://127.0.0.1:8818",
+            "fullBufferTts": False,
+            "ttsDeliveryMode": "native_incremental_pcm",
+            "echoCalibrations": {
+                "mic-a::output-b": {
+                    "delayMs": 72,
+                    "suppressionStrength": 0.8,
+                    "leakageThreshold": 4,
+                    "doubleTalkSensitivity": -1,
+                    "unexpected": 99,
+                }
+            },
+            "modelApiKey": "must-not-persist",
+        }
+    )
+
+    saved = json.loads(server.UI_SETTINGS_PATH.read_text(encoding="utf-8"))
+    assert result["ttsBackend"] == "qwen3tts-audiocpp"
+    assert saved["modelUrl"] == "http://127.0.0.1:8818"
+    assert saved["ttsDeliveryMode"] == "native_incremental_pcm"
+    assert saved["ttsProfileByBackend"] == {
+        "qwen3tts-audiocpp": "low-latency",
+        "faster": "provider-default",
+    }
+    assert saved["echoCalibrations"]["mic-a::output-b"] == {
+        "delayMs": 72.0,
+        "suppressionStrength": 0.8,
+        "leakageThreshold": 1.0,
+        "doubleTalkSensitivity": 0.0,
+    }
+    assert "modelApiKey" not in saved
+    assert "must-not-persist" not in server.UI_SETTINGS_PATH.read_text(encoding="utf-8")
+    assert not server.UI_SETTINGS_PATH.with_suffix(".tmp").exists()
+
+
+def test_hf_ui_history_compaction_preferences_are_bounded(tmp_path, monkeypatch):
+    server = _load_ui_server_module()
+    monkeypatch.setattr(server, "UI_SETTINGS_PATH", tmp_path / "hf_realtime_ui_settings.json")
+
+    saved = server._write_public_ui_settings({
+        "historyCompaction": {
+            "enabled": False,
+            "trigger_ratio": 4,
+            "target_ratio": -1,
+            "recent_turns": 99,
+        }
+    })
+
+    assert saved["historyCompaction"] == {
+        "enabled": False,
+        "trigger_ratio": 0.9,
+        "target_ratio": 0.1,
+        "recent_turns": 12,
+    }
+
+
+def test_hf_ui_read_migrates_legacy_secret_without_returning_it(tmp_path, monkeypatch):
+    server = _load_ui_server_module()
+    settings_path = tmp_path / "hf_realtime_ui_settings.json"
+    monkeypatch.setattr(server, "UI_SETTINGS_PATH", settings_path)
+    settings_path.write_text(
+        json.dumps({
+            "modelApiKey": "legacy-secret-must-never-escape",
+            "modelUrl": "http://127.0.0.1:8818",
+            "ttsBackend": "faster",
+        }),
+        encoding="utf-8",
+    )
+
+    restored = server._read_public_ui_settings()
+
+    assert restored == {"modelUrl": "http://127.0.0.1:8818", "ttsBackend": "faster"}
+    persisted = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert persisted == restored
+    assert "modelApiKey" not in persisted
+    assert "legacy-secret-must-never-escape" not in settings_path.read_text(encoding="utf-8")
+
+
+def test_hf_ui_normalizes_legacy_audio_cpp_provider_settings(tmp_path, monkeypatch):
+    server = _load_ui_server_module()
+    monkeypatch.setattr(server, "UI_SETTINGS_PATH", tmp_path / "hf_realtime_ui_settings.json")
+
+    saved = server._write_public_ui_settings(
+        {
+            "ttsBackend": "audio-cpp",
+            "voiceByBackend": {"audio-cpp": "clone:legacy-profile"},
+            "ttsProfileByBackend": {"audio-cpp": "balanced"},
+        }
+    )
+
+    assert saved["ttsBackend"] == "qwen3tts-audiocpp"
+    assert saved["voiceByBackend"] == {"qwen3tts-audiocpp": "clone:legacy-profile"}
+    assert saved["ttsProfileByBackend"] == {"qwen3tts-audiocpp": "balanced"}
+    assert '"audio-cpp"' not in server.UI_SETTINGS_PATH.read_text(encoding="utf-8")
+
+
+def test_audio_cpp_validation_persists_model_and_profile_without_secrets(tmp_path, monkeypatch):
+    server = _load_ui_server_module()
+    monkeypatch.setattr(server, "AUDIO_CPP_VALIDATION_PATH", tmp_path / "audio_cpp_validation.json")
+
+    saved = server._write_audio_cpp_validation("qwen3-tts-0.6b-base-bf16", "abc12345")
+
+    assert saved["model_id"] == "qwen3-tts-0.6b-base-bf16"
+    assert server._read_audio_cpp_validation()["profile_id"] == "abc12345"
+    assert not server.AUDIO_CPP_VALIDATION_PATH.with_suffix(".tmp").exists()
+
+
+def test_tts_validation_keeps_each_model_clone_pair(tmp_path, monkeypatch):
+    server = _load_ui_server_module()
+    monkeypatch.setattr(server, "TTS_VALIDATION_PATH", tmp_path / "tts_backend_validation.json")
+    monkeypatch.setattr(server, "AUDIO_CPP_VALIDATION_PATH", tmp_path / "missing_audio_cpp_validation.json")
+
+    first = server._write_tts_validation(
+        "qwen3tts-audiocpp", "qwen3-tts-1.7b-base-bf16", "clone:22fb07ef3a80"
+    )
+    second = server._write_tts_validation(
+        "qwen3tts-audiocpp", "qwen3-tts-1.7b-base-bf16", "clone:776a491528c9"
+    )
+
+    assert server._find_tts_validation(
+        "qwen3tts-audiocpp", "qwen3-tts-1.7b-base-bf16", "clone:22fb07ef3a80"
+    ) == first
+    assert server._find_tts_validation(
+        "qwen3tts-audiocpp", "qwen3-tts-1.7b-base-bf16", "clone:776a491528c9"
+    ) == second
+    assert server._find_tts_validation(
+        "qwen3tts-audiocpp", "qwen3-tts-0.6b-base-bf16", "clone:776a491528c9"
+    ) == {}
+
+
+def test_audio_cpp_validation_persists_verified_delivery_mode(tmp_path, monkeypatch):
+    server = _load_ui_server_module()
+    monkeypatch.setattr(server, "TTS_VALIDATION_PATH", tmp_path / "tts_backend_validation.json")
+
+    saved = server._write_tts_validation(
+        "qwen3tts-audiocpp",
+        "qwen3-tts-1.7b-base-bf16",
+        "clone:candidate-profile",
+        delivery_mode="native-incremental-pcm",
+        native_streaming=True,
+    )
+
+    assert saved["deliveryMode"] == "native-incremental-pcm"
+    assert saved["nativeStreaming"] is True
+    assert server._find_tts_validation(
+        "qwen3tts-audiocpp", "qwen3-tts-1.7b-base-bf16", "clone:candidate-profile"
+    ) == saved
+
+
+def test_audio_cpp_clone_validation_uses_speech_sized_timeout(monkeypatch):
+    server = _load_ui_server_module()
+    seen = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"status": "ok", "backend": {"model_id": "qwen3-tts-1.7b-base-bf16", "runtime": {}}}
+
+    class Client:
+        def __init__(self, **kwargs):
+            seen.append(kwargs["timeout"].read)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url):
+            if url.endswith("/models"):
+                return type("Models", (), {"raise_for_status": lambda self: None, "json": lambda self: {"data": [{"id": "qwen3-tts-1.7b-base-bf16"}]}})()
+            return Response()
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", Client)
+    asyncio.run(server._probe_audio_cpp_candidate(run_speech_probe=False))
+    assert seen == [8.0]
+
+
+def test_settings_show_model_provider_before_stacked_tts_and_voice():
+    ui_dir = Path(__file__).resolve().parents[1] / "web" / "hf-realtime-voice"
+    html = (ui_dir / "index.html").read_text(encoding="utf-8")
+    client_js = (ui_dir / "ws" / "s2s-ws-client.js").read_text(encoding="utf-8")
+
+    assert html.index('id="model-provider"') < html.index('id="tts-backend"') < html.index('id="voice"')
+    assert 'id="model-api-key" type="password"' in html
+    assert client_js.index("this.updateLocalPipeline") < client_js.index("this._sendSessionUpdate")

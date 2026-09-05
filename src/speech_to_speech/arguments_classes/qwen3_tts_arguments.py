@@ -28,10 +28,10 @@ class Qwen3TTSHandlerArguments:
             "help": "Attention implementation. Options: 'eager', 'flash_attention_2', 'sdpa'. Use 'eager' on Jetson. Default is 'eager'."
         },
     )
-    qwen3_tts_backend: Literal["ggml", "torch"] = field(
+    qwen3_tts_backend: Literal["ggml", "torch", "openai-api"] = field(
         default="ggml",
         metadata={
-            "help": "faster-qwen3-tts backend on non-macOS platforms. Options: 'ggml' or 'torch'. Default is 'ggml'. On Apple Silicon, mlx-audio is selected automatically and this option is ignored."
+            "help": "Qwen3-TTS backend on non-macOS platforms. Options: 'ggml', 'torch', or 'openai-api' for a remote OpenAI-compatible FasterQwen3TTS server. Default is 'ggml'. On Apple Silicon, mlx-audio is selected automatically unless openai-api is requested."
         },
     )
     qwen3_tts_ref_audio: Optional[str] = field(
@@ -97,4 +97,43 @@ class Qwen3TTSHandlerArguments:
         metadata={
             "help": "Audio chunk size in samples for streaming output. Must match LocalAudioStreamer blocksize. Default is 512."
         },
+    )
+
+    qwen3_tts_api_base_url: str = field(
+        default="http://127.0.0.1:8881/v1",
+        metadata={"help": "Base URL for an OpenAI-compatible FasterQwen3TTS API when qwen3_tts_backend=openai-api."},
+    )
+    qwen3_tts_api_key: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional API key for the OpenAI-compatible FasterQwen3TTS API."},
+    )
+    qwen3_tts_api_model: str = field(
+        default="qwen3-tts",
+        metadata={"help": "Model field for /audio/speech when qwen3_tts_backend=openai-api."},
+    )
+    qwen3_tts_api_voice: Optional[str] = field(
+        default="clone:16d9bb336799",
+        metadata={
+            "help": "Default Voice field for /audio/speech when qwen3_tts_backend=openai-api. Set null to use selected_profile.json if valid, otherwise the first live Base clone profile."
+        },
+    )
+    qwen3_tts_api_fallback_voice: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional fallback voice retried once if the primary OpenAI-compatible TTS request fails."},
+    )
+    qwen3_tts_api_backend_model: str = field(
+        default="1.7B-Base",
+        metadata={"help": "Required backend model key for the OpenAI-compatible FasterQwen3TTS API."},
+    )
+    qwen3_tts_api_voice_library_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional Voice Studio library directory used to map clone profile IDs to clone names."},
+    )
+    qwen3_tts_api_sample_rate: int = field(
+        default=24000,
+        metadata={"help": "PCM sample rate returned by the OpenAI-compatible FasterQwen3TTS API."},
+    )
+    qwen3_tts_api_timeout_s: float = field(
+        default=120.0,
+        metadata={"help": "HTTP timeout for OpenAI-compatible FasterQwen3TTS API requests."},
     )

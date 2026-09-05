@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from speech_to_speech.api.openai_realtime.service import RealtimeService
 from speech_to_speech.pipeline.cancel_scope import CancelScope
+from speech_to_speech.pipeline.model_operations import ModelOperationCoordinator
 
 
 class SessionState(BaseModel):
@@ -50,6 +51,7 @@ class PipelineUnit(BaseModel):
     index: int
     service: RealtimeService
     cancel_scope: CancelScope
+    model_operations: ModelOperationCoordinator = Field(default_factory=ModelOperationCoordinator)
     should_listen: Event
     response_playing: Event
     input_queue: Queue

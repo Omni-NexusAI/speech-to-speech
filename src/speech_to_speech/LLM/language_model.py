@@ -54,6 +54,12 @@ from speech_to_speech.pipeline.messages import (
     LLMResponseChunk,
     TokenUsage,
 )
+from speech_to_speech.pipeline.response_ownership import (
+    response_epoch_admission,
+    response_epoch_history_transaction,
+    response_output_allowed,
+    wait_for_response_epoch_admission,
+)
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 from speech_to_speech.utils.utils import is_out_of_band, response_wants_audio
 
@@ -135,6 +141,10 @@ class StreamContext(BaseModel):
     turn_revision: int | None = None
     speech_stopped_at_s: float | None = None
     cancel_generation: int | None = None
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
+    runtime_config: RuntimeConfig | None = None
 
     @property
     def interrupted(self) -> bool:
@@ -153,6 +163,15 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
     _cancel_criteria: _CancelCriteria
     streamer: Iterable[str]
     tokenizer: _Tokenizer
+
+    @staticmethod
+    def _log_generation_summary(ctx: StreamContext) -> None:
+        """Log aggregate generation facts without exposing generated content."""
+        logger.debug(
+            "Legacy LLM generation summary assistant_chars=%d tool_calls=%d",
+            len(ctx.generated_text or ""),
+            len(ctx.tools or []),
+        )
 
     def setup(
         self,
@@ -188,13 +207,39 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         self._transformers_lock = Lock()
         self.compactor = build_compactor(self._build_compaction_generate_fn()) if compact_history else None
 
-    def _turn_is_latest(self, turn_id: str | None, turn_revision: int | None) -> bool:
+    def _turn_is_latest(
+        self,
+        turn_id: str | None,
+        turn_revision: int | None,
+        *,
+        runtime_config: RuntimeConfig | None = None,
+        response_epoch: int | None = None,
+    ) -> bool:
+        admission = response_epoch_admission(
+            runtime_config=runtime_config,
+            response_epoch=response_epoch,
+            cancel_scope=self.cancel_scope,
+        )
+        if admission is not None:
+            return admission
         return self.speculative_turns is None or self.speculative_turns.is_latest(turn_id, turn_revision)
 
-    def _turn_output_allowed(self, turn_id: str | None, turn_revision: int | None) -> bool:
-        if self.speculative_turns is None:
-            return True
-        return self.speculative_turns.is_latest_after_reopen_grace(turn_id, turn_revision)
+    def _turn_output_allowed(
+        self,
+        turn_id: str | None,
+        turn_revision: int | None,
+        *,
+        runtime_config: RuntimeConfig | None = None,
+        response_epoch: int | None = None,
+    ) -> bool:
+        return response_output_allowed(
+            runtime_config=runtime_config,
+            response_epoch=response_epoch,
+            turn_id=turn_id,
+            turn_revision=turn_revision,
+            speculative_turns=self.speculative_turns,
+            cancel_scope=self.cancel_scope,
+        )
 
     @abstractmethod
     def _load_model(
@@ -326,6 +371,9 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                         turn_revision=ctx.turn_revision,
                         speech_stopped_at_s=ctx.speech_stopped_at_s,
                         cancel_generation=ctx.cancel_generation,
+                        input_epoch=ctx.input_epoch,
+                        response_epoch=ctx.response_epoch,
+                        response_id=ctx.response_id,
                     )
                 )
                 ctx.sentence_batch = []
@@ -361,6 +409,9 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                             turn_revision=ctx.turn_revision,
                             speech_stopped_at_s=ctx.speech_stopped_at_s,
                             cancel_generation=ctx.cancel_generation,
+                            input_epoch=ctx.input_epoch,
+                            response_epoch=ctx.response_epoch,
+                            response_id=ctx.response_id,
                         )
                     )
                 printable_text = stripped
@@ -383,6 +434,9 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     turn_revision=ctx.turn_revision,
                     speech_stopped_at_s=ctx.speech_stopped_at_s,
                     cancel_generation=ctx.cancel_generation,
+                    input_epoch=ctx.input_epoch,
+                    response_epoch=ctx.response_epoch,
+                    response_id=ctx.response_id,
                 )
             )
             return chunks, tools, ""
@@ -403,6 +457,9 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                                 turn_revision=ctx.turn_revision,
                                 speech_stopped_at_s=ctx.speech_stopped_at_s,
                                 cancel_generation=ctx.cancel_generation,
+                                input_epoch=ctx.input_epoch,
+                                response_epoch=ctx.response_epoch,
+                                response_id=ctx.response_id,
                             )
                         )
                         ctx.sentence_batch = []
@@ -416,7 +473,12 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             ctx.cancelled = True
             logger.info("LLM generation cancelled (interruption)")
             return True
-        if not self._turn_is_latest(ctx.turn_id, ctx.turn_revision):
+        if not self._turn_is_latest(
+            ctx.turn_id,
+            ctx.turn_revision,
+            runtime_config=ctx.runtime_config,
+            response_epoch=ctx.response_epoch,
+        ):
             ctx.cancelled = True
             logger.info("LLM generation cancelled (stale speculative turn)")
             return True
@@ -465,7 +527,12 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 runtime_config,
                 response,
             )
-            if chunks and not self._turn_output_allowed(ctx.turn_id, ctx.turn_revision):
+            if chunks and not self._turn_output_allowed(
+                ctx.turn_id,
+                ctx.turn_revision,
+                runtime_config=ctx.runtime_config,
+                response_epoch=ctx.response_epoch,
+            ):
                 ctx.cancelled = True
                 logger.info("LLM generation cancelled (stale speculative turn)")
                 break
@@ -475,7 +542,12 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             if ctx.printable_text.strip():
                 ctx.sentence_batch.append(ctx.printable_text.strip())
                 ctx.printable_text = ""
-            if not self._turn_output_allowed(ctx.turn_id, ctx.turn_revision):
+            if not self._turn_output_allowed(
+                ctx.turn_id,
+                ctx.turn_revision,
+                runtime_config=ctx.runtime_config,
+                response_epoch=ctx.response_epoch,
+            ):
                 ctx.cancelled = True
                 logger.info("LLM generation cancelled (stale speculative turn)")
                 return
@@ -488,6 +560,9 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 turn_revision=ctx.turn_revision,
                 speech_stopped_at_s=ctx.speech_stopped_at_s,
                 cancel_generation=ctx.cancel_generation,
+                input_epoch=ctx.input_epoch,
+                response_epoch=ctx.response_epoch,
+                response_id=ctx.response_id,
             )
             ctx.sentence_batch = []
 
@@ -504,12 +579,34 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         ctx.turn_id = request.turn_id
         ctx.turn_revision = request.turn_revision
         ctx.speech_stopped_at_s = request.speech_stopped_at_s
-        if not self._turn_is_latest(ctx.turn_id, ctx.turn_revision):
+        ctx.input_epoch = request.input_epoch
+        ctx.response_epoch = request.response_epoch
+        ctx.response_id = request.response_id
+        ctx.runtime_config = request.runtime_config
+        if not wait_for_response_epoch_admission(
+            runtime_config=ctx.runtime_config,
+            response_epoch=ctx.response_epoch,
+        ):
+            logger.info("Skipping cancelled queued LLM request for response epoch=%s", ctx.response_epoch)
+            return
+        if not self._turn_is_latest(
+            ctx.turn_id,
+            ctx.turn_revision,
+            runtime_config=ctx.runtime_config,
+            response_epoch=ctx.response_epoch,
+        ):
             logger.info("Skipping stale LLM request for turn=%s rev=%s", ctx.turn_id, ctx.turn_revision)
-            yield EndOfResponse(turn_id=ctx.turn_id, turn_revision=ctx.turn_revision)
+            yield EndOfResponse(
+                runtime_config=ctx.runtime_config,
+                turn_id=ctx.turn_id,
+                turn_revision=ctx.turn_revision,
+                input_epoch=ctx.input_epoch,
+                response_epoch=ctx.response_epoch,
+                response_id=ctx.response_id,
+            )
             return
 
-        runtime_config = request.runtime_config
+        runtime_config = ctx.runtime_config
         response = request.response
         original_chat = runtime_config.chat
         out_of_band = is_out_of_band(response)
@@ -518,7 +615,15 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 active_chat = build_active_chat(original_chat, response)
             except ChatItemError as exc:
                 logger.info("Out-of-band response rejected: %s", exc)
-                yield EndOfResponse(turn_id=ctx.turn_id, turn_revision=ctx.turn_revision, error=str(exc))
+                yield EndOfResponse(
+                    runtime_config=runtime_config,
+                    turn_id=ctx.turn_id,
+                    turn_revision=ctx.turn_revision,
+                    error=str(exc),
+                    input_epoch=ctx.input_epoch,
+                    response_epoch=ctx.response_epoch,
+                    response_id=ctx.response_id,
+                )
                 return
         else:
             active_chat = original_chat.copy()
@@ -553,27 +658,38 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             if ctx.stopped:
                 return
 
-            turn_output_allowed = not ctx.cancelled and self._turn_output_allowed(ctx.turn_id, ctx.turn_revision)
+            turn_output_allowed = not ctx.cancelled and self._turn_output_allowed(
+                ctx.turn_id,
+                ctx.turn_revision,
+                runtime_config=runtime_config,
+                response_epoch=ctx.response_epoch,
+            )
             # Out-of-band responses still emit output, but never write back to the default
             # conversation (their context was a throwaway chat).
             commit_allowed = turn_output_allowed and not out_of_band
             if commit_allowed:
-                original_chat.add_item(make_assistant_message(ctx.generated_text))
-            if commit_allowed and ctx.tools:
-                for t in ctx.tools:
-                    original_chat.add_item(
-                        RealtimeConversationItemFunctionCall(
-                            type="function_call",
-                            id=t.id,
-                            call_id=t.call_id,
-                            name=t.name,
-                            arguments=t.arguments,
-                            status=t.status,
-                        )
-                    )
-            if commit_allowed:
-                original_chat.strip_images(consumed_image_ids)
-                original_chat.trim_if_needed(self.compactor)
+                with response_epoch_history_transaction(
+                    runtime_config=runtime_config,
+                    response_epoch=ctx.response_epoch,
+                ) as admitted:
+                    commit_allowed = admitted
+                    if admitted:
+                        original_chat.add_item(make_assistant_message(ctx.generated_text))
+                        for t in ctx.tools:
+                            original_chat.add_item(
+                                RealtimeConversationItemFunctionCall(
+                                    type="function_call",
+                                    id=t.id,
+                                    call_id=t.call_id,
+                                    name=t.name,
+                                    arguments=t.arguments,
+                                    status=t.status,
+                                )
+                            )
+                        original_chat.strip_images(consumed_image_ids)
+                        original_chat.trim_if_needed(self.compactor)
+                    else:
+                        turn_output_allowed = False
             logger.debug("Clean text: %s", ctx.generated_text)
             logger.info(f"Tools: {ctx.tools}")
 
@@ -587,6 +703,9 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     turn_revision=ctx.turn_revision,
                     speech_stopped_at_s=ctx.speech_stopped_at_s,
                     cancel_generation=ctx.cancel_generation,
+                    input_epoch=ctx.input_epoch,
+                    response_epoch=ctx.response_epoch,
+                    response_id=ctx.response_id,
                 )
 
             output_tokens = len(self.tokenizer.encode(ctx.raw_generated_text)) if ctx.raw_generated_text else 0
@@ -594,8 +713,12 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 yield TokenUsage(
                     input_tokens=ctx.input_tokens,
                     output_tokens=output_tokens,
+                    runtime_config=runtime_config,
                     turn_id=ctx.turn_id,
                     turn_revision=ctx.turn_revision,
+                    input_epoch=ctx.input_epoch,
+                    response_epoch=ctx.response_epoch,
+                    response_id=ctx.response_id,
                 )
         except Exception as exc:
             # Any generation failure must still terminate the response. Without this
@@ -603,16 +726,24 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # emitted, leaving st.in_response stuck and locking every later response.
             logger.exception("LLM generation failed; ending the current response")
             yield EndOfResponse(
+                runtime_config=runtime_config,
                 turn_id=ctx.turn_id,
                 turn_revision=ctx.turn_revision,
                 cancel_generation=ctx.cancel_generation,
                 error=f"Language model generation failed: {exc}",
+                input_epoch=ctx.input_epoch,
+                response_epoch=ctx.response_epoch,
+                response_id=ctx.response_id,
             )
             return
         yield EndOfResponse(
+            runtime_config=runtime_config,
             turn_id=ctx.turn_id,
             turn_revision=ctx.turn_revision,
             cancel_generation=ctx.cancel_generation,
+            input_epoch=ctx.input_epoch,
+            response_epoch=ctx.response_epoch,
+            response_id=ctx.response_id,
         )
 
     def on_session_end(self) -> None:

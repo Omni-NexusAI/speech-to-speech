@@ -32,3 +32,11 @@ class ResponsesApiLanguageModelHandlerArguments(LanguageModelBaseArguments):
             "For Together Qwen3.5 models this sends chat_template_kwargs.enable_thinking=false."
         },
     )
+    responses_api_request_timeout_s: float = field(
+        default=30.0,
+        metadata={"help": "Response inactivity timeout for model requests."},
+    )
+    responses_api_warmup: bool = field(
+        default=False,
+        metadata={"help": "Run a generative startup warmup. Disabled for selectable endpoints."},
+    )

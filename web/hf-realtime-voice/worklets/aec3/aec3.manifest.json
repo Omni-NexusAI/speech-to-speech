@@ -1,0 +1,11 @@
+{
+    "available":  true,
+    "abiVersion":  1,
+    "engine":  "Sonora WebRTC M145 AEC3",
+    "sourceRevision":  "a024d6ef8351add55be5e8b1d6cc35f555787660",
+    "wasm":  "aec3.wasm",
+    "sha256":  "2e2c4ffabcf8d4818beedd79e54661c7d6fc8bf5ec234a3141834d0be6b8be52",
+    "frameMs":  10,
+    "output":  "pcm_s16le/16000/mono",
+    "doubleTalkTelemetry":  "aec3-output-evidence"
+}

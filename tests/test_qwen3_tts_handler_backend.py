@@ -751,6 +751,37 @@ def test_estimate_max_new_tokens_can_exceed_default_ceiling_when_raised():
     assert handler._estimate_max_new_tokens(long_text) > 1536
 
 
+def test_openai_payload_preserves_multilingual_text_unchanged():
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.api_model = "qwen3-tts"
+    handler.api_response_format = "pcm"
+    text = "Guten Morgen. \u041f\u0440\u0438\u0432\u0435\u0442. \u3053\u3093\u306b\u3061\u306f\u3002"
+
+    payload = handler._openai_api_payload(text, "clone:alpha-base-0001")
+
+    assert payload["input"] == text
+    assert payload["voice"] == "clone:alpha-base-0001"
+    assert payload["stream"] is True
+
+
+def test_openai_process_preserves_legacy_stream_mock_contract_and_forwards_candidate_tuning():
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.api_fallback_voice = None
+    handler._api_voice_for_backend = lambda voice: voice
+    captured = []
+
+    def stream(text, voice, **kwargs):
+        captured.append((text, voice, kwargs))
+        return iter([_audible_stream_chunk()])
+
+    handler._stream_openai_api_voice = stream
+    assert len(list(handler._process_openai_api("hello", "clone:one"))) == 1
+    assert "tts_tuning" not in captured[-1][2]
+    tuning = {"provider": "qwen3tts-audiocpp", "profile_id": "balanced", "overrides": {"top_k": 31}}
+    assert len(list(handler._process_openai_api("hello", "clone:one", progressive_buffered=True, tts_tuning=tuning))) == 1
+    assert captured[-1][2]["tts_tuning"] == tuning
+
+
 def test_process_voice_clone_scales_max_new_tokens_for_faster_backend(monkeypatch):
     captured = {}
     handler = object.__new__(Qwen3TTSHandler)

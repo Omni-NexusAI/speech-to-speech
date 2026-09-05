@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 
-# ── Base class ────────────────────────────────────────────────────────
+# â”€â”€ Base class â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 class PipelineMessage(BaseModel):
@@ -33,7 +33,7 @@ class PipelineMessage(BaseModel):
     tag: str
 
 
-# ── VAD → STT ─────────────────────────────────────────────────────────
+# â”€â”€ VAD â†’ STT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 class VADAudio(PipelineMessage):
@@ -45,9 +45,13 @@ class VADAudio(PipelineMessage):
     turn_id: str | None = None
     turn_revision: int | None = None
     created_at_s: float = Field(default_factory=perf_counter)
+    runtime_config: RuntimeConfig | None = None
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
 
 
-# ── STT → TranscriptionNotifier → LLM ────────────────────────────────
+# â”€â”€ STT â†’ TranscriptionNotifier â†’ LLM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 class PartialTranscription(PipelineMessage):
@@ -64,13 +68,56 @@ class Transcription(PipelineMessage):
 
     tag: Literal["transcription"] = "transcription"
     text: str
+    transcript: str | None = None
+    is_final: bool = True
+    tools: list[ResponseFunctionToolCall] = Field(default_factory=list)
     language_code: Optional[str] = None
     turn_id: str | None = None
     turn_revision: int | None = None
     speech_stopped_at_s: float | None = None
 
 
-# ── LLM → LMOutputProcessor ──────────────────────────────────────────
+
+class DirectAssistantResponse(PipelineMessage):
+    """Assistant text produced directly from user audio before the LLM stage."""
+
+    tag: Literal["direct_assistant_response"] = "direct_assistant_response"
+    text: str
+    transcript: str | None = None
+    is_final: bool = True
+    tools: list[ResponseFunctionToolCall] = Field(default_factory=list)
+    language_code: Optional[str] = None
+    turn_id: str | None = None
+    turn_revision: int | None = None
+    speech_stopped_at_s: float | None = None
+    runtime_config: RuntimeConfig | None = None
+    response: RealtimeResponseCreateParams | None = None
+    # True once the direct-audio handler has durably anchored the accepted
+    # semantic user turn and applied any validated in-place text upgrade.
+    context_committed: bool = False
+    # Optional transcript metadata may be finalized for the Realtime UI before
+    # the direct Gemma answer is complete; this flag does not create history.
+    transcript_finalized: bool = False
+    # Direct-audio responses bypass the normal LLM request object, but must
+    # still carry the request generation through LM output and TTS so a
+    # barge-in cannot synthesize abandoned assistant text later.
+    cancel_generation: int | None = None
+    # Conversation-wide ownership values.  They are optional during the
+    # protocol migration so older callers keep their existing contract.
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
+    # A terminal transport failure still has to traverse the direct response
+    # path so the realtime service can emit response.done and release its slot.
+    error: str | None = None
+
+
+class DirectAssistantRequest(DirectAssistantResponse):
+    """Pass-through LLM request for already-generated assistant text."""
+
+    tag: Literal["direct_assistant_request"] = "direct_assistant_request"
+
+# â”€â”€ LLM â†’ LMOutputProcessor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 class LLMResponseChunk(PipelineMessage):
@@ -86,6 +133,9 @@ class LLMResponseChunk(PipelineMessage):
     turn_revision: int | None = None
     speech_stopped_at_s: float | None = None
     cancel_generation: int | None = None
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
 
 
 class TokenUsage(PipelineMessage):
@@ -94,8 +144,12 @@ class TokenUsage(PipelineMessage):
     tag: Literal["token_usage"] = "token_usage"
     input_tokens: int
     output_tokens: int
+    runtime_config: RuntimeConfig | None = None
     turn_id: str | None = None
     turn_revision: int | None = None
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
 
 
 class EndOfResponse(PipelineMessage):
@@ -108,13 +162,17 @@ class EndOfResponse(PipelineMessage):
     """
 
     tag: Literal["end_of_response"] = "end_of_response"
+    runtime_config: RuntimeConfig | None = None
     turn_id: str | None = None
     turn_revision: int | None = None
     cancel_generation: int | None = None
     error: str | None = None
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
 
 
-# ── LMOutputProcessor → TTS ──────────────────────────────────────────
+# â”€â”€ LMOutputProcessor â†’ TTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 class TTSInput(PipelineMessage):
@@ -129,17 +187,29 @@ class TTSInput(PipelineMessage):
     turn_revision: int | None = None
     speech_stopped_at_s: float | None = None
     cancel_generation: int | None = None
+    # TTS freezes its synthesis context by response_epoch.  input_epoch keeps
+    # diagnostics and stale-output rejection connected to the accepted speech.
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
 
 
 class AudioOutput(PipelineMessage):
-    """Audio queue item tagged with the response generation that produced it."""
+    """Audio queue item with immutable response identity and source PCM clock."""
 
     tag: Literal["audio_output"] = "audio_output"
     audio: bytes | np.ndarray
     cancel_generation: int | None = None
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
+    # Outbound synthesis is normally 16 kHz. The isolated audio.cpp candidate
+    # preserves model-native PCM16/24 kHz through the router instead of being
+    # silently mislabeled or downsampled.
+    source_sample_rate: int = 16000
 
 
-# ── Realtime service → LLM ────────────────────────────────────────────
+# â”€â”€ Realtime service â†’ LLM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 class GenerateResponseRequest(PipelineMessage):
@@ -160,9 +230,15 @@ class GenerateResponseRequest(PipelineMessage):
     turn_id: str | None = None
     turn_revision: int | None = None
     speech_stopped_at_s: float | None = None
+    # Conversation-scoped ownership is claimed before model admission.  Every
+    # downstream result must echo this identity so detached work can be
+    # rejected without relying on transport timing or response flags.
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
 
 
-# ── Binary sentinels (audio/output queue) ─────────────────────────────
+# â”€â”€ Binary sentinels (audio/output queue) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 AUDIO_RESPONSE_DONE: Final[bytes] = b"__RESPONSE_DONE__"
 PIPELINE_END: Final[bytes] = b"END"

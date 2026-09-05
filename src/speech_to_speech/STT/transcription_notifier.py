@@ -10,10 +10,18 @@ from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.LLM.chat import make_user_message
 from speech_to_speech.pipeline.events import PartialTranscriptionEvent, TranscriptionCompletedEvent
 from speech_to_speech.pipeline.handler_types import LLMIn, STTOut
-from speech_to_speech.pipeline.messages import GenerateResponseRequest, PartialTranscription, Transcription
+from speech_to_speech.pipeline.messages import (
+    DirectAssistantRequest,
+    DirectAssistantResponse,
+    GenerateResponseRequest,
+    PartialTranscription,
+    Transcription,
+)
 from speech_to_speech.pipeline.queue_types import TextEventItem
 
 logger = logging.getLogger(__name__)
+
+_DIRECT_AUDIO_PLACEHOLDER = "[User audio]"
 
 
 class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
@@ -38,8 +46,71 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
         self.text_output_queue = text_output_queue
         self.runtime_config = runtime_config
         self.should_listen = should_listen
+        self._finalized_direct_transcripts: set[tuple[str | None, int | None]] = set()
 
     def process(self, transcription: STTOut) -> Iterator[Union[STTOut, LLMIn]]:
+        if isinstance(transcription, DirectAssistantResponse):
+            text = transcription.text.strip()
+            transcript = (transcription.transcript or "").strip()
+            runtime_config = transcription.runtime_config or self.runtime_config
+            if self.text_output_queue is not None:
+                transcript_key = (transcription.turn_id, transcription.turn_revision)
+                should_finalize = (
+                    (transcription.is_final or transcription.transcript_finalized)
+                    and transcript_key not in self._finalized_direct_transcripts
+                )
+                if should_finalize:
+                    self._finalized_direct_transcripts.add(transcript_key)
+                    self.text_output_queue.put(
+                        TranscriptionCompletedEvent(
+                            transcript=transcript or _DIRECT_AUDIO_PLACEHOLDER,
+                            language_code=transcription.language_code,
+                            turn_id=transcription.turn_id,
+                            turn_revision=transcription.turn_revision,
+                            speech_stopped_at_s=transcription.speech_stopped_at_s,
+                            context_committed=transcription.context_committed,
+                            display_only=not bool(transcript),
+                            direct_audio_completed=True,
+                            input_epoch=transcription.input_epoch,
+                            response_epoch=transcription.response_epoch,
+                            response_id=transcription.response_id,
+                        )
+                    )
+                elif transcript and not transcription.is_final:
+                    self.text_output_queue.put(
+                        PartialTranscriptionEvent(
+                            delta=transcript,
+                            turn_id=transcription.turn_id,
+                            turn_revision=transcription.turn_revision,
+                        )
+                    )
+            if self.runtime_config is not None and transcript and not transcription.context_committed:
+                self.runtime_config.chat.add_item(make_user_message(transcript))
+            if transcription.is_final:
+                self._finalized_direct_transcripts.discard((transcription.turn_id, transcription.turn_revision))
+            if not text and not transcription.tools and not transcription.is_final:
+                return
+            if text:
+                logger.info("Direct audio assistant response chunk (%d characters)", len(text))
+            yield DirectAssistantRequest(
+                text=text,
+                transcript=transcript or None,
+                is_final=transcription.is_final,
+                tools=transcription.tools,
+                language_code=transcription.language_code,
+                turn_id=transcription.turn_id,
+                turn_revision=transcription.turn_revision,
+                speech_stopped_at_s=transcription.speech_stopped_at_s,
+                runtime_config=runtime_config,
+                response=transcription.response,
+                context_committed=transcription.context_committed,
+                cancel_generation=transcription.cancel_generation,
+                input_epoch=transcription.input_epoch,
+                response_epoch=transcription.response_epoch,
+                response_id=transcription.response_id,
+                error=transcription.error,
+            )
+            return
         if isinstance(transcription, PartialTranscription):
             if self.text_output_queue and transcription.text:
                 self.text_output_queue.put(
@@ -49,7 +120,12 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
                         turn_revision=transcription.turn_revision,
                     )
                 )
-                logger.debug("Partial transcription: %s", str(transcription.text)[:80])
+                logger.debug(
+                    "Partial transcription emitted turn=%s rev=%s chars=%d",
+                    transcription.turn_id,
+                    transcription.turn_revision,
+                    len(str(transcription.text)),
+                )
             return
 
         if isinstance(transcription, Transcription):
@@ -88,9 +164,20 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
             return
 
         if language_code:
-            logger.info("Transcription completed (language=%s): %s", language_code, transcript)
+            logger.info(
+                "Transcription completed language=%s turn=%s rev=%s chars=%d",
+                language_code,
+                turn_id,
+                turn_revision,
+                len(transcript),
+            )
         else:
-            logger.info("Transcription completed: %s", transcript)
+            logger.info(
+                "Transcription completed turn=%s rev=%s chars=%d",
+                turn_id,
+                turn_revision,
+                len(transcript),
+            )
 
         if self.runtime_config is not None:
             self.runtime_config.chat.add_item(make_user_message(transcript))

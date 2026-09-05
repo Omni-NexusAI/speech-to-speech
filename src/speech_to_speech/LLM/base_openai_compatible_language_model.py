@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from threading import Lock, local
+from time import perf_counter, time
 from typing import Any, Optional
 
 import httpx
@@ -32,11 +34,20 @@ from speech_to_speech.LLM.text_prompt import build_text_system_prompt
 from speech_to_speech.LLM.utils import remove_unspeechable, resolve_auto_language
 from speech_to_speech.LLM.voice_prompt import build_voice_system_prompt
 from speech_to_speech.pipeline.cancel_scope import CancelScope
+from speech_to_speech.pipeline.events import PipelineMetricEvent
 from speech_to_speech.pipeline.handler_types import LLMIn, LLMOut
 from speech_to_speech.pipeline.messages import (
+    DirectAssistantRequest,
     EndOfResponse,
     LLMResponseChunk,
     TokenUsage,
+)
+from speech_to_speech.pipeline.model_operations import ModelOperationCoordinator, ModelOperationToken
+from speech_to_speech.pipeline.response_ownership import (
+    response_epoch_admission,
+    response_epoch_history_transaction,
+    response_output_allowed,
+    wait_for_response_epoch_admission,
 )
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 from speech_to_speech.utils.utils import is_out_of_band, response_wants_audio
@@ -44,7 +55,11 @@ from speech_to_speech.utils.utils import is_out_of_band, response_wants_audio
 logger = logging.getLogger(__name__)
 
 
-# ── Normalised provider events ────────────────────────────────────────────────
+class _ModelOperationCancelled(RuntimeError):
+    """Internal signal for cancellation captured before transport startup."""
+
+
+# â”€â”€ Normalised provider events â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Each backend's stream/response is mapped to this small vocabulary so the shared
 # speech-pipeline logic (sentence batching, cancellation, history, token usage)
 # lives in one place. Subclasses differ only in how they produce these events.
@@ -92,6 +107,10 @@ class _Turn(BaseModel):
     turn_revision: int | None
     speech_stopped_at_s: float | None
     wants_audio: bool
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
+    tool_calls_allowed: bool = True
 
 
 class _GenState(BaseModel):
@@ -110,15 +129,15 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
     """Shared lifecycle for OpenAI-compatible LLM backends (Responses & Chat
     Completions).
 
-    Subclasses implement four hooks — :meth:`warmup`,
+    Subclasses implement four hooks â€” :meth:`warmup`,
     :meth:`_build_compaction_generate_fn`, :meth:`_serialize`, :meth:`_request`,
-    :meth:`_iter_events` and :meth:`_build_optional_kwargs` — and inherit the
+    :meth:`_iter_events` and :meth:`_build_optional_kwargs` â€” and inherit the
     request/response orchestration: speculative-turn gating, cancellation,
     sentence batching, text-only vs audio handling, history write-back, token
     usage, out-of-band handling and error termination.
     """
 
-    # ── setup ─────────────────────────────────────────────────────────────────
+    # â”€â”€ setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def setup(
         self,
@@ -133,13 +152,18 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         speculative_turns: SpeculativeTurnTracker | None = None,
         disable_thinking: bool = True,
         reasoning_effort: Optional[str] = None,
-        request_timeout_s: float = 20.0,
+        request_timeout_s: float = 30.0,
+        warmup: bool = False,
         stream_batch_sentences: int = 3,
         enable_lang_prompt: bool = False,
         compact_history: bool = False,
+        model_operations: ModelOperationCoordinator | None = None,
+        text_output_queue: Any | None = None,
         **_kwargs: Any,
     ) -> None:
         self.cancel_scope = cancel_scope
+        self.model_operations = model_operations
+        self.text_output_queue = text_output_queue
         self.speculative_turns = speculative_turns
         self.model_name = model_name
         self.stream = stream
@@ -149,14 +173,77 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         self.request_timeout_s = float(request_timeout_s)
         self.request_timeout = httpx.Timeout(
             self.request_timeout_s,
-            connect=min(10.0, self.request_timeout_s),
+            connect=min(5.0, self.request_timeout_s),
         )
 
         self.user_role = user_role
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.base_url = base_url
+        self.api_key = api_key
+        self.disable_thinking = disable_thinking
+        self.reasoning_effort = reasoning_effort
+        self.client = OpenAI(
+            api_key=api_key or "not-needed",
+            base_url=base_url,
+            max_retries=0,
+            timeout=self.request_timeout,
+        )
+        self._active_response: Any = None
+        self._active_client: Any = None
+        self._active_response_lock = Lock()
+        self._operation_context = local()
         self._extra_body = self._build_extra_body(base_url, disable_thinking, reasoning_effort)
         self.compactor = build_compactor(self._build_compaction_generate_fn()) if compact_history else None
-        self.warmup()
+        if warmup:
+            self.warmup()
+
+    def _client_for(self, runtime_config: Any) -> tuple[OpenAI, str, Optional[dict[str, Any]]]:
+        endpoint = getattr(runtime_config, "model_endpoint", None)
+        if endpoint is None or endpoint.provider == "local":
+            if getattr(self.client, "is_closed", False):
+                self.client = OpenAI(
+                    api_key=self.api_key or "not-needed",
+                    base_url=self.base_url,
+                    max_retries=0,
+                    timeout=self.request_timeout,
+                )
+            return self.client, self.model_name, self._extra_body
+        base_url = endpoint.base_url
+        api_key = endpoint.api_key
+        model_name = endpoint.model
+        client = OpenAI(
+            api_key=api_key or "not-needed",
+            base_url=base_url,
+            max_retries=0,
+            timeout=self.request_timeout,
+        )
+        extra_body = self._build_extra_body(base_url, self.disable_thinking, self.reasoning_effort)
+        return client, model_name, extra_body
+
+    def _set_active_client(self, client: Any) -> bool:
+        with self._active_response_lock:
+            self._active_client = client
+        context = getattr(getattr(self, "_operation_context", None), "value", None)
+        if context is None:
+            return True
+        coordinator, operation = context
+        bound = coordinator.bind_cancel(operation, self.cancel_active)
+        cancellation_requested = getattr(coordinator, "cancellation_requested", None)
+        cancelled = callable(cancellation_requested) and cancellation_requested(operation)
+        if not bound or cancelled:
+            self.cancel_active()
+            return False
+        return True
+
+    def _model_operation_cancelled(self) -> bool:
+        context = getattr(getattr(self, "_operation_context", None), "value", None)
+        if context is None:
+            return False
+        coordinator, operation = context
+        cancellation_requested = getattr(coordinator, "cancellation_requested", None)
+        return bool(
+            not coordinator.is_current(operation)
+            or (callable(cancellation_requested) and cancellation_requested(operation))
+        )
 
     @staticmethod
     def _is_official_openai(base_url: Optional[str]) -> bool:
@@ -194,7 +281,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             return {"chat_template_kwargs": {"enable_thinking": False}}
         return None
 
-    # ── subclass hooks ──────────────────────────────────────────────────────--
+    # â”€â”€ subclass hooks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€--
 
     @abstractmethod
     def warmup(self) -> None:
@@ -212,7 +299,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         ...
 
     @abstractmethod
-    def _request(self, api_input: Any, optional_kwargs: dict[str, Any]) -> Any:
+    def _request(self, api_input: Any, optional_kwargs: dict[str, Any], runtime_config: Any) -> Any:
         """Issue the create() call and return the response or stream."""
         ...
 
@@ -240,18 +327,44 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         """Build the per-request tools/tool_choice kwargs in the backend's shape."""
         ...
 
-    # ── speculative-turn / cancellation gating ─────────────────────────────────
+    # â”€â”€ speculative-turn / cancellation gating â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    def _turn_is_latest(self, turn_id: str | None, turn_revision: int | None) -> bool:
+    def _turn_is_latest(
+        self,
+        turn_id: str | None,
+        turn_revision: int | None,
+        *,
+        runtime_config: Any | None = None,
+        response_epoch: int | None = None,
+    ) -> bool:
+        admission = response_epoch_admission(
+            runtime_config=runtime_config,
+            response_epoch=response_epoch,
+            cancel_scope=self.cancel_scope,
+        )
+        if admission is not None:
+            return admission
         return self.speculative_turns is None or self.speculative_turns.is_latest(turn_id, turn_revision)
 
     def _generation_is_stale(self, gen: int | None) -> bool:
         return gen is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(gen)
 
-    def _turn_output_allowed(self, turn_id: str | None, turn_revision: int | None) -> bool:
-        if self.speculative_turns is None:
-            return True
-        return self.speculative_turns.is_latest_after_reopen_grace(turn_id, turn_revision)
+    def _turn_output_allowed(
+        self,
+        turn_id: str | None,
+        turn_revision: int | None,
+        *,
+        runtime_config: Any | None = None,
+        response_epoch: int | None = None,
+    ) -> bool:
+        return response_output_allowed(
+            runtime_config=runtime_config,
+            response_epoch=response_epoch,
+            turn_id=turn_id,
+            turn_revision=turn_revision,
+            speculative_turns=self.speculative_turns,
+            cancel_scope=self.cancel_scope,
+        )
 
     def _apply_config(
         self,
@@ -264,7 +377,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             full_instructions = builder(instructions)
             chat.add_item(make_system_message(full_instructions))
 
-    # ── output helpers ──────────────────────────────────────────────────────--
+    # â”€â”€ output helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€--
 
     def _chunk(
         self,
@@ -284,6 +397,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             turn_revision=turn.turn_revision,
             speech_stopped_at_s=turn.speech_stopped_at_s,
             cancel_generation=turn.gen,
+            input_epoch=turn.input_epoch,
+            response_epoch=turn.response_epoch,
+            response_id=turn.response_id,
         )
 
     def _record_tool_call(self, state: _GenState, turn: _Turn, item: ResponseFunctionToolCall) -> Iterator[LLMOut]:
@@ -308,21 +424,48 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             id=item.id,
             status=item.status,
         )
-        if self._generation_is_stale(turn.gen) or not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
+        if self._generation_is_stale(turn.gen) or not self._turn_output_allowed(
+            turn.turn_id,
+            turn.turn_revision,
+            runtime_config=turn.runtime_config,
+            response_epoch=turn.response_epoch,
+        ):
             logger.info("LLM generation cancelled (stale speculative turn)")
             return
         if not is_out_of_band(turn.response):
             # Flush assistant text accumulated before this call first (so history
-            # order matches what the client received), then persist the call —
+            # order matches what the client received), then persist the call â€”
             # all before the chunk leaves for the client.
             chat = turn.runtime_config.chat
-            for pending_item in state.pending:
-                chat.add_item(pending_item)
-            state.pending.clear()
-            chat.add_item(fc_item)
+            with response_epoch_history_transaction(
+                runtime_config=turn.runtime_config,
+                response_epoch=turn.response_epoch,
+            ) as admitted:
+                if not admitted:
+                    logger.info("LLM tool call cancelled before atomic history commit")
+                    return
+                for pending_item in state.pending:
+                    chat.add_item(pending_item)
+                state.pending.clear()
+                chat.add_item(fc_item)
         yield self._chunk(turn, tools=[item])
 
-    # ── consumption ─────────────────────────────────────────────────────────--
+    def _record_disallowed_tool_call(self, turn: _Turn, assistant_text_length: int) -> None:
+        """Record a contract breach without retaining provider-supplied details."""
+        self._emit_model_metric(
+            turn,
+            "tool_contract",
+            detail={
+                "operation": "post_tool",
+                "finish_reason_category": "other",
+                "assistant_text_length": assistant_text_length,
+                "native_tool_fragment_count": 1,
+                "completed_call_count": 0,
+                "malformed_call_category": "native_call_disallowed",
+            },
+        )
+
+    # â”€â”€ consumption â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€--
 
     def _consume_streaming(self, events: Iterator[ProviderEvent], state: _GenState, turn: _Turn) -> Iterator[LLMOut]:
         cancelled = False
@@ -332,13 +475,23 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         def _flush(batch: list[str]) -> Iterator[LLMOut]:
             if not batch:
                 return
-            if not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
+            if not self._turn_output_allowed(
+                turn.turn_id,
+                turn.turn_revision,
+                runtime_config=turn.runtime_config,
+                response_epoch=turn.response_epoch,
+            ):
                 logger.info("LLM generation cancelled (stale speculative turn)")
                 return
             yield self._chunk(turn, text=" ".join(batch))
 
         for event in events:
-            if self._generation_is_stale(turn.gen) or not self._turn_is_latest(turn.turn_id, turn.turn_revision):
+            if self._generation_is_stale(turn.gen) or not self._turn_is_latest(
+                turn.turn_id,
+                turn.turn_revision,
+                runtime_config=turn.runtime_config,
+                response_epoch=turn.response_epoch,
+            ):
                 logger.info("LLM generation cancelled (interruption)")
                 cancelled = True
                 break
@@ -351,12 +504,21 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     RealtimeConversationItemAssistantMessage(type="message", role="assistant", content=event.content)
                 )
             elif isinstance(event, ToolCall):
+                if not turn.tool_calls_allowed:
+                    logger.warning("Provider returned a tool call while tool_choice=none; dropping it")
+                    self._record_disallowed_tool_call(turn, len(state.clean_text))
+                    continue
                 # Flush any pending spoken text before emitting the tool call.
                 if printable_text.strip():
                     sentence_batch.append(printable_text.strip())
                     printable_text = ""
                 if sentence_batch:
-                    if not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
+                    if not self._turn_output_allowed(
+                        turn.turn_id,
+                        turn.turn_revision,
+                        runtime_config=turn.runtime_config,
+                        response_epoch=turn.response_epoch,
+                    ):
                         logger.info("LLM generation cancelled (stale speculative turn)")
                         cancelled = True
                         break
@@ -370,7 +532,12 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     # don't sentence-split (sent_tokenize collapses newlines/markdown).
                     state.clean_text += event.text
                     if event.text:
-                        if not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
+                        if not self._turn_output_allowed(
+                            turn.turn_id,
+                            turn.turn_revision,
+                            runtime_config=turn.runtime_config,
+                            response_epoch=turn.response_epoch,
+                        ):
                             logger.info("LLM generation cancelled (stale speculative turn)")
                             cancelled = True
                             break
@@ -384,7 +551,12 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     for s in sentences[:-1]:
                         sentence_batch.append(s)
                         if len(sentence_batch) >= self.stream_batch_sentences:
-                            if not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
+                            if not self._turn_output_allowed(
+                                turn.turn_id,
+                                turn.turn_revision,
+                                runtime_config=turn.runtime_config,
+                                response_epoch=turn.response_epoch,
+                            ):
                                 logger.info("LLM generation cancelled (stale speculative turn)")
                                 cancelled = True
                                 break
@@ -406,7 +578,12 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             logger.info(f"Tools: {state.tools}")
 
     def _consume_nonstreaming(self, events: Iterator[ProviderEvent], state: _GenState, turn: _Turn) -> Iterator[LLMOut]:
-        if self._generation_is_stale(turn.gen) or not self._turn_is_latest(turn.turn_id, turn.turn_revision):
+        if self._generation_is_stale(turn.gen) or not self._turn_is_latest(
+            turn.turn_id,
+            turn.turn_revision,
+            runtime_config=turn.runtime_config,
+            response_epoch=turn.response_epoch,
+        ):
             logger.info("LLM generation cancelled (interruption)")
             return
         for event in events:
@@ -418,6 +595,10 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     RealtimeConversationItemAssistantMessage(type="message", role="assistant", content=event.content)
                 )
             elif isinstance(event, ToolCall):
+                if not turn.tool_calls_allowed:
+                    logger.warning("Provider returned a tool call while tool_choice=none; dropping it")
+                    self._record_disallowed_tool_call(turn, len(state.clean_text))
+                    continue
                 yield from self._record_tool_call(state, turn, event.item)
             elif isinstance(event, TextDelta):
                 # Text-only keeps every character verbatim; audio strips
@@ -428,13 +609,18 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 if (
                     out
                     and not self._generation_is_stale(turn.gen)
-                    and self._turn_output_allowed(turn.turn_id, turn.turn_revision)
+                    and self._turn_output_allowed(
+                        turn.turn_id,
+                        turn.turn_revision,
+                        runtime_config=turn.runtime_config,
+                        response_epoch=turn.response_epoch,
+                    )
                 ):
                     yield self._chunk(turn, text=out)
         logger.debug(f"Clean text: {state.clean_text}")
         logger.info(f"Tools: {state.tools}")
 
-    # ── orchestration ─────────────────────────────────────────────────────────
+    # â”€â”€ orchestration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _generate(
         self,
@@ -443,10 +629,16 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         turn: _Turn,
         optional_kwargs: dict[str, Any],
     ) -> Iterator[LLMOut]:
+        if not hasattr(self, "_active_response_lock"):
+            self._active_response_lock = Lock()
+            self._active_response = None
+            self._active_client = None
         api_response: Any = None
         state = _GenState()
         error_message: str | None = None
         api_input = self._serialize(active_chat)
+        request_started_s = perf_counter()
+        first_output = True
         # Images the model actually sees this turn; only these are stripped on
         # write-back, so an image a fast client injects mid-generation for the
         # next turn survives (it is not in this serialized snapshot).
@@ -459,29 +651,52 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
         try:
             if error_message is None:
-                api_response = self._request(api_input, optional_kwargs)
+                self._emit_model_metric(turn, "waiting_headers")
+                api_response = self._request(api_input, optional_kwargs, turn.runtime_config)
+                if self._model_operation_cancelled():
+                    raise _ModelOperationCancelled()
             if api_response is not None:
+                self._emit_model_metric(
+                    turn,
+                    "generating",
+                    elapsed_ms=(perf_counter() - request_started_s) * 1000,
+                )
+                with self._active_response_lock:
+                    self._active_response = api_response
                 events = self._iter_events(api_response)
-                if self.stream:
-                    yield from self._consume_streaming(events, state, turn)
-                else:
-                    yield from self._consume_nonstreaming(events, state, turn)
+                outputs = (
+                    self._consume_streaming(events, state, turn)
+                    if self.stream
+                    else self._consume_nonstreaming(events, state, turn)
+                )
+                for output in outputs:
+                    if first_output and isinstance(output, LLMResponseChunk) and (output.text or output.tools):
+                        self._emit_model_metric(
+                            turn,
+                            "first_token",
+                            elapsed_ms=(perf_counter() - request_started_s) * 1000,
+                        )
+                        first_output = False
+                    yield output
+        except _ModelOperationCancelled:
+            logger.info(
+                "Language-model transport was cancelled before output admission "
+                "turn=%s revision=%s response_epoch=%s",
+                turn.turn_id,
+                turn.turn_revision,
+                turn.response_epoch,
+            )
         except httpx.ReadTimeout:
+            error_message = "Language model response timed out."
+            self._emit_model_metric(
+                turn,
+                "timeout",
+                elapsed_ms=(perf_counter() - request_started_s) * 1000,
+            )
             logger.warning(
                 "OpenAI API read timed out after %.1fs; ending the current response",
                 self.request_timeout_s,
             )
-            if not self._generation_is_stale(turn.gen) and self._turn_output_allowed(turn.turn_id, turn.turn_revision):
-                # Canned apology carries no language_code (mirrors the prior handlers).
-                yield LLMResponseChunk(
-                    text="Wow I'm a bit slow today, could you repeat that?",
-                    runtime_config=turn.runtime_config,
-                    response=turn.response,
-                    turn_id=turn.turn_id,
-                    turn_revision=turn.turn_revision,
-                    speech_stopped_at_s=turn.speech_stopped_at_s,
-                    cancel_generation=turn.gen,
-                )
         except Exception as exc:
             # Any other generation failure must still terminate the response: record
             # the error and fall through to the EndOfResponse below. Without this the
@@ -491,47 +706,185 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             if error_message is None:
                 error_message = f"Language model generation failed: {exc}"
         finally:
+            with self._active_response_lock:
+                if self._active_response is api_response:
+                    self._active_response = None
+                active_client = getattr(self, "_active_client", None)
+                self._active_client = None
             if api_response is not None and hasattr(api_response, "close"):
                 try:
                     api_response.close()
                 except Exception:
                     pass
+            if active_client is not None and active_client is not getattr(self, "client", None):
+                try:
+                    active_client.close()
+                except Exception:
+                    pass
+
+        # Camera images are single-use once the request has reached the provider.
+        # Use the request snapshot so an image added for the next turn survives.
+        if not is_out_of_band(turn.response) and (api_response is not None or error_message is not None):
+            original_chat.strip_images(consumed_image_ids)
 
         if (
             error_message is None
             and not self._generation_is_stale(turn.gen)
-            and self._turn_output_allowed(turn.turn_id, turn.turn_revision)
+            and self._turn_output_allowed(
+                turn.turn_id,
+                turn.turn_revision,
+                runtime_config=turn.runtime_config,
+                response_epoch=turn.response_epoch,
+            )
         ):
+            history_admitted = True
             # Out-of-band responses emit output and usage but never write back to the
             # default conversation (their context was a throwaway chat).
             if not is_out_of_band(turn.response):
                 # Tool calls (and any assistant text preceding them) were already
                 # written eagerly in _record_tool_call; only trailing items remain.
-                for item in state.pending:
-                    original_chat.add_item(item)
-                original_chat.strip_images(consumed_image_ids)
-                original_chat.trim_if_needed(self.compactor)
-            if state.input_tokens or state.output_tokens:
+                with response_epoch_history_transaction(
+                    runtime_config=turn.runtime_config,
+                    response_epoch=turn.response_epoch,
+                ) as admitted:
+                    history_admitted = admitted
+                    if admitted:
+                        for item in state.pending:
+                            original_chat.add_item(item)
+                        original_chat.strip_images(consumed_image_ids)
+                        original_chat.trim_if_needed(self.compactor)
+            if history_admitted and (state.input_tokens or state.output_tokens):
                 yield TokenUsage(
                     input_tokens=state.input_tokens,
                     output_tokens=state.output_tokens,
+                    runtime_config=turn.runtime_config,
                     turn_id=turn.turn_id,
                     turn_revision=turn.turn_revision,
+                    input_epoch=turn.input_epoch,
+                    response_epoch=turn.response_epoch,
+                    response_id=turn.response_id,
                 )
+        final_status = "cancelled" if self._generation_is_stale(turn.gen) else "complete"
+        if error_message is not None:
+            final_status = "failed"
+        self._emit_model_metric(
+            turn,
+            final_status,
+            elapsed_ms=(perf_counter() - request_started_s) * 1000,
+        )
         yield EndOfResponse(
-            turn_id=turn.turn_id, turn_revision=turn.turn_revision, cancel_generation=turn.gen, error=error_message
+            runtime_config=turn.runtime_config,
+            turn_id=turn.turn_id,
+            turn_revision=turn.turn_revision,
+            cancel_generation=turn.gen,
+            error=error_message,
+            input_epoch=turn.input_epoch,
+            response_epoch=turn.response_epoch,
+            response_id=turn.response_id,
+        )
+
+    def cancel_active(self) -> None:
+        """Close the current provider stream so cancellation releases the slot."""
+        lock = getattr(self, "_active_response_lock", None)
+        if lock is None:
+            return
+        with lock:
+            response = self._active_response
+            client = self._active_client
+            self._active_response = None
+            self._active_client = None
+        for resource in (response, client):
+            if resource is not None and hasattr(resource, "close"):
+                try:
+                    resource.close()
+                except Exception:
+                    logger.debug("Provider transport was already closed during cancellation")
+
+    def _emit_model_metric(
+        self,
+        turn: _Turn,
+        status: str,
+        *,
+        elapsed_ms: float | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        text_output_queue = getattr(self, "text_output_queue", None)
+        if text_output_queue is None:
+            return
+        text_output_queue.put(
+            PipelineMetricEvent(
+                stage="gemma",
+                status=status,
+                at_s=time(),
+                elapsed_ms=elapsed_ms,
+                turn_id=turn.turn_id,
+                turn_revision=turn.turn_revision,
+                input_epoch=turn.input_epoch,
+                response_epoch=turn.response_epoch,
+                response_id=turn.response_id,
+                detail={"operation": "post_tool", **(detail or {})},
+            )
         )
 
     def process(self, request: LLMIn) -> Iterator[LLMOut]:
         """Process a language model request and yield LLMResponseChunks."""
+        if isinstance(request, DirectAssistantRequest):
+            if request.text or request.tools:
+                yield LLMResponseChunk(
+                    text=request.text,
+                    language_code=request.language_code,
+                    runtime_config=request.runtime_config,
+                    response=request.response,
+                    turn_id=request.turn_id,
+                    turn_revision=request.turn_revision,
+                    speech_stopped_at_s=request.speech_stopped_at_s,
+                    tools=request.tools,
+                    cancel_generation=request.cancel_generation,
+                    input_epoch=request.input_epoch,
+                    response_epoch=request.response_epoch,
+                    response_id=request.response_id,
+                )
+            if request.is_final:
+                yield EndOfResponse(
+                    runtime_config=request.runtime_config,
+                    turn_id=request.turn_id,
+                    turn_revision=request.turn_revision,
+                    cancel_generation=request.cancel_generation,
+                    error=request.error,
+                    input_epoch=request.input_epoch,
+                    response_epoch=request.response_epoch,
+                    response_id=request.response_id,
+                )
+            return
         runtime_config = request.runtime_config
         response = request.response
         turn_id = request.turn_id
         turn_revision = request.turn_revision
         speech_stopped_at_s = request.speech_stopped_at_s
-        if not self._turn_is_latest(turn_id, turn_revision):
+        input_epoch = request.input_epoch
+        response_epoch = request.response_epoch
+        response_id = request.response_id
+        if not wait_for_response_epoch_admission(
+            runtime_config=runtime_config,
+            response_epoch=response_epoch,
+        ):
+            logger.info("Skipping cancelled queued LLM request for response epoch=%s", response_epoch)
+            return
+        if not self._turn_is_latest(
+            turn_id,
+            turn_revision,
+            runtime_config=runtime_config,
+            response_epoch=response_epoch,
+        ):
             logger.info("Skipping stale LLM request for turn=%s rev=%s", turn_id, turn_revision)
-            yield EndOfResponse(turn_id=turn_id, turn_revision=turn_revision)
+            yield EndOfResponse(
+                runtime_config=runtime_config,
+                turn_id=turn_id,
+                turn_revision=turn_revision,
+                input_epoch=input_epoch,
+                response_epoch=response_epoch,
+                response_id=response_id,
+            )
             return
 
         original_chat = runtime_config.chat
@@ -540,7 +893,15 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 active_chat = build_active_chat(original_chat, response)
             except ChatItemError as exc:
                 logger.info("Out-of-band response rejected: %s", exc)
-                yield EndOfResponse(turn_id=turn_id, turn_revision=turn_revision, error=str(exc))
+                yield EndOfResponse(
+                    runtime_config=runtime_config,
+                    turn_id=turn_id,
+                    turn_revision=turn_revision,
+                    error=str(exc),
+                    input_epoch=input_epoch,
+                    response_epoch=response_epoch,
+                    response_id=response_id,
+                )
                 return
         else:
             active_chat = original_chat.copy()
@@ -560,9 +921,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
         optional_kwargs = self._build_optional_kwargs(req_tools, req_tool_choice)
 
-        # CancelScope.is_stale(gen) is checked when the stream iterator advances; a
-        # blocked read inside httpx cannot be aborted by cancel_scope.cancel() from
-        # the websocket router. Mitigations: request_timeout_s / ReadTimeout.
+        # The shared model-operation coordinator closes a blocked provider stream
+        # on barge-in; the generation tag still rejects any late detached output.
         gen = self.cancel_scope.generation if self.cancel_scope else None
 
         turn = _Turn(
@@ -574,8 +934,65 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             turn_revision=turn_revision,
             speech_stopped_at_s=speech_stopped_at_s,
             wants_audio=wants_audio,
+            input_epoch=input_epoch,
+            response_epoch=response_epoch,
+            response_id=response_id,
+            tool_calls_allowed=req_tool_choice != "none",
         )
-        yield from self._generate(active_chat, original_chat, turn, optional_kwargs)
+        operation: ModelOperationToken | None = None
+        coordinator = getattr(self, "model_operations", None)
+        if coordinator is not None:
+            session_id = str(runtime_config.local_pipeline.get("_session_id") or "") or None
+            operation = coordinator.acquire(
+                kind="post_tool",
+                session_id=session_id,
+                turn_id=turn_id,
+                turn_revision=turn_revision,
+                cancel_generation=gen,
+                stale=lambda: self._generation_is_stale(gen)
+                or not self._turn_is_latest(
+                    turn_id,
+                    turn_revision,
+                    runtime_config=runtime_config,
+                    response_epoch=response_epoch,
+                ),
+            )
+            if operation is None:
+                yield EndOfResponse(
+                    runtime_config=runtime_config,
+                    turn_id=turn_id,
+                    turn_revision=turn_revision,
+                    cancel_generation=gen,
+                    input_epoch=input_epoch,
+                    response_epoch=response_epoch,
+                    response_id=response_id,
+                )
+                return
+        try:
+            if operation is not None and coordinator is not None:
+                self._operation_context.value = (coordinator, operation)
+            if operation is not None and coordinator is not None and not coordinator.is_current(operation):
+                yield EndOfResponse(
+                    runtime_config=runtime_config,
+                    turn_id=turn_id,
+                    turn_revision=turn_revision,
+                    cancel_generation=gen,
+                    input_epoch=input_epoch,
+                    response_epoch=response_epoch,
+                    response_id=response_id,
+                )
+                return
+            yield from self._generate(active_chat, original_chat, turn, optional_kwargs)
+        finally:
+            # Several focused adapters construct a lightweight handler without
+            # ``setup``/``__init__``.  Cancellation still has to release the
+            # coordinator in that path; do not turn terminal cleanup into a
+            # second failure merely because no thread-local context was made.
+            operation_context = getattr(self, "_operation_context", None)
+            if operation_context is not None and hasattr(operation_context, "value"):
+                del operation_context.value
+            if operation is not None and coordinator is not None:
+                coordinator.release(operation)
 
     @property
     def timing_log_level(self) -> int:

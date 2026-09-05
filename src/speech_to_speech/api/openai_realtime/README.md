@@ -122,7 +122,9 @@ Both handlers yield `(text, language_code, tools)` tuples. `LMOutputProcessor` f
 
 ## Interruption Handling
 
-Barge-in (user speaks while the assistant is playing audio) is handled cooperatively between the VAD, the `_send_loop`, and the LLM/TTS handlers via a shared `CancelScope` object (`cancel_scope.py`).
+Barge-in (user speaks while the assistant is playing audio) is handled cooperatively between the VAD, the `_send_loop`, and the LLM/TTS handlers via a shared `CancelScope` object (`cancel_scope.py`). A per-conversation model-operation coordinator also serializes direct audio, optional preview, and post-tool requests and actively closes the selected provider stream. Transcript metadata is extracted only from the primary direct-audio response and never launches a fallback model request.
+
+Cancellation is response-scoped, not session-scoped. The router waits up to two seconds for the active transport to release; after that it detaches the stale generation, rejects all late output by generation ID, and leaves the WebSocket, history, and next turn usable.
 
 ### CancelScope design
 

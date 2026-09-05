@@ -1,6 +1,7 @@
 import logging
 import threading
 from threading import Event
+from typing import Any
 
 import uvicorn
 
@@ -25,6 +26,7 @@ class RealtimeServer:
         pool: list[PipelineUnit],
         host: str = "0.0.0.0",
         port: int = 8765,
+        runtime_info: dict[str, Any] | None = None,
     ) -> None:
         if not pool:
             raise ValueError("RealtimeServer requires at least one PipelineUnit in the pool")
@@ -32,10 +34,11 @@ class RealtimeServer:
         self.pool = pool
         self.host = host
         self.port = port
+        self.runtime_info = runtime_info or {}
 
     def run(self) -> None:
         """Start the FastAPI/uvicorn server (called from a ThreadManager thread)."""
-        app = create_app(pool=self.pool, stop_event=self.stop_event)
+        app = create_app(pool=self.pool, stop_event=self.stop_event, runtime_info=self.runtime_info)
 
         logger.info(
             f"OpenAI Realtime API starting on ws://{self.host}:{self.port}/v1/realtime (pool size {len(self.pool)})"

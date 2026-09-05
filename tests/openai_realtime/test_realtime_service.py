@@ -36,11 +36,14 @@ from openai.types.realtime import (
 
 from speech_to_speech.api.openai_realtime.service import (
     CHUNK_SIZE_BYTES,
+    PipelineSpeechStartedServerEvent,
     RealtimeService,
 )
+from speech_to_speech.LLM.chat import make_user_message
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
     PartialTranscriptionEvent,
+    PipelineMetricEvent,
     ResponseFailedEvent,
     SpeechStartedEvent,
     SpeechStoppedEvent,
@@ -49,6 +52,329 @@ from speech_to_speech.pipeline.events import (
 )
 from speech_to_speech.pipeline.messages import GenerateResponseRequest
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
+
+
+def test_queued_promotion_installs_checkpoint_before_history_waiter_can_commit(
+    service, conn_id, monkeypatch
+):
+    """Promotion notification and rollback refresh share one ownership lock."""
+
+    state = service._state(conn_id)
+    first = service.claim_pending_response(conn_id, turn_id="audible", turn_revision=1)
+    response_id, _ = service.response._ensure_response(conn_id)
+    service.handle_playback_started(
+        conn_id,
+        response_id=response_id,
+        response_epoch=first.response_epoch,
+    )
+    state.response_ownership.input_started(reason="interrupt_disabled", invalidate_active=False)
+    queued = service.claim_pending_response(conn_id, turn_id="queued", turn_revision=1)
+    assert state.response_ownership.is_queued(queued.response_epoch)
+    state.provisional_chat_checkpoints.pop(queued.response_epoch, None)
+
+    checkpoint_entered = Event()
+    release_checkpoint = Event()
+    waiter_done = Event()
+    observed = []
+    original_checkpoint = state.runtime_config.chat.checkpoint
+
+    def blocking_checkpoint():
+        checkpoint_entered.set()
+        assert release_checkpoint.wait(2)
+        return original_checkpoint()
+
+    monkeypatch.setattr(state.runtime_config.chat, "checkpoint", blocking_checkpoint)
+    promoter = Thread(target=lambda: service.activate_next_queued_response(conn_id))
+    promoter.start()
+    assert checkpoint_entered.wait(1)
+
+    def history_waiter():
+        with state.response_ownership.history_transaction(queued.response_epoch) as admitted:
+            observed.append(
+                (admitted, queued.response_epoch in state.provisional_chat_checkpoints)
+            )
+        waiter_done.set()
+
+    waiter = Thread(target=history_waiter)
+    waiter.start()
+    sleep(0.05)
+    assert not waiter_done.is_set(), "history waiter escaped while promotion checkpoint was incomplete"
+    release_checkpoint.set()
+    promoter.join(2)
+    waiter.join(2)
+
+    assert observed == [(True, True)]
+
+
+def test_manual_response_create_is_rejected_during_confirmed_audio_capture(service, conn_id):
+    supersession = service.observe_speech_started(conn_id, reason="new_speech")
+
+    result = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+
+    assert isinstance(result, RealtimeErrorEvent)
+    assert result.error.type == "input_audio_buffer_capture_in_progress"
+    owner = service.claim_pending_response(conn_id, turn_id="turn-captured", turn_revision=0)
+    assert owner.input_epoch == supersession.input_epoch
+    assert service._state(conn_id).input_capture_pending is False
+
+
+def test_delayed_speech_start_cannot_cancel_already_claimed_successor(service, conn_id):
+    first = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+    assert isinstance(first, ResponseCreatedEvent)
+    first_owner = service._state(conn_id).response_ownership.active()
+    assert first_owner is not None
+
+    supersession = service.observe_speech_started(conn_id, reason="new_speech")
+    state = service._state(conn_id)
+    # The old protocol presentation closes synchronously at observation.
+    assert state.in_response is False
+    successor = service.claim_pending_response(conn_id, turn_id="turn-successor", turn_revision=0)
+    assert state.response_ownership.active() == successor
+
+    events = service.dispatch_pipeline_event(
+        conn_id,
+        SpeechStartedEvent(
+            turn_id="turn-successor",
+            turn_revision=0,
+            input_epoch=supersession.input_epoch,
+        ),
+    )
+
+    assert any(isinstance(event, InputAudioBufferSpeechStartedEvent) for event in events)
+    assert state.response_ownership.active() == successor
+    assert state.response_ownership.admits_output(successor.response_epoch)
+
+
+def test_pending_supersessions_are_taken_by_exact_input_epoch(service, conn_id):
+    first = service.observe_speech_started(conn_id, reason="first")
+    second = service.observe_speech_started(conn_id, reason="second")
+
+    assert service.take_pending_supersession(conn_id, first.input_epoch) == first
+    assert service.pending_supersession(conn_id, second.input_epoch) == second
+    assert service.take_pending_supersession(conn_id, first.input_epoch) is None
+    assert service.take_pending_supersession(conn_id, second.input_epoch) == second
+
+
+def test_cancel_marks_epoch_inadmissible_before_atomic_history_rollback(
+    service, conn_id, monkeypatch
+):
+    """No direct-Gemma history mutation can enter between cancel and rollback."""
+
+    state = service._state(conn_id)
+    owner = service.claim_pending_response(conn_id, turn_id="cancel-race", turn_revision=1)
+    rollback_entered = Event()
+    release_rollback = Event()
+    waiter_done = Event()
+    observed = []
+    original_rollback = state.runtime_config.chat.rollback
+
+    def blocking_rollback(checkpoint):
+        rollback_entered.set()
+        assert release_rollback.wait(2)
+        return original_rollback(checkpoint)
+
+    monkeypatch.setattr(state.runtime_config.chat, "rollback", blocking_rollback)
+    canceller = Thread(target=lambda: service.mark_response_cancelled(conn_id, reason="test"))
+    canceller.start()
+    assert rollback_entered.wait(1)
+
+    def history_waiter():
+        with state.response_ownership.history_transaction(owner.response_epoch) as admitted:
+            observed.append(admitted)
+        waiter_done.set()
+
+    waiter = Thread(target=history_waiter)
+    waiter.start()
+    sleep(0.05)
+    assert not waiter_done.is_set(), "history waiter interleaved with cancellation rollback"
+    release_rollback.set()
+    canceller.join(2)
+    waiter.join(2)
+
+    assert observed == [False]
+    assert owner.response_epoch not in state.provisional_chat_checkpoints
+    cancelled = state.response_ownership.owner_for_response_epoch(owner.response_epoch)
+    assert cancelled is not None and cancelled.state == "cancelled"
+
+
+def test_claim_installs_checkpoint_and_frozen_config_before_vad_can_invalidate(
+    service, conn_id, monkeypatch
+):
+    """VAD cannot observe a half-initialized response owner."""
+
+    state = service._state(conn_id)
+    checkpoint_entered = Event()
+    release_checkpoint = Event()
+    speech_done = Event()
+    claimed = []
+    original_checkpoint = state.runtime_config.chat.checkpoint
+
+    def blocking_checkpoint():
+        checkpoint_entered.set()
+        assert release_checkpoint.wait(2)
+        return original_checkpoint()
+
+    monkeypatch.setattr(state.runtime_config.chat, "checkpoint", blocking_checkpoint)
+    claimant = Thread(
+        target=lambda: claimed.append(
+            service.claim_pending_response(conn_id, turn_id="claim-race", turn_revision=1)
+        )
+    )
+    claimant.start()
+    assert checkpoint_entered.wait(1)
+
+    speech = Thread(
+        target=lambda: (
+            service.observe_speech_started(conn_id, reason="newer_speech"),
+            speech_done.set(),
+        )
+    )
+    speech.start()
+    sleep(0.05)
+    assert not speech_done.is_set(), "VAD escaped while response admission was incomplete"
+
+    release_checkpoint.set()
+    claimant.join(2)
+    speech.join(2)
+    assert speech_done.is_set()
+    owner = claimed[0]
+    cancelled = state.response_ownership.owner_for_response_epoch(owner.response_epoch)
+    assert cancelled is not None and cancelled.state == "cancelled"
+    assert owner.response_epoch not in state.provisional_chat_checkpoints
+    assert owner.response_epoch not in state.runtime_config.response_synthesis_configs
+    assert owner.response_epoch not in state.response_output_sample_rates
+
+
+def test_vad_rollback_finishes_before_new_response_can_claim(
+    service, conn_id, monkeypatch
+):
+    """An old rollback cannot erase a response admitted after newer speech."""
+
+    state = service._state(conn_id)
+    old = service.claim_pending_response(conn_id, turn_id="old", turn_revision=1)
+    rollback_entered = Event()
+    release_rollback = Event()
+    claim_done = Event()
+    claimed = []
+    original_rollback = state.runtime_config.chat.rollback
+
+    def blocking_rollback(checkpoint):
+        rollback_entered.set()
+        assert release_rollback.wait(2)
+        return original_rollback(checkpoint)
+
+    monkeypatch.setattr(state.runtime_config.chat, "rollback", blocking_rollback)
+    speech = Thread(target=lambda: service.observe_speech_started(conn_id, reason="newer_speech"))
+    speech.start()
+    assert rollback_entered.wait(1)
+
+    claimant = Thread(
+        target=lambda: (
+            claimed.append(
+                service.claim_pending_response(conn_id, turn_id="new", turn_revision=1)
+            ),
+            claim_done.set(),
+        )
+    )
+    claimant.start()
+    sleep(0.05)
+    assert not claim_done.is_set(), "new response claimed before stale rollback completed"
+
+    release_rollback.set()
+    speech.join(2)
+    claimant.join(2)
+    assert claim_done.is_set()
+    new = claimed[0]
+    assert old.response_epoch not in state.provisional_chat_checkpoints
+    assert new.response_epoch in state.provisional_chat_checkpoints
+    assert new.response_epoch in state.runtime_config.response_synthesis_configs
+    assert state.response_ownership.active().response_epoch == new.response_epoch
+
+
+class _ContextResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+def test_context_metrics_use_validated_window_without_startup_probe(monkeypatch):
+    def unexpected_probe(*args, **kwargs):
+        raise AssertionError("RealtimeService must not probe local Gemma during startup")
+
+    monkeypatch.setattr("speech_to_speech.api.openai_realtime.service.httpx.get", unexpected_probe)
+    service = RealtimeService(context_tokenizer_base_url="http://127.0.0.1:8818/v1", chat_size=30)
+    conn_id = service.register()
+    service._state(conn_id).runtime_config.model_endpoint.context_window = 48128
+
+    assert service.context_detail(conn_id)["history_tokens"] == 0
+    service._state(conn_id).runtime_config.chat.add_item(make_user_message("hello there"))
+    detail = service.context_detail(conn_id)
+
+    assert detail["history_tokens"] > 0
+    assert detail["max_tokens"] == 48128
+    assert detail["turns"] == 1
+    assert detail["limit"] == 30
+
+
+class TestRegisteredDirectSessionHistory:
+    @staticmethod
+    def _client_item(index: int) -> ConversationItemCreateEvent:
+        return ConversationItemCreateEvent(
+            type="conversation.item.create",
+            item={  # type: ignore[arg-type]
+                "id": f"msg_registered_{index}",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": f"client turn {index}"}],
+            },
+        )
+
+    def test_direct_registration_is_token_managed_before_client_or_direct_history_writes(self, monkeypatch):
+        service = RealtimeService(chat_size=30, direct_audio_session=True)
+        conn_id = service.register()
+        chat = service._state(conn_id).runtime_config.chat
+        monkeypatch.setattr(service, "_history_tokens", lambda *_args: (0, "estimated"))
+
+        try:
+            # Both accepted client inserts and direct handler writes reach this
+            # registered Chat before the first final direct-audio commit.
+            for index in range(31):
+                service.handle_conversation_item_create(conn_id, self._client_item(index))
+            for index in range(31, 62):
+                chat.add_item(make_user_message(f"direct turn {index}"))
+
+            assert len(chat.buffer) == 62
+            assert chat.stats()["turns"] == 62
+            assert chat.stats()["trim_count"] == 0
+            assert "limit" not in chat.stats()
+            detail = service.context_detail(conn_id)
+            assert detail["policy"] == "token_compaction"
+            assert "limit" not in detail
+        finally:
+            service.unregister(conn_id)
+
+    def test_non_direct_registration_retains_legacy_hard_cap(self, monkeypatch):
+        service = RealtimeService(chat_size=30)
+        conn_id = service.register()
+        chat = service._state(conn_id).runtime_config.chat
+        monkeypatch.setattr(service, "_history_tokens", lambda *_args: (0, "estimated"))
+
+        try:
+            for index in range(62):
+                service.handle_conversation_item_create(conn_id, self._client_item(index))
+
+            assert len(chat.buffer) == 60
+            assert chat.stats()["turns"] == 60
+            assert chat.stats()["trim_count"] == 2
+            assert chat.stats()["limit"] == 30
+            assert service.context_detail(conn_id)["policy"] == "visible_trim"
+        finally:
+            service.unregister(conn_id)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -339,6 +665,98 @@ class TestHandleConversationItemCreate:
             for e in service._state(conn_id).runtime_config.chat.buffer
         )
 
+    def test_duplicate_completed_tool_output_is_rejected_without_replay(self, service, conn_id):
+        from openai.types.realtime.realtime_conversation_item_function_call import (
+            RealtimeConversationItemFunctionCall,
+        )
+
+        st = service._state(conn_id)
+        st.runtime_config.chat.add_item(
+            RealtimeConversationItemFunctionCall(
+                type="function_call", call_id="call_once", name="lookup", arguments="{}"
+            )
+        )
+        st.pending_tool_call_ids.add("call_once")
+        output = ConversationItemCreateEvent(
+            type="conversation.item.create",
+            item={"type": "function_call_output", "output": "first", "call_id": "call_once"},
+        )
+
+        first = service.handle_conversation_item_create(conn_id, output)
+        duplicate = service.handle_conversation_item_create(conn_id, output)
+
+        assert isinstance(first[0], ConversationItemCreatedEvent)
+        assert isinstance(duplicate[0], RealtimeErrorEvent)
+        assert duplicate[0].error.type == "duplicate_tool_output"
+        assert st.completed_tool_call_ids == ["call_once"]
+        assert sum(item.type == "function_call_output" for item in st.runtime_config.chat.buffer) == 1
+        assert st.pending_tool_call_ids == set()
+        assert st.tool_followup_ready is True
+
+    def test_completed_tool_call_tombstones_are_connection_local_and_bounded(self, service, conn_id):
+        from openai.types.realtime.realtime_conversation_item_function_call import (
+            RealtimeConversationItemFunctionCall,
+        )
+
+        st = service._state(conn_id)
+        limit = service.tool_call_tombstone_limit
+        st.completed_tool_call_ids = [f"call_old_{index}" for index in range(limit)]
+        st.runtime_config.chat.add_item(
+            RealtimeConversationItemFunctionCall(
+                type="function_call", call_id="call_new", name="lookup", arguments="{}"
+            )
+        )
+        output = ConversationItemCreateEvent(
+            type="conversation.item.create",
+            item={"type": "function_call_output", "output": "new", "call_id": "call_new"},
+        )
+
+        events = service.handle_conversation_item_create(conn_id, output)
+
+        assert isinstance(events[0], ConversationItemCreatedEvent)
+        assert len(st.completed_tool_call_ids) == limit
+        assert "call_old_0" not in st.completed_tool_call_ids
+        assert st.completed_tool_call_ids[-1] == "call_new"
+
+    def test_matching_tool_output_unlocks_exactly_one_followup(self, service, conn_id, text_prompt_queue):
+        from openai.types.realtime.realtime_conversation_item_function_call import (
+            RealtimeConversationItemFunctionCall,
+        )
+
+        st = service._state(conn_id)
+        st.runtime_config.chat.add_item(
+            RealtimeConversationItemFunctionCall(
+                type="function_call", call_id="call_1", name="web_search", arguments="{}"
+            )
+        )
+        st.pending_tool_call_ids.add("call_1")
+        output = ConversationItemCreateEvent(
+            type="conversation.item.create",
+            item={"type": "function_call_output", "output": "result", "call_id": "call_1"},
+        )
+
+        service.handle_conversation_item_create(conn_id, output)
+        assert st.pending_tool_call_ids == set()
+        assert st.tool_followup_ready is True
+
+        created = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert isinstance(created, ResponseCreatedEvent)
+        assert st.tool_followup_started is True
+
+        duplicate = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert isinstance(duplicate, RealtimeErrorEvent)
+        assert duplicate.error.type == "duplicate_tool_followup"
+
+    def test_response_create_waits_for_matching_tool_output(self, service, conn_id):
+        st = service._state(conn_id)
+        st.pending_tool_call_ids.add("call_1")
+
+        result = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+
+        assert result is None
+        assert st.tool_followup_requested is True
+        assert st.tool_followup_started is False
+
     def test_input_image_forwarded(self, service, conn_id, text_prompt_queue):
         evt = ConversationItemCreateEvent(
             type="conversation.item.create",
@@ -430,7 +848,7 @@ class TestDeferConversationItemsDuringResponse:
         created = [e for e in events if isinstance(e, ConversationItemCreatedEvent)]
         assert len(created) == 2
 
-    def test_function_call_output_deferred_then_pairs_after_response(self, service, conn_id):
+    def test_function_call_output_is_acknowledged_and_pairs_during_response(self, service, conn_id):
         from openai.types.realtime.realtime_conversation_item_function_call import (
             RealtimeConversationItemFunctionCall,
         )
@@ -449,15 +867,135 @@ class TestDeferConversationItemsDuringResponse:
             item={"type": "function_call_output", "output": "ok", "call_id": "call_1"},
         )
         # Output arrives mid-response: deferred (applying now could race), no error.
-        assert service.handle_conversation_item_create(conn_id, evt) == []
+        created = service.handle_conversation_item_create(conn_id, evt)
+        assert created == []
         assert len(st.deferred_items) == 1
-
-        finish_events = service.finish_response(conn_id)
+        # Unresolved calls stay in the exact-once pending ledger until their
+        # output commits; they are re-injected as one atomic call/output pair.
+        assert chat.buffer == []
+        assert "call_1" in chat._pending_tool_calls
 
         # Flushed after completion → pairs cleanly, no invalid_conversation_item error.
-        assert not any(isinstance(e, RealtimeErrorEvent) for e in finish_events)
+        completed = service.finish_response(conn_id)
         assert chat._has_call_id_in_buffer("call_1")
         assert chat.buffer[-1].type == "function_call_output"
+        assert st.deferred_items == []
+        assert any(isinstance(event, ConversationItemCreatedEvent) for event in completed)
+
+    @pytest.mark.parametrize("create_before_output", [False, True])
+    def test_audible_tool_transaction_blocks_queued_speech_until_output_commits(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+        create_before_output,
+    ):
+        """Fast tool output cannot overtake local Chat write-back or queued speech.
+
+        This covers both browser orderings: response.create may arrive before the
+        matching output or immediately after it. In both cases the audible
+        predecessor's call -> output transaction commits first and only the
+        accepted speech successor reaches the model queue.
+        """
+        from openai.types.realtime.realtime_conversation_item_function_call import (
+            RealtimeConversationItemFunctionCall,
+        )
+
+        st = service._state(conn_id)
+        service.set_rendered_playback_ack_supported(conn_id, True)
+        owner = service.claim_pending_response(conn_id, turn_id="tool-owner", turn_revision=0)
+        response_id, _ = service.response._ensure_response(conn_id)
+        service.handle_playback_started(
+            conn_id,
+            response_id=response_id,
+            response_epoch=owner.response_epoch,
+        )
+        st.pending_tool_call_ids.add("call_fast")
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(turn_id="queued-speech", turn_revision=0, interrupt_response=False),
+        )
+        assert st.pending_tool_call_ids == {"call_fast"}
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStoppedEvent(duration_s=0.5, turn_id="queued-speech", turn_revision=0),
+        )
+        queued = st.response_ownership.owner_for_turn("queued-speech", 0)
+        assert queued is not None
+        assert st.response_ownership.is_queued(queued.response_epoch)
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(
+                transcript="final user question",
+                turn_id="queued-speech",
+                turn_revision=0,
+                input_epoch=queued.input_epoch,
+                response_epoch=queued.response_epoch,
+            ),
+        )
+        assert text_prompt_queue.empty()
+
+        if create_before_output:
+            assert service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create")) is None
+            assert st.tool_followup_requested is True
+
+        output = ConversationItemCreateEvent(
+            type="conversation.item.create",
+            item={"type": "function_call_output", "output": "camera result", "call_id": "call_fast"},
+        )
+        assert service.handle_conversation_item_create(conn_id, output) == []
+        assert len(st.deferred_items) == 1
+        assert text_prompt_queue.empty()
+
+        image = ConversationItemCreateEvent(
+            type="conversation.item.create",
+            item={
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_image", "image_url": "data:image/png;base64,Y2FtZXJh"}],
+            },
+        )
+        assert service.handle_conversation_item_create(conn_id, image) == []
+        assert len(st.deferred_items) == 2
+
+        # The local model records the function call only at final Chat commit.
+        st.runtime_config.chat.add_item(
+            RealtimeConversationItemFunctionCall(
+                type="function_call", call_id="call_fast", name="camera_snapshot", arguments="{}"
+            )
+        )
+        service.finish_response(conn_id)
+
+        if not create_before_output:
+            # Output alone is not the delimiter: the browser sends an optional
+            # image and then response.create. No model request may snapshot Chat
+            # before that final message is committed.
+            assert st.response_ownership.is_queued(queued.response_epoch)
+            assert text_prompt_queue.empty()
+            assert service.handle_response_create(
+                conn_id, ResponseCreateEvent(type="response.create")
+            ) is None
+
+        types = [item.type for item in st.runtime_config.chat.buffer]
+        assert types.index("function_call") < types.index("function_call_output")
+        assert any(
+            getattr(item, "role", None) == "user"
+            and any(getattr(part, "type", None) == "input_image" for part in item.content)
+            for item in st.runtime_config.chat.buffer
+        )
+        assert st.pending_tool_call_ids == set()
+        assert st.response_ownership.active().response_epoch == queued.response_epoch
+        assert text_prompt_queue.qsize() == 1
+        request = text_prompt_queue.get_nowait()
+        assert request.response_epoch == queued.response_epoch
+        assert any(
+            getattr(item, "role", None) == "user"
+            and any(getattr(part, "type", None) == "input_image" for part in item.content)
+            for item in request.runtime_config.chat.buffer
+        )
+
+        assert text_prompt_queue.empty(), "a second tool-followup model request escaped"
 
 
 # ===================================================================
@@ -602,7 +1140,15 @@ class TestHandleResponseCreate:
         result = service.handle_response_create(conn_id, evt)
         assert isinstance(result, RealtimeErrorEvent)
         assert "call_bogus" in result.error.message
-        assert service._state(conn_id).in_response is False
+        st = service._state(conn_id)
+        assert st.in_response is False
+        assert st.response_pending is False
+        assert st.provisional_chat_checkpoints == {}
+        assert text_prompt_queue.empty()
+
+        retry = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert isinstance(retry, ResponseCreatedEvent)
+        assert isinstance(text_prompt_queue.get_nowait(), GenerateResponseRequest)
 
     def test_double_response_create_rejected(self, service, conn_id, text_prompt_queue):
         """Second response.create is rejected because in_response is set immediately."""
@@ -612,6 +1158,56 @@ class TestHandleResponseCreate:
         result2 = service.handle_response_create(conn_id, evt)
         assert isinstance(result2, RealtimeErrorEvent)
         assert result2.error.type == "conversation_already_has_active_response"
+
+    def test_late_playback_ack_is_accepted_after_completion_until_next_owner(self, service, conn_id):
+        owner = service.claim_manual_response(conn_id)
+        response_id, _ = service.response._ensure_response(conn_id)
+        service.finish_response(conn_id)
+
+        event = service.handle_playback_started(
+            conn_id,
+            response_id=response_id,
+            response_epoch=owner.response_epoch,
+        )
+
+        completed = service._state(conn_id).response_ownership.owner_for_response_epoch(owner.response_epoch)
+        assert event is not None
+        assert completed is not None
+        assert completed.state == "completed"
+        assert completed.playback_started is True
+        assert service.is_response_epoch_output_admissible(conn_id, owner.response_epoch) is False
+
+    def test_sequential_manual_responses_receive_new_epoch_and_isolate_late_ack(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+    ):
+        first = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert isinstance(first, ResponseCreatedEvent)
+        text_prompt_queue.get_nowait()
+        first_owner = service._state(conn_id).response_ownership.active()
+        assert first_owner is not None
+        first_response_id = first.response.id
+        service.finish_response(conn_id)
+
+        second = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert isinstance(second, ResponseCreatedEvent)
+        text_prompt_queue.get_nowait()
+        second_owner = service._state(conn_id).response_ownership.active()
+        assert second_owner is not None
+        assert second_owner.response_epoch > first_owner.response_epoch
+        assert second_owner.playback_started is False
+
+        assert service.handle_playback_started(
+            conn_id,
+            response_id=first_response_id,
+            response_epoch=first_owner.response_epoch,
+        ) is None
+        still_second = service._state(conn_id).response_ownership.active()
+        assert still_second is not None
+        assert still_second.response_epoch == second_owner.response_epoch
+        assert still_second.playback_started is False
 
     @staticmethod
     def _user_input(text):
@@ -810,11 +1406,21 @@ class TestDispatchPipelineEvent:
         assert evt.item_id.startswith("item_")
 
     def test_speech_started_cancels_active_response(self, service, conn_id):
-        service.response._ensure_response(conn_id)
+        owner = service.claim_pending_response(conn_id, turn_id="active", turn_revision=0)
+        response_id, _ = service.response._ensure_response(conn_id)
+        active = service._state(conn_id).response_ownership.active()
+        assert active is not None
+        assert active.response_epoch == owner.response_epoch
+        assert active.response_id == response_id
+        assert active.state == "priming"
         events = service.dispatch_pipeline_event(
             conn_id,
             SpeechStartedEvent(),
         )
+        # VAD closes the prior protocol presentation synchronously under the
+        # ownership transaction, then the websocket drains those terminal
+        # events separately so a delayed speech-start cannot close a successor.
+        events.extend(service.take_deferred_settlement_events(conn_id))
         cancel_events = [e for e in events if isinstance(e, (ResponseAudioDoneEvent, ResponseDoneEvent))]
         assert len(cancel_events) == 2
         done = [e for e in cancel_events if isinstance(e, ResponseDoneEvent)][0]
@@ -836,6 +1442,7 @@ class TestDispatchPipelineEvent:
         """With interrupt_response=False, speech_started emits the started event but does NOT cancel the active response."""
         from openai.types.realtime.realtime_audio_input_turn_detection import ServerVad
 
+        service.set_rendered_playback_ack_supported(conn_id, True)
         service._state(conn_id).runtime_config.session.audio.input.turn_detection = ServerVad(
             type="server_vad",
             interrupt_response=False,
@@ -845,24 +1452,175 @@ class TestDispatchPipelineEvent:
             conn_id,
             SpeechStartedEvent(),
         )
-        assert len(events) == 1
-        assert isinstance(events[0], InputAudioBufferSpeechStartedEvent)
+        assert len(events) == 2
+        assert isinstance(events[0], PipelineSpeechStartedServerEvent)
+        assert events[0].effective_interrupt is False
+        assert isinstance(events[1], InputAudioBufferSpeechStartedEvent)
         assert service._state(conn_id).in_response is True
         assert service._state(conn_id).current_item_id == response_item_id
 
     def test_speech_started_internal_non_interrupt_does_not_cancel(self, service, conn_id):
+        service.set_rendered_playback_ack_supported(conn_id, True)
         _, response_item_id = service.response._ensure_response(conn_id)
         events = service.dispatch_pipeline_event(
             conn_id,
             SpeechStartedEvent(interrupt_response=False),
         )
 
-        assert len(events) == 1
-        assert isinstance(events[0], InputAudioBufferSpeechStartedEvent)
+        assert len(events) == 2
+        assert isinstance(events[0], PipelineSpeechStartedServerEvent)
+        assert events[0].effective_interrupt is False
+        assert events[0].reason == "interrupt_disabled"
+        assert isinstance(events[1], InputAudioBufferSpeechStartedEvent)
         assert service._state(conn_id).in_response is True
         assert service._state(conn_id).current_item_id == response_item_id
         done_events = service.finish_response(conn_id)
         assert done_events[0].item_id == response_item_id
+
+    def test_non_interrupt_speech_preserves_audible_owner_output_and_terminal_cleanup(
+        self,
+        service,
+        conn_id,
+    ):
+        """Capture may advance while an interruption-disabled answer remains authoritative."""
+        from openai.types.realtime.realtime_audio_input_turn_detection import ServerVad
+
+        service.set_rendered_playback_ack_supported(conn_id, True)
+        owner = service.claim_pending_response(conn_id, turn_id="old-turn", turn_revision=1)
+        response_id, _ = service.response._ensure_response(conn_id)
+        service.handle_playback_started(
+            conn_id,
+            response_id=response_id,
+            response_epoch=owner.response_epoch,
+        )
+        state = service._state(conn_id)
+        state.runtime_config.session.audio.input.turn_detection = ServerVad(
+            type="server_vad",
+            interrupt_response=False,
+        )
+        previous_input_epoch = state.response_ownership.input_epoch
+
+        started = service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(interrupt_response=False),
+        )
+
+        assert len(started) == 2
+        assert isinstance(started[0], PipelineSpeechStartedServerEvent)
+        assert started[0].effective_interrupt is False
+        assert started[0].response_epoch == owner.response_epoch
+        assert state.response_ownership.input_epoch == previous_input_epoch + 1
+        retained = state.response_ownership.active()
+        assert retained is not None
+        assert retained.response_epoch == owner.response_epoch
+        assert retained.audible is True
+        assert state.response_ownership.admits_output(owner.response_epoch) is True
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStoppedEvent(
+                duration_s=1.0,
+                turn_id="new-turn",
+                turn_revision=1,
+            ),
+        )
+        queued = state.response_ownership.owner_for_turn("new-turn", 1)
+        assert queued is not None
+        assert state.response_ownership.is_queued(queued.response_epoch) is True
+        assert state.response_ownership.active().response_epoch == owner.response_epoch
+        assert state.response_ownership.admits_output(owner.response_epoch) is True
+        assert state.response_ownership.admits_output(queued.response_epoch) is False
+
+        text_events = service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(
+                text="Retained output.",
+                response_epoch=owner.response_epoch,
+                input_epoch=owner.input_epoch,
+            ),
+        )
+        # Audio responses use the OpenAI transcript terminal event; the
+        # important contract here is that the retained audible owner is still
+        # admitted after a newer interruption-disabled input is queued.
+        assert any(event.type.endswith("transcript.done") for event in text_events)
+        audio_events = service.audio.encode_audio_chunk(conn_id, b"\x00\x00" * 160)
+        assert any(isinstance(event, ResponseAudioDeltaEvent) for event in audio_events)
+
+        done_events = service.finish_response(conn_id)
+        assert any(isinstance(event, ResponseDoneEvent) for event in done_events)
+        assert state.in_response is False
+        assert state.current_response_id is None
+        completed = state.response_ownership.owner_for_response_epoch(owner.response_epoch)
+        assert completed is not None
+        assert completed.state == "completed"
+        promoted = state.response_ownership.active()
+        assert promoted is not None
+        assert promoted.response_epoch == queued.response_epoch
+        assert state.response_ownership.admits_output(queued.response_epoch) is True
+        assert state.response_pending is True
+
+    def test_response_lifecycle_echoes_the_admission_time_playback_policy(self, service, conn_id):
+        state = service._state(conn_id)
+        state.runtime_config.local_pipeline.update(
+            {
+                "tts_backend": "qwen3tts-audiocpp",
+                "audio_output_sample_rate": 24000,
+                "tts_tuning": {
+                    "provider": "qwen3tts-audiocpp",
+                    "profile_id": "balanced",
+                    "profile_revision": 7,
+                    "delivery_mode": "native_incremental_pcm",
+                    "effective": {
+                        "model": "qwen3-tts-1.7b-base-bf16",
+                        "clone_mode": "full_icl",
+                        "max_reference_seconds": 20,
+                        "first_block_frames": 4,
+                        "steady_block_frames": 12,
+                        "left_context_frames": 72,
+                        "text_lookahead": 64,
+                        "phrase_flush_ms": 500,
+                        "temperature": 0.7,
+                        "top_k": 42,
+                        "top_p": 0.9,
+                        "repetition_penalty": 1.05,
+                        "seed": None,
+                    },
+                    "overrides": {},
+                },
+                "playback_policy": {
+                    "prime_target_ms": 480,
+                    "continuity_mode": "adaptive",
+                    "native_streaming": True,
+                    "max_prime_ms": 2000,
+                },
+            }
+        )
+        owner = service.claim_pending_response(conn_id, turn_id="turn-policy", turn_revision=0)
+
+        # An acknowledgement for a later UI change may overtake this response's
+        # lifecycle event.  The response must keep its admission-time policy.
+        state.runtime_config.local_pipeline["playback_policy"] = {
+            "prime_target_ms": 0,
+            "continuity_mode": "fast-start",
+            "native_streaming": False,
+            "max_prime_ms": 2000,
+        }
+        service.set_rendered_playback_ack_supported(conn_id, True)
+        event = service.response_owner_event(conn_id)
+
+        assert event is not None
+        assert event.response_epoch == owner.response_epoch
+        assert event.output_sample_rate == 24000
+        assert event.playback_policy == {
+            "prime_target_ms": 480,
+            "continuity_mode": "adaptive",
+            "native_streaming": True,
+            "max_prime_ms": 2000,
+            "source_sample_rate": 24000,
+            "provider": "qwen3tts-audiocpp",
+            "profile_id": "balanced",
+            "profile_revision": 7,
+        }
 
     def test_consecutive_speech_cycles_get_distinct_item_ids(self, service, conn_id):
         """Each speech_started/stopped cycle generates a new unique item_id."""
@@ -912,14 +1670,36 @@ class TestDispatchPipelineEvent:
 
     def test_speech_stopped_zero_duration_not_stored(self, service, conn_id):
         """Phantom trigger (duration_s=0) emits stopped event but doesn't overwrite duration."""
-        service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
+        supersession = service.observe_speech_started(conn_id, reason="new_speech")
+        assert service._state(conn_id).input_capture_pending is True
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStartedEvent(input_epoch=supersession.input_epoch),
+        )
         events = service.dispatch_pipeline_event(
             conn_id,
-            SpeechStoppedEvent(),
+            SpeechStoppedEvent(input_epoch=supersession.input_epoch),
         )
         assert len(events) == 1
         assert isinstance(events[0], InputAudioBufferSpeechStoppedEvent)
         assert service._state(conn_id).input_audio_duration_s == 0.0
+        assert service._state(conn_id).input_capture_pending is False
+
+    def test_delayed_discarded_stop_cannot_clear_newer_capture(self, service, conn_id):
+        old = service.observe_speech_started(conn_id, reason="old")
+        newer = service.observe_speech_started(conn_id, reason="newer")
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStoppedEvent(input_epoch=old.input_epoch),
+        )
+        assert service._state(conn_id).input_capture_pending is True
+
+        service.dispatch_pipeline_event(
+            conn_id,
+            SpeechStoppedEvent(input_epoch=newer.input_epoch),
+        )
+        assert service._state(conn_id).input_capture_pending is False
 
     # -- assistant_text --
 
@@ -928,8 +1708,9 @@ class TestDispatchPipelineEvent:
             conn_id,
             AssistantTextEvent(text="Hello there"),
         )
-        assert len(events) == 1
-        evt = events[0]
+        assert len(events) == 2
+        assert isinstance(events[0], ResponseCreatedEvent)
+        evt = events[1]
         assert isinstance(evt, ResponseAudioTranscriptDoneEvent)
         assert evt.content_index == 0
         assert evt.output_index == 0
@@ -946,16 +1727,86 @@ class TestDispatchPipelineEvent:
                 ],
             ),
         )
-        assert len(events) == 3
-        assert isinstance(events[0], ResponseAudioTranscriptDoneEvent)
-        assert events[0].output_index == 0
-        assert isinstance(events[1], ResponseFunctionCallArgumentsDoneEvent)
-        assert events[1].output_index == 1
-        assert events[1].name == "get_weather"
-        assert events[1].call_id == "c1"
-        assert json.loads(events[1].arguments) == {"city": "Paris"}
+        assert len(events) == 4
+        assert isinstance(events[0], ResponseCreatedEvent)
+        assert isinstance(events[1], ResponseAudioTranscriptDoneEvent)
+        assert events[1].output_index == 0
         assert isinstance(events[2], ResponseFunctionCallArgumentsDoneEvent)
-        assert events[2].output_index == 2
+        assert events[2].output_index == 1
+        assert events[2].name == "get_weather"
+        assert events[2].call_id == "c1"
+        assert json.loads(events[2].arguments) == {"city": "Paris"}
+        assert isinstance(events[3], ResponseFunctionCallArgumentsDoneEvent)
+        assert events[3].output_index == 2
+
+    @pytest.mark.parametrize("tool_name", ["web_search", "camera_snapshot"])
+    def test_opaque_llama_tool_id_completes_one_followup_and_next_response(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+        tool_name,
+    ):
+        from openai.types.realtime.realtime_conversation_item_function_call import (
+            RealtimeConversationItemFunctionCall,
+        )
+
+        from speech_to_speech.STT.gemma_audio_handler import GemmaAudioSTTHandler
+
+        st = service._state(conn_id)
+        st.runtime_config.chat.add_item(make_user_message(f"Use {tool_name}"))
+        tool = GemmaAudioSTTHandler._tool_calls_from_accum(
+            {0: {"name": tool_name, "args": "{}", "id": "UNM0K7ZOZpEN5uS0vGTo1G1UnSDH8Vki"}}
+        )[0]
+        st.runtime_config.chat.add_item(
+            RealtimeConversationItemFunctionCall(
+                type="function_call",
+                call_id=tool.call_id,
+                id=tool.id,
+                name=tool.name,
+                arguments=tool.arguments,
+                status=tool.status,
+            )
+        )
+
+        tool_events = service.dispatch_pipeline_event(
+            conn_id,
+            AssistantTextEvent(text="Let me check.", tools=[tool]),
+        )
+        emitted = next(event for event in tool_events if isinstance(event, ResponseFunctionCallArgumentsDoneEvent))
+        assert emitted.call_id == "call_UNM0K7ZOZpEN5uS0vGTo1G1UnSDH8Vki"
+        assert [item.type for item in st.runtime_config.chat.buffer] == ["message"]
+        assert st.runtime_config.chat.stats()["pending_tool_calls"] == 1
+
+        service.finish_response(conn_id)
+        acknowledgements = service.handle_conversation_item_create(
+            conn_id,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item={
+                    "type": "function_call_output",
+                    "call_id": emitted.call_id,
+                    "output": '{"ok":true}',
+                },
+            ),
+        )
+        assert any(isinstance(event, ConversationItemCreatedEvent) for event in acknowledgements)
+        assert [item.type for item in st.runtime_config.chat.buffer[-2:]] == [
+            "function_call",
+            "function_call_output",
+        ]
+
+        created = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert isinstance(created, ResponseCreatedEvent)
+        request = text_prompt_queue.get_nowait()
+        assert isinstance(request, GenerateResponseRequest)
+        duplicate = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert isinstance(duplicate, RealtimeErrorEvent)
+        assert duplicate.error.type == "duplicate_tool_followup"
+
+        service.finish_response(conn_id)
+        next_response = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert isinstance(next_response, ResponseCreatedEvent)
 
     def test_assistant_text_tools_only(self, service, conn_id):
         events = service.dispatch_pipeline_event(
@@ -965,9 +1816,12 @@ class TestDispatchPipelineEvent:
                 tools=[{"type": "function_call", "call_id": "c1", "name": "f1", "arguments": "{}"}],
             ),
         )
-        assert len(events) == 1
-        assert isinstance(events[0], ResponseFunctionCallArgumentsDoneEvent)
-        assert events[0].output_index == 0
+        assert len(events) == 2
+        assert events[0].type == "response.created"
+        assert isinstance(events[1], ResponseFunctionCallArgumentsDoneEvent)
+        assert events[1].output_index == 0
+        assert service._state(conn_id).in_response is True
+        assert service._state(conn_id).pending_tool_call_ids == {"c1"}
 
     def test_assistant_text_text_only_emits_text_events(self, service, conn_id):
         from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
@@ -981,11 +1835,12 @@ class TestDispatchPipelineEvent:
         )
         # on_assistant_text streams only the delta now; the matching done is
         # emitted once at close in finish_response.
-        assert len(events) == 1
-        assert isinstance(events[0], ResponseTextDeltaEvent)
-        assert events[0].content_index == 0
-        assert events[0].output_index == 0
-        assert events[0].delta == "Hello there"
+        assert len(events) == 2
+        assert isinstance(events[0], ResponseCreatedEvent)
+        assert isinstance(events[1], ResponseTextDeltaEvent)
+        assert events[1].content_index == 0
+        assert events[1].output_index == 0
+        assert events[1].delta == "Hello there"
         assert not any(isinstance(e, ResponseTextDoneEvent) for e in events)
         assert not any(isinstance(e, ResponseAudioTranscriptDoneEvent) for e in events)
 
@@ -1035,9 +1890,10 @@ class TestDispatchPipelineEvent:
             ),
         )
         # No per-chunk done anymore: delta, then the tool event at output_index 1.
-        assert isinstance(events[0], ResponseTextDeltaEvent)
+        assert isinstance(events[0], ResponseCreatedEvent)
+        assert isinstance(events[1], ResponseTextDeltaEvent)
         assert not any(isinstance(e, ResponseTextDoneEvent) for e in events)
-        tool_event = events[1]
+        tool_event = events[2]
         assert isinstance(tool_event, ResponseFunctionCallArgumentsDoneEvent)
         assert tool_event.output_index == 1
         assert tool_event.name == "get_weather"
@@ -1104,9 +1960,10 @@ class TestDispatchPipelineEvent:
         assert done.wait(1.0)
         thread.join(timeout=1.0)
 
-        assert len(result["events"]) == 1
-        assert isinstance(result["events"][0], ResponseAudioTranscriptDoneEvent)
-        assert result["events"][0].transcript == "latest"
+        assert len(result["events"]) == 2
+        assert isinstance(result["events"][0], ResponseCreatedEvent)
+        assert isinstance(result["events"][1], ResponseAudioTranscriptDoneEvent)
+        assert result["events"][1].transcript == "latest"
         assert tracker.is_committed("turn_1", 0)
         service.unregister(conn_id)
 
@@ -1161,9 +2018,10 @@ class TestDispatchPipelineEvent:
         events = service.try_dispatch_pipeline_event(conn_id, event)
 
         assert events is not None
-        assert len(events) == 1
-        assert isinstance(events[0], ResponseAudioTranscriptDoneEvent)
-        assert events[0].transcript == "latest"
+        assert len(events) == 2
+        assert isinstance(events[0], ResponseCreatedEvent)
+        assert isinstance(events[1], ResponseAudioTranscriptDoneEvent)
+        assert events[1].transcript == "latest"
         assert tracker.is_committed("turn_1", 0)
         service.unregister(conn_id)
 
@@ -1185,9 +2043,10 @@ class TestDispatchPipelineEvent:
         events = service.try_dispatch_pipeline_event(conn_id, event)
 
         assert events is not None
-        assert len(events) == 1
-        assert isinstance(events[0], ResponseAudioTranscriptDoneEvent)
-        assert events[0].transcript == "latest"
+        assert len(events) == 2
+        assert isinstance(events[0], ResponseCreatedEvent)
+        assert isinstance(events[1], ResponseAudioTranscriptDoneEvent)
+        assert events[1].transcript == "latest"
         assert tracker.is_committed("turn_1", 0)
         service.unregister(conn_id)
 
@@ -1248,6 +2107,79 @@ class TestDispatchPipelineEvent:
         assert evt.usage.seconds == 3.2
         assert evt.usage.type == "duration"
         assert service._state(conn_id).response_pending is True
+
+    def test_direct_audio_completion_emits_final_transcript_without_second_generation(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+    ):
+        service.dispatch_pipeline_event(conn_id, SpeechStartedEvent())
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(
+                transcript="hello world",
+                turn_id="turn_1",
+                turn_revision=0,
+                context_committed=True,
+                direct_audio_completed=True,
+            ),
+        )
+
+        assert len(events) == 1
+        assert isinstance(events[0], ConversationItemInputAudioTranscriptionCompletedEvent)
+        assert events[0].transcript == "hello world"
+        assert text_prompt_queue.empty()
+        assert service._state(conn_id).response_pending is False
+
+    def test_direct_audio_display_placeholder_never_enters_model_context(
+        self,
+        service,
+        conn_id,
+        runtime_config,
+        text_prompt_queue,
+    ):
+        events = service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(
+                transcript="[User audio]",
+                display_only=True,
+                turn_id="turn_audio",
+                turn_revision=0,
+                direct_audio_completed=True,
+            ),
+        )
+
+        assert len(events) == 1
+        assert events[0].transcript == "[User audio]"
+        assert runtime_config.chat.buffer == []
+        assert text_prompt_queue.empty()
+        assert service._state(conn_id).response_pending is False
+
+    def test_explicit_response_create_remains_available_after_direct_audio_completion(
+        self,
+        service,
+        conn_id,
+        text_prompt_queue,
+    ):
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(
+                transcript="use a tool",
+                turn_id="turn_tool",
+                turn_revision=0,
+                context_committed=True,
+                direct_audio_completed=True,
+            ),
+        )
+
+        result = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+
+        assert isinstance(result, ResponseCreatedEvent)
+        request = text_prompt_queue.get_nowait()
+        assert isinstance(request, GenerateResponseRequest)
+        assert request.turn_id == "turn_tool"
+        assert text_prompt_queue.empty()
 
     def test_empty_transcription_completed_emits_event_without_response(
         self,
@@ -1687,6 +2619,72 @@ class TestUsageMetricsTracking:
         )
         assert events == []
 
+
+class TestTtsFailureOwnership:
+    """TTS failures terminate the reporting owner, never a newer response."""
+
+    @staticmethod
+    def _failure_for(owner):
+        return PipelineMetricEvent(
+            stage="tts",
+            status="runaway_aborted",
+            at_s=1.0,
+            input_epoch=owner.input_epoch,
+            response_epoch=owner.response_epoch,
+            response_id=owner.response_id,
+            detail={"limit": "bounded"},
+        )
+
+    def test_owned_tts_failure_clears_only_that_output_and_keeps_audible_history(self, service, conn_id):
+        service._state(conn_id).runtime_config.chat.add_item(make_user_message("retain this audible turn"))
+        created = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert isinstance(created, ResponseCreatedEvent)
+        state = service._state(conn_id)
+        owner = state.response_ownership.active()
+        assert owner is not None and owner.response_id is not None
+        input_epoch = state.response_ownership.input_epoch
+        service.handle_playback_started(
+            conn_id,
+            response_id=owner.response_id,
+            response_epoch=owner.response_epoch,
+        )
+        state.pending_output_text_parts = ["partial tail"]
+
+        events = service.dispatch_pipeline_event(conn_id, self._failure_for(owner))
+
+        assert [event.type for event in events] == [
+            "pipeline.metric",
+            "response.output_audio.done",
+            "response.done",
+        ]
+        done = events[-1]
+        assert isinstance(done, ResponseDoneEvent)
+        assert done.response.status == "failed"
+        assert state.in_response is False
+        assert state.pending_output_text_parts == []
+        assert state.response_ownership.input_epoch == input_epoch
+        cancelled = state.response_ownership.owner_for_response_epoch(owner.response_epoch)
+        assert cancelled is not None and cancelled.reason == "synthesis-failed"
+        assert state.runtime_config.chat.buffer[0].content[0].text == "retain this audible turn"
+
+    def test_stale_tts_failure_cannot_clear_successor_and_next_turn_remains_usable(self, service, conn_id):
+        first = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert isinstance(first, ResponseCreatedEvent)
+        first_owner = service._state(conn_id).response_ownership.active()
+        assert first_owner is not None
+        service.finish_response(conn_id)
+
+        second = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+        assert isinstance(second, ResponseCreatedEvent)
+        state = service._state(conn_id)
+        second_owner = state.response_ownership.active()
+        assert second_owner is not None and second_owner.response_epoch != first_owner.response_epoch
+
+        assert service.dispatch_pipeline_event(conn_id, self._failure_for(first_owner)) == []
+        assert state.in_response is True
+        assert state.response_ownership.active() == second_owner
+        assert service.finish_response(conn_id)
+
     def test_response_done_reflects_token_usage(self, service, conn_id):
         service.response._ensure_response(conn_id)
         service.dispatch_pipeline_event(
@@ -1845,6 +2843,21 @@ class TestUsageMetricsTracking:
             ),
         )
         assert service._state(conn_id).response_usage.tool_calls == 2
+
+    def test_duplicate_function_call_terminal_is_emitted_once(self, service, conn_id):
+        event = AssistantTextEvent(
+            text="",
+            tools=[{"type": "function_call", "call_id": "call_once", "name": "f1", "arguments": "{}"}],
+        )
+
+        first = service.dispatch_pipeline_event(conn_id, event)
+        duplicate = service.dispatch_pipeline_event(conn_id, event.model_copy(deep=True))
+
+        assert sum(isinstance(item, ResponseFunctionCallArgumentsDoneEvent) for item in first) == 1
+        assert not any(isinstance(item, ResponseFunctionCallArgumentsDoneEvent) for item in duplicate)
+        state = service._state(conn_id)
+        assert state.pending_tool_call_ids == {"call_once"}
+        assert state.response_usage.tool_calls == 1
 
     def test_tool_calls_rolls_into_global(self, service, conn_id):
         service.response._ensure_response(conn_id)

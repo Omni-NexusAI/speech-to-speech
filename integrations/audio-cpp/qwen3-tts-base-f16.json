@@ -1,0 +1,26 @@
+{
+  "host": "0.0.0.0",
+  "port": 8080,
+  "backend": "cuda",
+  "device": 0,
+  "threads": 1,
+  "lazy_load": true,
+  "models": [
+    {
+      "id": "qwen3-tts-0.6b-base-bf16",
+      "family": "qwen3_tts",
+      "path": "/opt/models/Qwen3-TTS-12Hz-0.6B-Base",
+      "task": "tts",
+      "mode": "offline",
+      "lazy": true
+    },
+    {
+      "id": "qwen3-tts-1.7b-base-bf16",
+      "family": "qwen3_tts",
+      "path": "/opt/models/Qwen3-TTS-12Hz-1.7B-Base",
+      "task": "tts",
+      "mode": "offline",
+      "lazy": true
+    }
+  ]
+}

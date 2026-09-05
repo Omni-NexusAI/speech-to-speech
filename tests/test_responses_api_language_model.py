@@ -7,7 +7,9 @@ from openai import Stream
 from openai.types.realtime.conversation_item import (
     RealtimeConversationItemAssistantMessage,
     RealtimeConversationItemFunctionCallOutput,
+    RealtimeConversationItemUserMessage,
 )
+from openai.types.realtime.realtime_conversation_item_user_message import Content as UserContent
 from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
 from openai.types.responses import (
     Response,
@@ -23,6 +25,7 @@ from speech_to_speech.LLM.chat import Chat, make_user_message
 from speech_to_speech.LLM.responses_api_language_model import ResponsesApiModelHandler
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.messages import EndOfResponse, GenerateResponseRequest, LLMResponseChunk, TokenUsage
+from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 
 
 def _make_text_delta_event(text):
@@ -91,6 +94,19 @@ def _make_request(text="Hi", chat_size=2):
     return GenerateResponseRequest(runtime_config=cfg)
 
 
+def _add_user_image(chat, text, image_url):
+    return chat.add_item(
+        RealtimeConversationItemUserMessage(
+            type="message",
+            role="user",
+            content=[
+                UserContent(type="input_text", text=text),
+                UserContent(type="input_image", image_url=image_url),
+            ],
+        )
+    )
+
+
 def _make_handler(*, disable_thinking=False, stream=True, cancel_scope=None):
     handler = object.__new__(ResponsesApiModelHandler)
     handler.model_name = "test-model"
@@ -132,6 +148,87 @@ def test_process_streams_text_from_response_events():
     assert isinstance(outputs[0], LLMResponseChunk) and outputs[0].text == "Hello."
     assert isinstance(outputs[1], LLMResponseChunk) and outputs[1].text == "How are you?"
     assert isinstance(outputs[2], EndOfResponse)
+
+
+def test_streaming_outputs_preserve_response_epoch_identity():
+    """Responses API text and terminal output remain bound to one owner."""
+    handler = _make_handler()
+    handler.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            create=lambda **kwargs: _make_stream(
+                [
+                    _make_text_delta_event("Hello."),
+                    _make_output_item_done_event(content="Hello."),
+                ]
+            )
+        )
+    )
+    request = _make_request("Hi")
+    request.input_epoch = 7
+    request.response_epoch = 11
+    request.response_id = "resp_epoch_11"
+
+    outputs = list(handler.process(request))
+
+    assert any(isinstance(output, LLMResponseChunk) for output in outputs)
+    assert isinstance(outputs[-1], EndOfResponse)
+    for output in outputs:
+        assert output.input_epoch == 7
+        assert output.response_epoch == 11
+        assert output.response_id == "resp_epoch_11"
+
+
+def test_streaming_current_response_epoch_survives_newer_speculative_input():
+    """Post-audible non-interrupt output is governed by response ownership."""
+
+    handler = _make_handler()
+    tracker = SpeculativeTurnTracker()
+    tracker.observe("turn_new", 0)
+    handler.speculative_turns = tracker
+    handler.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            create=lambda **kwargs: _make_stream(
+                [
+                    _make_text_delta_event("Retained answer."),
+                    _make_output_item_done_event(content="Retained answer."),
+                ]
+            )
+        )
+    )
+    request = _make_request("Earlier accepted input")
+    request.turn_id = "turn_old"
+    request.turn_revision = 0
+    request.response_epoch = 73
+    request.runtime_config.local_pipeline["_response_epoch_is_current"] = lambda epoch: epoch == 73
+
+    outputs = list(handler.process(request))
+
+    assert any(
+        isinstance(output, LLMResponseChunk) and output.text == "Retained answer."
+        for output in outputs
+    )
+    assert isinstance(outputs[-1], EndOfResponse)
+    assert outputs[-1].response_epoch == 73
+
+
+def test_responses_api_does_not_call_provider_for_cancelled_queued_epoch():
+    """Queued non-interrupt turns wait at the shared LLM admission boundary."""
+
+    handler = _make_handler()
+    provider_calls = []
+    handler.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **kwargs: provider_calls.append(kwargs))
+    )
+    request = _make_request("Queued accepted input")
+    request.response_epoch = 74
+    waited = []
+    request.runtime_config.local_pipeline["_wait_response_epoch_current"] = (
+        lambda epoch: (waited.append(epoch), False)[1]
+    )
+
+    assert list(handler.process(request)) == []
+    assert waited == [74]
+    assert provider_calls == []
 
 
 def test_text_only_streams_raw_deltas_without_sentence_trimming():
@@ -305,6 +402,30 @@ def test_process_handles_cancellation():
     assert isinstance(outputs[0], EndOfResponse)
 
 
+def test_cancelled_generation_retires_only_images_in_its_input_snapshot():
+    scope = CancelScope()
+    handler = _make_handler(cancel_scope=scope)
+    cfg = _make_runtime_config()
+    consumed = _add_user_image(cfg.chat, "look at this", "data:image/jpeg;base64,OLD")
+    fresh = None
+
+    def fake_create(**kwargs):
+        nonlocal fresh
+        fresh = _add_user_image(cfg.chat, "next frame", "data:image/jpeg;base64,NEW")
+        scope.cancel()
+        return _make_stream([_make_text_delta_event("stale")])
+
+    handler.client = SimpleNamespace(responses=SimpleNamespace(create=fake_create))
+
+    outputs = list(handler.process(GenerateResponseRequest(runtime_config=cfg)))
+
+    assert len(outputs) == 1
+    assert isinstance(outputs[0], EndOfResponse)
+    assert all(part.type != "input_image" for part in consumed.content)
+    assert fresh is not None
+    assert any(part.type == "input_image" for part in fresh.content)
+
+
 def test_responses_api_timing_logs_only_text_chunks():
     handler = object.__new__(ResponsesApiModelHandler)
     handler._times = [0.01]
@@ -327,12 +448,9 @@ def test_process_read_timeout_ends_response_cleanly():
 
     outputs = list(handler.process(_make_request("Hi")))
 
-    assert len(outputs) == 2
-    assert (
-        isinstance(outputs[0], LLMResponseChunk)
-        and outputs[0].text == "Wow I'm a bit slow today, could you repeat that?"
-    )
-    assert isinstance(outputs[1], EndOfResponse)
+    assert len(outputs) == 1
+    assert isinstance(outputs[0], EndOfResponse)
+    assert outputs[0].error == "Language model response timed out."
 
 
 def test_generation_error_emits_failed_end_of_response():
@@ -354,6 +472,22 @@ def test_generation_error_emits_failed_end_of_response():
     assert "input must not be empty" in eors[0].error
     # No partial output committed; the only thing emitted is the failed EndOfResponse.
     assert all(isinstance(o, EndOfResponse) for o in outputs)
+
+
+def test_generation_error_retires_consumed_camera_image():
+    handler = _make_handler()
+    cfg = _make_runtime_config()
+    consumed = _add_user_image(cfg.chat, "look at this", "data:image/jpeg;base64,OLD")
+
+    def boom(**kwargs):
+        raise RuntimeError("provider failed")
+
+    handler.client = SimpleNamespace(responses=SimpleNamespace(create=boom))
+
+    outputs = list(handler.process(GenerateResponseRequest(runtime_config=cfg)))
+
+    assert outputs[-1].error is not None
+    assert all(part.type != "input_image" for part in consumed.content)
 
 
 def test_empty_context_fails_with_clear_message_without_calling_provider():

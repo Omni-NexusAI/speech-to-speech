@@ -15,6 +15,8 @@ import numpy as np
 
 from speech_to_speech.pipeline.messages import (
     AudioOutput,
+    DirectAssistantRequest,
+    DirectAssistantResponse,
     EndOfResponse,
     GenerateResponseRequest,
     LLMResponseChunk,
@@ -27,18 +29,18 @@ from speech_to_speech.pipeline.messages import (
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 
-# ── VAD stage ─────────────────────────────────────────────────────────
+# â”€â”€ VAD stage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 VADIn: TypeAlias = bytes | tuple[bytes, RuntimeConfig]
 VADOut: TypeAlias = VADAudio
 
-# ── STT stage ─────────────────────────────────────────────────────────
+# â”€â”€ STT stage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 STTIn: TypeAlias = VADAudio
-STTOut: TypeAlias = PartialTranscription | Transcription
+STTOut: TypeAlias = PartialTranscription | Transcription | DirectAssistantResponse
 
-# ── LLM stage ─────────────────────────────────────────────────────────
-LLMIn: TypeAlias = GenerateResponseRequest
+# â”€â”€ LLM stage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+LLMIn: TypeAlias = GenerateResponseRequest | DirectAssistantRequest
 LLMOut: TypeAlias = LLMResponseChunk | TokenUsage | EndOfResponse
 
-# ── TTS stage ─────────────────────────────────────────────────────────
+# â”€â”€ TTS stage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 TTSIn: TypeAlias = TTSInput | EndOfResponse
 TTSOut: TypeAlias = bytes | np.ndarray | AudioOutput

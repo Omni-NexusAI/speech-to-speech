@@ -4,6 +4,7 @@ from dataclasses import fields
 from speech_to_speech.arguments_classes.chat_tts_arguments import ChatTTSHandlerArguments
 from speech_to_speech.arguments_classes.facebookmms_tts_arguments import FacebookMMSTTSHandlerArguments
 from speech_to_speech.arguments_classes.faster_whisper_stt_arguments import FasterWhisperSTTHandlerArguments
+from speech_to_speech.arguments_classes.gemma_audio_stt_arguments import GemmaAudioSTTHandlerArguments
 from speech_to_speech.arguments_classes.kokoro_tts_arguments import KokoroTTSHandlerArguments
 from speech_to_speech.arguments_classes.language_model_arguments import LanguageModelHandlerArguments
 from speech_to_speech.arguments_classes.mlx_audio_whisper_arguments import MLXAudioWhisperSTTHandlerArguments
@@ -20,7 +21,7 @@ from speech_to_speech.arguments_classes.socket_sender_arguments import SocketSen
 from speech_to_speech.arguments_classes.vad_arguments import VADHandlerArguments
 from speech_to_speech.arguments_classes.websocket_streamer_arguments import WebSocketStreamerArguments
 from speech_to_speech.arguments_classes.whisper_stt_arguments import WhisperSTTHandlerArguments
-from speech_to_speech.s2s_pipeline import ParsedArguments, parse_arguments
+from speech_to_speech.s2s_pipeline import ECHO_GUARD_RUNTIME_DESCRIPTOR, ParsedArguments, parse_arguments
 
 
 def test_release_defaults_match_responses_api_parakeet_qwen3_realtime_profile():
@@ -52,6 +53,28 @@ def test_release_defaults_match_responses_api_parakeet_qwen3_realtime_profile():
     assert qwen3_args.qwen3_tts_non_streaming_mode is True
     assert qwen3_args.qwen3_tts_ref_audio is None
     assert qwen3_args.qwen3_tts_mlx_quantization == "6bit"
+    assert qwen3_args.qwen3_tts_api_base_url == "http://127.0.0.1:8881/v1"
+    assert qwen3_args.qwen3_tts_api_voice == "clone:16d9bb336799"
+    assert qwen3_args.qwen3_tts_api_backend_model == "1.7B-Base"
+
+
+def test_runtime_echo_guard_descriptor_matches_client_owned_aec3_contract():
+    descriptor = ECHO_GUARD_RUNTIME_DESCRIPTOR
+
+    assert descriptor["default"] == "native"
+    assert descriptor["modes"] == ["native", "adaptive", "strict"]
+    assert descriptor["reference"] == "post_gain_resampled_scheduled_playback_pcm"
+    assert descriptor["ownership"] == "client"
+    assert descriptor["adaptive"] == {
+        "implementation": "sonora_aec3_wasm",
+        "activation": "validated_module_only",
+        "availability": "client_reported",
+        "calibration": "per_microphone_output_device_pair",
+        "failure_mode": "native",
+    }
+    assert descriptor["strict"] == {"failure_mode": "fail_closed"}
+    assert "filter" not in descriptor
+    assert "nlms" not in str(descriptor).lower()
 
 
 # -- ParsedArguments dataclass tests ------------------------------------------
@@ -67,6 +90,7 @@ EXPECTED_FIELD_TYPES = {
     "faster_whisper_stt_handler_kwargs": FasterWhisperSTTHandlerArguments,
     "mlx_audio_whisper_stt_handler_kwargs": MLXAudioWhisperSTTHandlerArguments,
     "parakeet_tdt_stt_handler_kwargs": ParakeetTDTSTTHandlerArguments,
+    "gemma_audio_stt_handler_kwargs": GemmaAudioSTTHandlerArguments,
     "language_model_handler_kwargs": LanguageModelHandlerArguments,
     "responses_api_language_model_handler_kwargs": ResponsesApiLanguageModelHandlerArguments,
     "chat_tts_handler_kwargs": ChatTTSHandlerArguments,
@@ -114,6 +138,18 @@ def test_parse_arguments_accepts_qwen3_tts_backend_override():
         sys.argv = original_argv
 
     assert args.qwen3_tts_handler_kwargs.qwen3_tts_backend == "torch"
+
+
+def test_parse_arguments_accepts_local_gemma_audio_and_remote_tts():
+    original_argv = sys.argv[:]
+    try:
+        sys.argv = ["speech-to-speech", "--stt", "gemma-audio", "--qwen3_tts_backend", "openai-api"]
+        args = parse_arguments()
+    finally:
+        sys.argv = original_argv
+
+    assert args.module_kwargs.stt == "gemma-audio"
+    assert args.qwen3_tts_handler_kwargs.qwen3_tts_backend == "openai-api"
 
 
 def test_parse_arguments_transformers_backend():

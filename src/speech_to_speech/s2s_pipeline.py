@@ -29,6 +29,7 @@ from speech_to_speech.arguments_classes.facebookmms_tts_arguments import Faceboo
 from speech_to_speech.arguments_classes.faster_whisper_stt_arguments import (
     FasterWhisperSTTHandlerArguments,
 )
+from speech_to_speech.arguments_classes.gemma_audio_stt_arguments import GemmaAudioSTTHandlerArguments
 from speech_to_speech.arguments_classes.kokoro_tts_arguments import KokoroTTSHandlerArguments
 from speech_to_speech.arguments_classes.language_model_arguments import LanguageModelHandlerArguments
 from speech_to_speech.arguments_classes.mlx_audio_whisper_arguments import (
@@ -51,8 +52,10 @@ from speech_to_speech.arguments_classes.websocket_streamer_arguments import WebS
 from speech_to_speech.arguments_classes.whisper_stt_arguments import WhisperSTTHandlerArguments
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.LLM.chat import Chat
+from speech_to_speech.LLM.direct_history_compaction import normalize_history_compaction
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.handler_types import LLMIn, LLMOut, STTIn, STTOut, TTSIn, TTSOut
+from speech_to_speech.pipeline.model_operations import ModelOperationCoordinator
 from speech_to_speech.pipeline.queue_types import (
     AudioInItem,
     AudioOutItem,
@@ -88,6 +91,54 @@ logger = logging.getLogger(__name__)
 logging.getLogger("numba").setLevel(logging.WARNING)  # quiet down numba logs
 
 
+ECHO_GUARD_RUNTIME_DESCRIPTOR = {
+    "default": "native",
+    "modes": ["native", "adaptive", "strict"],
+    "reference": "post_gain_resampled_scheduled_playback_pcm",
+    "ownership": "client",
+    "adaptive": {
+        "implementation": "sonora_aec3_wasm",
+        "activation": "validated_module_only",
+        "availability": "client_reported",
+        "calibration": "per_microphone_output_device_pair",
+        "failure_mode": "native",
+    },
+    "strict": {
+        "failure_mode": "fail_closed",
+    },
+}
+
+
+def _idle_pool_context_descriptor(
+    *,
+    stt: str,
+    chat_size: int,
+    context_window: int | None,
+    compact_history: bool,
+) -> dict[str, Any]:
+    """Describe configured context policy before a pooled conversation has usage."""
+    if stt != "gemma-audio":
+        # Preserve the existing non-direct descriptor and its upstream turn cap.
+        return {
+            "limit": chat_size,
+            "turn_limit": chat_size,
+            "history_tokens": 0,
+            "max_tokens": context_window,
+            "compact_history": compact_history,
+            "policy": "compact" if compact_history else "visible_trim",
+        }
+    default_policy = RuntimeConfig().local_pipeline.get("history_compaction")
+    policy = normalize_history_compaction(default_policy)
+    return {
+        "history_tokens": None,
+        "max_tokens": context_window,
+        "history_compaction": {
+            "policy": policy,
+            "status": {"status": "idle", "last_failure": None},
+        },
+    }
+
+
 @dataclass
 class ParsedArguments:
     module_kwargs: ModuleArguments
@@ -100,6 +151,7 @@ class ParsedArguments:
     faster_whisper_stt_handler_kwargs: FasterWhisperSTTHandlerArguments
     mlx_audio_whisper_stt_handler_kwargs: MLXAudioWhisperSTTHandlerArguments
     parakeet_tdt_stt_handler_kwargs: ParakeetTDTSTTHandlerArguments
+    gemma_audio_stt_handler_kwargs: GemmaAudioSTTHandlerArguments
     language_model_handler_kwargs: LanguageModelHandlerArguments
     responses_api_language_model_handler_kwargs: ResponsesApiLanguageModelHandlerArguments
     chat_tts_handler_kwargs: ChatTTSHandlerArguments
@@ -159,6 +211,7 @@ def parse_arguments() -> ParsedArguments:
             FasterWhisperSTTHandlerArguments,
             MLXAudioWhisperSTTHandlerArguments,
             ParakeetTDTSTTHandlerArguments,
+            GemmaAudioSTTHandlerArguments,
             _lm_class,
             ChatTTSHandlerArguments,
             FacebookMMSTTSHandlerArguments,
@@ -188,6 +241,7 @@ def parse_arguments() -> ParsedArguments:
         faster_whisper_stt_handler_kwargs=by_type[FasterWhisperSTTHandlerArguments],
         mlx_audio_whisper_stt_handler_kwargs=by_type[MLXAudioWhisperSTTHandlerArguments],
         parakeet_tdt_stt_handler_kwargs=by_type[ParakeetTDTSTTHandlerArguments],
+        gemma_audio_stt_handler_kwargs=by_type[GemmaAudioSTTHandlerArguments],
         language_model_handler_kwargs=by_type.get(LanguageModelHandlerArguments, LanguageModelHandlerArguments()),
         # The OpenAI-compatible slot holds whichever class was registered:
         # ChatCompletions... (a subclass) for chat-completions, else ResponsesApi....
@@ -211,6 +265,14 @@ def setup_logger(log_level: str) -> None:
         level=log_level.upper(),
         format="%(asctime)s - %(pipeline_prefix)s%(name)s - %(levelname)s - %(message)s",
     )
+    runtime_log_path = os.getenv("S2S_RUNTIME_LOG_FILE")
+    if runtime_log_path:
+        root_logger = logging.getLogger()
+        target = os.path.abspath(runtime_log_path)
+        if not any(getattr(handler, "baseFilename", None) == target for handler in root_logger.handlers):
+            file_handler = logging.FileHandler(target, encoding="utf-8")
+            file_handler.setFormatter(logging.Formatter("%(asctime)s - %(pipeline_prefix)s%(name)s - %(levelname)s - %(message)s"))
+            root_logger.addHandler(file_handler)
     # Attach the filter to every existing handler so each LogRecord gets a
     # `pipeline_prefix` attribute (matching the format string above).
     pipeline_filter = PipelineLogFilter()
@@ -293,6 +355,7 @@ def prepare_all_args(
     faster_whisper_stt_handler_kwargs: FasterWhisperSTTHandlerArguments,
     mlx_audio_whisper_stt_handler_kwargs: MLXAudioWhisperSTTHandlerArguments,
     parakeet_tdt_stt_handler_kwargs: ParakeetTDTSTTHandlerArguments,
+    gemma_audio_stt_handler_kwargs: GemmaAudioSTTHandlerArguments,
     language_model_handler_kwargs: LanguageModelHandlerArguments,
     responses_api_language_model_handler_kwargs: ResponsesApiLanguageModelHandlerArguments,
     chat_tts_handler_kwargs: ChatTTSHandlerArguments,
@@ -308,6 +371,7 @@ def prepare_all_args(
         paraformer_stt_handler_kwargs,
         mlx_audio_whisper_stt_handler_kwargs,
         parakeet_tdt_stt_handler_kwargs,
+        gemma_audio_stt_handler_kwargs,
         language_model_handler_kwargs,
         responses_api_language_model_handler_kwargs,
         chat_tts_handler_kwargs,
@@ -322,6 +386,7 @@ def prepare_all_args(
     rename_args(paraformer_stt_handler_kwargs, "paraformer_stt")
     rename_args(mlx_audio_whisper_stt_handler_kwargs, "mlx_audio_whisper")
     rename_args(parakeet_tdt_stt_handler_kwargs, "parakeet_tdt")
+    rename_args(gemma_audio_stt_handler_kwargs, "gemma_audio")
     rename_args(language_model_handler_kwargs, "llm")
     rename_args(responses_api_language_model_handler_kwargs, "responses_api")
     rename_args(chat_tts_handler_kwargs, "chat_tts")
@@ -368,6 +433,7 @@ def _build_pipeline_handlers(
     paraformer_stt_handler_kwargs: ParaformerSTTHandlerArguments,
     mlx_audio_whisper_stt_handler_kwargs: MLXAudioWhisperSTTHandlerArguments,
     parakeet_tdt_stt_handler_kwargs: ParakeetTDTSTTHandlerArguments,
+    gemma_audio_stt_handler_kwargs: GemmaAudioSTTHandlerArguments,
     language_model_handler_kwargs: LanguageModelHandlerArguments,
     responses_api_language_model_handler_kwargs: ResponsesApiLanguageModelHandlerArguments,
     chat_tts_handler_kwargs: ChatTTSHandlerArguments,
@@ -411,6 +477,7 @@ def _build_pipeline_handlers(
         paraformer_stt_handler_kwargs,
         mlx_audio_whisper_stt_handler_kwargs,
         parakeet_tdt_stt_handler_kwargs,
+        gemma_audio_stt_handler_kwargs,
     )
 
     lm = get_llm_handler(
@@ -456,6 +523,7 @@ def _build_realtime_pipeline_unit(
     paraformer_stt_handler_kwargs: ParaformerSTTHandlerArguments,
     mlx_audio_whisper_stt_handler_kwargs: MLXAudioWhisperSTTHandlerArguments,
     parakeet_tdt_stt_handler_kwargs: ParakeetTDTSTTHandlerArguments,
+    gemma_audio_stt_handler_kwargs: GemmaAudioSTTHandlerArguments,
     language_model_handler_kwargs: LanguageModelHandlerArguments,
     responses_api_language_model_handler_kwargs: ResponsesApiLanguageModelHandlerArguments,
     chat_tts_handler_kwargs: ChatTTSHandlerArguments,
@@ -479,6 +547,7 @@ def _build_realtime_pipeline_unit(
     paraformer_kw = deepcopy(paraformer_stt_handler_kwargs)
     mlx_audio_whisper_kw = deepcopy(mlx_audio_whisper_stt_handler_kwargs)
     parakeet_kw = deepcopy(parakeet_tdt_stt_handler_kwargs)
+    gemma_audio_kw = deepcopy(gemma_audio_stt_handler_kwargs)
     lm_kw = deepcopy(language_model_handler_kwargs)
     responses_api_kw = deepcopy(responses_api_language_model_handler_kwargs)
     chat_tts_kw = deepcopy(chat_tts_handler_kwargs)
@@ -490,6 +559,7 @@ def _build_realtime_pipeline_unit(
     should_listen = Event()
     response_playing = Event()
     cancel_scope = CancelScope()
+    model_operations = ModelOperationCoordinator()
     speculative_turns = SpeculativeTurnTracker()
     recv_audio_chunks_queue: Queue[AudioInItem] = Queue()
     send_audio_chunks_queue: Queue[AudioOutItem] = Queue()
@@ -502,6 +572,12 @@ def _build_realtime_pipeline_unit(
 
     vars(vad_kw)["text_output_queue"] = text_output_queue
     vars(vad_kw)["speculative_turns"] = speculative_turns
+    vars(gemma_audio_kw)["text_output_queue"] = text_output_queue
+    vars(gemma_audio_kw)["cancel_scope"] = cancel_scope
+    vars(gemma_audio_kw)["model_operations"] = model_operations
+    vars(responses_api_kw)["model_operations"] = model_operations
+    vars(responses_api_kw)["text_output_queue"] = text_output_queue
+    vars(qwen3_tts_kw)["text_output_queue"] = text_output_queue
     for kw in (
         lm_kw,
         responses_api_kw,
@@ -524,9 +600,16 @@ def _build_realtime_pipeline_unit(
         should_listen=should_listen,
         chat_size=chat_size,
         speculative_turns=speculative_turns,
+        context_tokenizer_base_url=(
+            gemma_audio_kw.base_url if module_kwargs.stt == "gemma-audio" else None
+        ),
+        default_model_name=gemma_audio_kw.model_name,
+        default_model_api_key=gemma_audio_kw.api_key,
+        model_operations=model_operations,
+        direct_audio_session=module_kwargs.stt == "gemma-audio",
     )
 
-    if module_kwargs.enable_live_transcription:
+    if module_kwargs.enable_live_transcription or module_kwargs.stt == "gemma-audio":
         vad_kw.enable_realtime_transcription = True
         vad_kw.realtime_processing_pause = module_kwargs.live_transcription_update_interval
 
@@ -552,6 +635,7 @@ def _build_realtime_pipeline_unit(
         paraformer_stt_handler_kwargs=paraformer_kw,
         mlx_audio_whisper_stt_handler_kwargs=mlx_audio_whisper_kw,
         parakeet_tdt_stt_handler_kwargs=parakeet_kw,
+        gemma_audio_stt_handler_kwargs=gemma_audio_kw,
         language_model_handler_kwargs=lm_kw,
         responses_api_language_model_handler_kwargs=responses_api_kw,
         chat_tts_handler_kwargs=chat_tts_kw,
@@ -568,6 +652,7 @@ def _build_realtime_pipeline_unit(
         index=index,
         service=service,
         cancel_scope=cancel_scope,
+        model_operations=model_operations,
         should_listen=should_listen,
         response_playing=response_playing,
         input_queue=recv_audio_chunks_queue,
@@ -589,6 +674,7 @@ def build_pipeline(
     paraformer_stt_handler_kwargs: ParaformerSTTHandlerArguments,
     mlx_audio_whisper_stt_handler_kwargs: MLXAudioWhisperSTTHandlerArguments,
     parakeet_tdt_stt_handler_kwargs: ParakeetTDTSTTHandlerArguments,
+    gemma_audio_stt_handler_kwargs: GemmaAudioSTTHandlerArguments,
     language_model_handler_kwargs: LanguageModelHandlerArguments,
     responses_api_language_model_handler_kwargs: ResponsesApiLanguageModelHandlerArguments,
     chat_tts_handler_kwargs: ChatTTSHandlerArguments,
@@ -651,6 +737,7 @@ def build_pipeline(
                 paraformer_stt_handler_kwargs=paraformer_stt_handler_kwargs,
                 mlx_audio_whisper_stt_handler_kwargs=mlx_audio_whisper_stt_handler_kwargs,
                 parakeet_tdt_stt_handler_kwargs=parakeet_tdt_stt_handler_kwargs,
+                gemma_audio_stt_handler_kwargs=gemma_audio_stt_handler_kwargs,
                 language_model_handler_kwargs=language_model_handler_kwargs,
                 responses_api_language_model_handler_kwargs=responses_api_language_model_handler_kwargs,
                 chat_tts_handler_kwargs=chat_tts_handler_kwargs,
@@ -662,11 +749,36 @@ def build_pipeline(
             for i in range(pool_size)
         ]
 
+        runtime_lm_kwargs = (
+            responses_api_language_model_handler_kwargs
+            if module_kwargs.llm_backend in ("responses-api", "chat-completions")
+            else language_model_handler_kwargs
+        )
         realtime_server = RealtimeServer(
             stop_event=stop_event,
             pool=pool,
             host=websocket_streamer_kwargs.ws_host,
             port=websocket_streamer_kwargs.ws_port,
+            runtime_info={
+                "mode": "local-direct-audio" if module_kwargs.stt == "gemma-audio" else "realtime",
+                "stt": module_kwargs.stt,
+                "live_transcription": module_kwargs.enable_live_transcription,
+                "live_transcription_update_interval": module_kwargs.live_transcription_update_interval,
+                "turn_handling": {
+                    "stabilization_ms": int(gemma_audio_stt_handler_kwargs.revision_settle_s * 1000),
+                    "reopen_horizon_ms": vad_handler_kwargs.unanswered_reopen_ms,
+                    "max_revisions": vad_handler_kwargs.max_speculative_revisions,
+                    "max_combined_audio_ms": vad_handler_kwargs.max_speculative_audio_ms,
+                    "horizon_policy": "fixed_first_soft_endpoint",
+                },
+                "echo_guard": deepcopy(ECHO_GUARD_RUNTIME_DESCRIPTOR),
+                "context": _idle_pool_context_descriptor(
+                    stt=module_kwargs.stt,
+                    chat_size=runtime_lm_kwargs.chat_size,
+                    context_window=pool[0].service.default_model_endpoint.context_window,
+                    compact_history=runtime_lm_kwargs.compact_history,
+                ),
+            },
         )
 
         all_handlers: list[Any] = [realtime_server]
@@ -696,7 +808,7 @@ def build_pipeline(
         ]
 
     # Set VAD realtime transcription parameters from module_kwargs
-    if module_kwargs.enable_live_transcription:
+    if module_kwargs.enable_live_transcription or module_kwargs.stt == "gemma-audio":
         vad_handler_kwargs.enable_realtime_transcription = True
         vad_handler_kwargs.realtime_processing_pause = module_kwargs.live_transcription_update_interval
 
@@ -735,6 +847,7 @@ def build_pipeline(
         paraformer_stt_handler_kwargs=paraformer_stt_handler_kwargs,
         mlx_audio_whisper_stt_handler_kwargs=mlx_audio_whisper_stt_handler_kwargs,
         parakeet_tdt_stt_handler_kwargs=parakeet_tdt_stt_handler_kwargs,
+        gemma_audio_stt_handler_kwargs=gemma_audio_stt_handler_kwargs,
         language_model_handler_kwargs=language_model_handler_kwargs,
         responses_api_language_model_handler_kwargs=responses_api_language_model_handler_kwargs,
         chat_tts_handler_kwargs=chat_tts_handler_kwargs,
@@ -758,12 +871,16 @@ def get_stt_handler(
     paraformer_stt_handler_kwargs: ParaformerSTTHandlerArguments,
     mlx_audio_whisper_stt_handler_kwargs: MLXAudioWhisperSTTHandlerArguments,
     parakeet_tdt_stt_handler_kwargs: ParakeetTDTSTTHandlerArguments,
+    gemma_audio_stt_handler_kwargs: GemmaAudioSTTHandlerArguments,
 ) -> BaseHandler[STTIn, STTOut]:
     from speech_to_speech.STT.base_stt_handler import BaseSTTHandler
 
     def with_speculative_turns(handler: BaseSTTHandler) -> BaseSTTHandler:
         if speculative_turns is not None:
             handler.speculative_turns = speculative_turns
+            attached = getattr(handler, "on_speculative_turns_attached", None)
+            if callable(attached):
+                attached()
         return handler
 
     if module_kwargs.stt == "whisper":
@@ -841,9 +958,20 @@ def get_stt_handler(
                 setup_kwargs=setup_kwargs,
             )
         )
+    elif module_kwargs.stt == "gemma-audio":
+        from speech_to_speech.STT.gemma_audio_handler import GemmaAudioSTTHandler
+
+        return with_speculative_turns(
+            GemmaAudioSTTHandler(
+                stop_event,
+                queue_in=spoken_prompt_queue,
+                queue_out=text_prompt_queue,
+                setup_kwargs=vars(gemma_audio_stt_handler_kwargs),
+            )
+        )
     else:
         raise ValueError(
-            "The STT should be either whisper, whisper-mlx, mlx-audio-whisper, faster-whisper, parakeet-tdt, or paraformer."
+            "The STT should be either whisper, whisper-mlx, mlx-audio-whisper, faster-whisper, parakeet-tdt, paraformer, or gemma-audio."
         )
 
 
@@ -996,6 +1124,7 @@ def main() -> None:
         args.faster_whisper_stt_handler_kwargs,
         args.mlx_audio_whisper_stt_handler_kwargs,
         args.parakeet_tdt_stt_handler_kwargs,
+        args.gemma_audio_stt_handler_kwargs,
         args.language_model_handler_kwargs,
         args.responses_api_language_model_handler_kwargs,
         args.chat_tts_handler_kwargs,
@@ -1040,6 +1169,7 @@ def main() -> None:
         args.paraformer_stt_handler_kwargs,
         args.mlx_audio_whisper_stt_handler_kwargs,
         args.parakeet_tdt_stt_handler_kwargs,
+        args.gemma_audio_stt_handler_kwargs,
         args.language_model_handler_kwargs,
         args.responses_api_language_model_handler_kwargs,
         args.chat_tts_handler_kwargs,

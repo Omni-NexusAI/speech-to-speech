@@ -4,6 +4,8 @@ import json
 import logging
 import threading
 from collections.abc import Callable
+from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, Literal, Union
 
 from openai.types.realtime import ConversationItem
@@ -54,6 +56,24 @@ class CompactionResult(BaseModel):
     assistant_summary: str
 
 
+@dataclass(frozen=True)
+class ChatCheckpoint:
+    """Rollback point for an unheard provisional response transaction.
+
+    Checkpoints are intentionally conversation-local and only used while an
+    answer has not reached browser playback.  They retain the exact pending
+    tool-call map so a superseded turn cannot later restart a follow-up.
+    """
+
+    buffer: tuple[SupportedItem, ...]
+    user_turn_count: int
+    pending_tool_calls: dict[str, RealtimeConversationItemFunctionCall]
+    trim_count: int
+    memory_summary: str | None = None
+    revision: int = 0
+    assistant_exchange_ids: dict[str, str] | None = None
+
+
 def _ensure_id(value: str | None, prefix: str) -> str:
     if value is None:
         return _generate_id(prefix)
@@ -101,6 +121,11 @@ class Chat:
         self.buffer: list[SupportedItem] = []
         self._pending_tool_calls: dict[str, RealtimeConversationItemFunctionCall] = {}
         self._user_turn_count: int = 0
+        self._trim_count: int = 0
+        self._managed_history = False
+        self._memory_summary: str | None = None
+        self._assistant_exchange_ids: dict[str, str] = {}
+        self._revision = 0
 
         # All state mutations and serializations go through _lock. Public methods
         # acquire it once; internal callers that already hold it use the
@@ -122,6 +147,7 @@ class Chat:
             self._user_turn_count -= 1
         while self.buffer and not isinstance(self.buffer[0], RealtimeConversationItemUserMessage):
             self.buffer.pop(0)
+        self._trim_count += 1
 
     def _has_call_id_in_buffer(self, call_id: str) -> bool:
         for entry in self.buffer:
@@ -148,21 +174,90 @@ class Chat:
         """
         with self._lock:
             self._append_tool_output_locked(call_id, output_item)
+            self._revision += 1
+
+    def discard_pending_tool_calls(self, call_ids: set[str]) -> None:
+        """Drop unresolved calls that were superseded by newer user speech."""
+        if not call_ids:
+            return
+        with self._lock:
+            self._pending_tool_calls = {
+                call_id: call
+                for call_id, call in self._pending_tool_calls.items()
+                if call_id not in call_ids
+            }
+            self.buffer = [
+                item
+                for item in self.buffer
+                if not (
+                    isinstance(item, RealtimeConversationItemFunctionCall)
+                    and item.call_id in call_ids
+                )
+            ]
+            self._revision += 1
+
+    def checkpoint(self) -> ChatCheckpoint:
+        """Capture a bounded rollback point before model work begins."""
+        with self._lock:
+            buffer, pending_tool_calls = deepcopy((self.buffer, self._pending_tool_calls))
+            return ChatCheckpoint(
+                buffer=tuple(buffer),
+                user_turn_count=self._user_turn_count,
+                pending_tool_calls=pending_tool_calls,
+                trim_count=self._trim_count,
+                memory_summary=self._memory_summary,
+                revision=self._revision,
+                assistant_exchange_ids=deepcopy(self._assistant_exchange_ids),
+            )
+
+    def rollback(self, checkpoint: ChatCheckpoint) -> bool:
+        """Discard one unheard response transaction without touching history."""
+        with self._lock:
+            # A length-only tail delete is unsafe once max-history trimming has
+            # removed items from the front. Restore the immutable transaction
+            # snapshot so an unheard provisional turn cannot replace heard
+            # history at the 30-turn boundary.
+            buffer, pending_tool_calls = deepcopy((checkpoint.buffer, checkpoint.pending_tool_calls))
+            self.buffer = list(buffer)
+            self._user_turn_count = checkpoint.user_turn_count
+            self._pending_tool_calls = pending_tool_calls
+            self._trim_count = checkpoint.trim_count
+            self._memory_summary = checkpoint.memory_summary
+            self._assistant_exchange_ids = deepcopy(checkpoint.assistant_exchange_ids or {})
+            self._revision += 1
+            # Invalidate any background compaction snapshot captured after the
+            # provisional checkpoint.
+            self._gen_counter += 1
+            logger.debug("Restored provisional chat transaction to %d item(s)", len(checkpoint.buffer))
+            return True
 
     def _append_tool_output_locked(self, call_id: str, output_item: RealtimeConversationItemFunctionCallOutput) -> None:
         """Body of :meth:`append_tool_output`. Caller must hold ``_lock``."""
         if self._has_call_id_in_buffer(call_id):
+            exchange_id = next(
+                (
+                    self._assistant_exchange_ids.get(entry.id or "")
+                    for entry in self.buffer
+                    if isinstance(entry, RealtimeConversationItemFunctionCall) and entry.call_id == call_id
+                ),
+                None,
+            )
             self._pending_tool_calls.pop(call_id, None)
             self._mark_call_completed(call_id, output_item.status)
             self.buffer.append(output_item)
+            if exchange_id and output_item.id:
+                self._assistant_exchange_ids[output_item.id] = exchange_id
             return
 
         if call_id in self._pending_tool_calls:
             logger.info("Re-injecting evicted function_call for call_id=%s", call_id)
             fc = self._pending_tool_calls.pop(call_id)
+            exchange_id = self._assistant_exchange_ids.get(fc.id or "")
             fc.status = "completed" if output_item.status is None else output_item.status
             self.buffer.append(fc)
             self.buffer.append(output_item)
+            if exchange_id and output_item.id:
+                self._assistant_exchange_ids[output_item.id] = exchange_id
             return
 
         raise ChatItemError(f"No function_call with call_id '{call_id}' found in conversation history.")
@@ -170,6 +265,7 @@ class Chat:
     def init_chat(self, message: RealtimeConversationItemSystemMessage) -> None:
         with self._lock:
             self.init_chat_message = message
+            self._revision += 1
 
     def add_item(self, item: SupportedItem) -> SupportedItem:
         """Validate and route a conversation item into the chat buffer.
@@ -225,7 +321,7 @@ class Chat:
             else:
                 raise ChatItemError(f"Unsupported item type: {getattr(item, 'type', None)}")
 
-            if self.size > 0 and self._user_turn_count > 2 * self.size:
+            if not self._managed_history and self.size > 0 and self._user_turn_count > 2 * self.size:
                 logger.warning(
                     "Chat buffer exceeded hard cap (%d > 2 * size=%d); evicting oldest turn",
                     self._user_turn_count,
@@ -234,6 +330,7 @@ class Chat:
                 while self._user_turn_count > 2 * self.size:
                     self._evict_oldest_turn()
 
+            self._revision += 1
             return item
 
     def trim_if_needed(self, compactor: CompactFn | None = None) -> None:
@@ -246,6 +343,8 @@ class Chat:
         Call once after each successful generation, not inside :meth:`add_item`.
         """
         with self._lock:
+            if self._managed_history:
+                return
             if self._user_turn_count <= self.size:
                 return
             if compactor is not None:
@@ -267,6 +366,7 @@ class Chat:
                 if not isinstance(item, RealtimeConversationItemUserMessage) or item.id != item_id:
                     continue
                 item.content = [UserContent(type="input_text", text=text)]
+                self._revision += 1
                 logger.debug("Replaced speculative user message %s", item_id)
                 return True
         return False
@@ -280,9 +380,126 @@ class Chat:
                     continue
                 del self.buffer[index]
                 self._user_turn_count -= 1
+                self._revision += 1
                 logger.debug("Removed speculative user message %s", item_id)
                 return True
         return False
+
+    def enable_token_managed_history(self) -> None:
+        """Disable legacy turn eviction for this conversation only."""
+        with self._lock:
+            self._managed_history = True
+
+    def history_revision(self) -> int:
+        with self._lock:
+            return self._revision
+
+    def memory_summary(self) -> str | None:
+        with self._lock:
+            return self._memory_summary
+
+    def memory_snapshot(self, recent_turns: int) -> tuple[ResponseInputParam, set[str], int]:
+        """Return the old settled prefix eligible for token compaction."""
+        with self._lock:
+            # A direct-audio turn without optional transcript metadata is a
+            # truthful assistant-only exchange.  It must participate in the
+            # retention boundary rather than accumulating forever or gaining a
+            # fabricated user message merely to satisfy a counter.
+            exchanges: list[int] = []
+            current_assistant_exchange: str | None = None
+            for index, item in enumerate(self.buffer):
+                starts_exchange = isinstance(item, RealtimeConversationItemUserMessage)
+                exchange_id = self._assistant_exchange_ids.get(item.id or "")
+                if exchange_id is not None:
+                    # Direct audio can have no truthful user text.  The
+                    # response owner supplies one opaque exchange key for
+                    # every direct item belonging to that accepted audio turn,
+                    # including a tool call/output and terminal answer. A
+                    # different key is therefore a real turn boundary even
+                    # after an earlier textual user.
+                    starts_exchange = exchange_id != current_assistant_exchange
+                    current_assistant_exchange = exchange_id
+                elif isinstance(item, RealtimeConversationItemAssistantMessage):
+                    # A tool preamble/result after a textual user remains in
+                    # that user's exchange.
+                    starts_exchange = not exchanges
+                if starts_exchange:
+                    exchanges.append(index)
+                    if isinstance(item, RealtimeConversationItemUserMessage):
+                        current_assistant_exchange = None
+            if len(exchanges) <= max(1, recent_turns):
+                return [], set(), self._revision
+            end = exchanges[-max(1, recent_turns)]
+            prefix = self.buffer[:end]
+            # Never summarize an incomplete tool transaction.
+            if self._pending_tool_calls:
+                return [], set(), self._revision
+            ids = {item.id for item in prefix if item.id}
+            return self._to_responses_api_chat_locked(items=list(prefix)), ids, self._revision
+
+    def apply_memory_summary(self, summary: str, marker_ids: set[str], *, expected_revision: int) -> bool:
+        """Install a provenance-marked summary only if its snapshot is current.
+
+        The summary is stored separately from dialogue and is serialized as a
+        system memory block, never as a fabricated user/assistant exchange.
+        """
+        with self._lock:
+            if self._shutdown.is_set() or self._revision != expected_revision or self._pending_tool_calls:
+                return False
+            if not marker_ids:
+                return False
+            self.buffer = [item for item in self.buffer if item.id not in marker_ids]
+            self._assistant_exchange_ids = {
+                item_id: exchange_id
+                for item_id, exchange_id in self._assistant_exchange_ids.items()
+                if item_id not in marker_ids
+            }
+            self._user_turn_count = sum(isinstance(item, RealtimeConversationItemUserMessage) for item in self.buffer)
+            self._memory_summary = summary.strip() or None
+            self._revision += 1
+            return True
+
+    def mark_assistant_only_exchange(self, item_id: str | None, exchange_id: str) -> None:
+        """Associate a real assistant-only item with its accepted audio turn."""
+        self.mark_direct_exchange_item(item_id, exchange_id)
+
+    def mark_direct_exchange_item(self, item_id: str | None, exchange_id: str) -> None:
+        """Associate any direct-audio item with its accepted-turn boundary."""
+        if not item_id:
+            return
+        with self._lock:
+            self._assistant_exchange_ids[item_id] = exchange_id
+            self._revision += 1
+
+    def projected_direct_history_serialized_chars(
+        self,
+        summary: str,
+        marker_ids: set[str],
+        *,
+        expected_revision: int,
+    ) -> int | None:
+        """Return a conservative post-splice direct-history serialization size.
+
+        This is intentionally only a projection: it refuses an outdated
+        revision or unresolved tool transaction rather than guessing which
+        response a future direct-audio request will see.  Direct Gemma omits
+        system messages from chat history because it builds one response-local
+        system prompt, so this measures only the exact non-system history
+        shape; the caller budgets the response-local system/tool/media fields
+        separately.
+        """
+        with self._lock:
+            if self._revision != expected_revision or self._pending_tool_calls or not marker_ids:
+                return None
+            clone = Chat(self.size)
+            clone.init_chat_message = self.init_chat_message
+            clone.buffer = [item for item in self.buffer if item.id not in marker_ids]
+            clone._pending_tool_calls = dict(self._pending_tool_calls)
+            clone._user_turn_count = sum(isinstance(item, RealtimeConversationItemUserMessage) for item in clone.buffer)
+            clone._managed_history = self._managed_history
+            clone._memory_summary = summary.strip() or None
+            messages = [message for message in clone.to_transformers_chat() if message.get("role") != "system"]
+            return len(json.dumps(messages, ensure_ascii=False, separators=(",", ":")))
 
     def to_responses_api_chat(self, items: list[SupportedItem] | None = None) -> ResponseInputParam:
         """Serialize the chat (system prompt + buffer) for the OpenAI Responses API.
@@ -304,6 +521,17 @@ class Chat:
                         ResponseInputTextParam(text=p.text or "A helpful AI assistant.", type="input_text")
                         for p in self.init_chat_message.content
                     ],
+                    role="system",
+                    type="message",
+                )
+            )
+        if self._memory_summary:
+            result.append(
+                ResponseMessage(
+                    content=[ResponseInputTextParam(
+                        text="Conversation memory (compressed; not a verbatim user quote): " + self._memory_summary,
+                        type="input_text",
+                    )],
                     role="system",
                     type="message",
                 )
@@ -378,6 +606,12 @@ class Chat:
             if self.init_chat_message:
                 text = " ".join(p.text for p in self.init_chat_message.content if p.text)
                 messages.append(TransformersSystemMessage(content=text))
+            if self._memory_summary:
+                messages.append(
+                    TransformersSystemMessage(
+                        content="Conversation memory (compressed; not a verbatim user quote): " + self._memory_summary
+                    )
+                )
             for item in self.buffer:
                 if isinstance(item, RealtimeConversationItemUserMessage):
                     has_images = any(p.type == "input_image" for p in item.content)
@@ -435,7 +669,67 @@ class Chat:
             clone.buffer = list(self.buffer)
             clone._pending_tool_calls = dict(self._pending_tool_calls)
             clone._user_turn_count = self._user_turn_count
+            clone._trim_count = self._trim_count
+            clone._managed_history = self._managed_history
+            clone._memory_summary = self._memory_summary
+            clone._assistant_exchange_ids = dict(self._assistant_exchange_ids)
+            clone._revision = self._revision
             return clone
+
+    def history_token_text(self) -> str:
+        """Return retained history as compact text for the server tokenizer.
+
+        System instructions and raw image data are intentionally excluded: the
+        diagnostics counter represents conversation history and therefore starts
+        at zero for a new session.
+        """
+        with self._lock:
+            entries: list[dict[str, Any]] = []
+            if self._memory_summary:
+                entries.append({"role": "memory", "content": self._memory_summary})
+            for item in self.buffer:
+                if isinstance(item, RealtimeConversationItemUserMessage):
+                    content = [
+                        part.text if part.type == "input_text" else "<image>"
+                        for part in item.content
+                        if (part.type == "input_text" and part.text) or part.type == "input_image"
+                    ]
+                    entries.append({"role": "user", "content": content})
+                elif isinstance(item, RealtimeConversationItemAssistantMessage):
+                    entries.append(
+                        {"role": "assistant", "content": [part.text for part in item.content if part.text]}
+                    )
+                elif isinstance(item, RealtimeConversationItemFunctionCall):
+                    entries.append(
+                        {"role": "tool_call", "name": item.name, "arguments": item.arguments, "call_id": item.call_id}
+                    )
+                elif isinstance(item, RealtimeConversationItemFunctionCallOutput):
+                    entries.append({"role": "tool_output", "output": item.output, "call_id": item.call_id})
+            buffered_calls = {
+                item.call_id for item in self.buffer if isinstance(item, RealtimeConversationItemFunctionCall)
+            }
+            for call_id, item in self._pending_tool_calls.items():
+                if call_id not in buffered_calls:
+                    entries.append(
+                        {"role": "tool_call", "name": item.name, "arguments": item.arguments, "call_id": call_id}
+                    )
+            return json.dumps(entries, ensure_ascii=False, separators=(",", ":")) if entries else ""
+
+    def stats(self) -> dict[str, int]:
+        """Return content-free counters for local diagnostics."""
+        with self._lock:
+            stats = {
+                "turns": self._user_turn_count,
+                "items": len(self.buffer),
+                "pending_tool_calls": len(self._pending_tool_calls),
+                "trim_count": self._trim_count,
+            }
+            # A managed direct session has no arbitrary turn limit.  Retaining
+            # the constructor's legacy size here made new sessions appear to
+            # have a live 30-turn cap even though token compaction owns them.
+            if not self._managed_history:
+                stats["limit"] = self.size
+            return stats
 
     def reset(self) -> None:
         """Clear all conversation state. Cancels any in-flight compaction splice."""
@@ -446,6 +740,10 @@ class Chat:
             self.init_chat_message = None
             self._pending_tool_calls = {}
             self._user_turn_count = 0
+            self._trim_count = 0
+            self._memory_summary = None
+            self._assistant_exchange_ids = {}
+            self._revision += 1
 
     def close(self) -> None:
         """Permanently shut down the chat. In-flight compaction splice is suppressed.

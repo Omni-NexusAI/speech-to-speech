@@ -34,6 +34,7 @@ from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
     PartialTranscriptionEvent,
+    ResponseOutputCompleteEvent,
     SpeechStartedEvent,
     SpeechStoppedEvent,
     TranscriptionCompletedEvent,
@@ -347,6 +348,9 @@ class TestSDKBargeIn:
             done = next(e for e in events if e.type == RESPONSE_DONE)
             assert done.response.status == "cancelled"
 
+            metric = await asyncio.wait_for(conn.recv(), timeout=0.5)
+            assert metric.type == "pipeline.metric"
+            assert metric.status in {"cancelled", "detached"}
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(conn.recv(), timeout=0.5)
 
@@ -385,6 +389,7 @@ class TestSDKPhantomSpeech:
             assert event.type == RESPONSE_CREATED
             await _recv(conn)  # audio delta
 
+            server_env.text_output_queue.put(ResponseOutputCompleteEvent())
             server_env.output_queue.put(AUDIO_RESPONSE_DONE)
             event = await _recv(conn)
             assert event.type == AUDIO_DONE
@@ -451,6 +456,9 @@ class TestSDKToolCalling:
                 )
             )
 
+            created = await _recv(conn)
+            assert created.type == "response.created"
+
             event = await _recv(conn)
             assert event.type == TRANSCRIPT_DONE
             assert event.transcript == "Checking weather"
@@ -478,8 +486,10 @@ class TestSDKToolCalling:
                 )
             )
 
+            created = await _recv(conn)
             e1 = await _recv(conn)
             e2 = await _recv(conn)
+            assert created.type == "response.created"
             assert e1.type == FUNCTION_CALL_DONE
             assert e2.type == FUNCTION_CALL_DONE
             assert e1.output_index == 0
@@ -647,10 +657,11 @@ class TestSDKMultiTurn:
             # Barge-in
             server_env.text_output_queue.put(SpeechStartedEvent())
             events = []
-            for _ in range(3):
+            for _ in range(4):
                 events.append(await _recv(conn))
 
             t1_done = next(e for e in events if e.type == RESPONSE_DONE)
+            assert any(e.type == "pipeline.metric" for e in events)
 
             # Simulate pipeline acknowledging cancellation so discard guard clears
             server_env.output_queue.put(AUDIO_RESPONSE_DONE)

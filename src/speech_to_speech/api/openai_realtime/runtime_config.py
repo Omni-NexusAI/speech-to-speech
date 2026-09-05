@@ -1,3 +1,7 @@
+from typing import Any, Literal
+
+import threading
+
 from openai.types.realtime import RealtimeSessionCreateRequest
 from openai.types.realtime.realtime_audio_config import RealtimeAudioConfig
 from openai.types.realtime.realtime_audio_config_input import RealtimeAudioConfigInput
@@ -5,6 +9,27 @@ from openai.types.realtime.realtime_audio_config_output import RealtimeAudioConf
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from speech_to_speech.LLM.chat import Chat
+
+
+class ModelEndpointConfig(BaseModel):
+    """Conversation-scoped OpenAI-compatible multimodal model endpoint."""
+
+    provider: Literal["local", "remote"] = "local"
+    base_url: str = "http://127.0.0.1:8818/v1"
+    model: str = "gemma-4-12b-it-qat"
+    api_key: str | None = None
+    advertised_model: str | None = None
+    context_window: int | None = None
+
+    def redacted(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "model": self.model,
+            "advertised_model": self.advertised_model,
+            "context_window": self.context_window,
+            "api_key_set": bool(self.api_key),
+        }
 
 
 def _apply_update(current: BaseModel, update: BaseModel) -> None:
@@ -42,6 +67,19 @@ class RuntimeConfig(BaseModel):
         default_factory=lambda: RealtimeSessionCreateRequest(type="realtime"),
         validate_default=True,
     )
+    local_pipeline: dict[str, Any] = Field(default_factory=lambda: {
+        "max_response_tokens": 384,
+        "history_compaction": {"enabled": True, "trigger_ratio": 0.70, "target_ratio": 0.50, "recent_turns": 6},
+    })
+    model_endpoint: ModelEndpointConfig = Field(default_factory=ModelEndpointConfig)
+    # Response-scoped TTS admission snapshots.  This deliberately stores only
+    # copied scalar/dict synthesis settings (not Chat, callbacks, or transport
+    # objects) so a live pipeline update cannot retarget an answer before its
+    # first stable LLM phrase reaches TTS.
+    response_synthesis_configs: dict[int, dict[str, Any]] = Field(default_factory=dict)
+    # Serializes maintenance's final endpoint/session identity check and Chat
+    # splice with runtime configuration mutation and session teardown.
+    history_maintenance_lock: Any = Field(default_factory=threading.RLock, exclude=True)
 
     @field_validator("session", mode="after")
     @classmethod

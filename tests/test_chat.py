@@ -1223,6 +1223,27 @@ class TestCompaction:
                 for c in msg.get("content", []):
                     assert c.get("type") != "input_image"
 
+    def test_token_managed_direct_history_never_uses_legacy_turn_eviction(self):
+        chat = Chat(size=2)
+        chat.enable_token_managed_history()
+        for i in range(65):
+            chat.add_item(_user(f"u{i}"))
+            chat.add_item(_assistant(f"a{i}"))
+            chat.trim_if_needed()
+        assert chat.stats()["turns"] == 65
+
+    def test_memory_summary_is_not_a_fabricated_dialogue_turn(self):
+        chat = Chat(size=30)
+        for i in range(8):
+            chat.add_item(_user(f"u{i}"))
+            chat.add_item(_assistant(f"a{i}"))
+        snapshot, ids, revision = chat.memory_snapshot(6)
+        assert snapshot and ids
+        assert chat.apply_memory_summary("old facts", ids, expected_revision=revision)
+        assert chat.stats()["turns"] == 6
+        wire = chat.to_responses_api_chat()
+        assert any(item.get("role") == "system" and "compressed" in item["content"][0]["text"] for item in wire)
+
 
 # ===================================================================
 # build_active_chat (out-of-band response context)
@@ -1278,3 +1299,12 @@ class TestBuildActiveChat:
 
         with pytest.raises(ChatItemError):
             build_active_chat(original, resp)
+
+
+def test_replace_user_text_advances_history_revision_for_background_compaction():
+    chat = Chat(10)
+    item = chat.add_item(make_user_message("first wording"))
+    revision = chat.history_revision()
+
+    assert chat.replace_user_message_text(item.id, "revised wording") is True
+    assert chat.history_revision() == revision + 1
