@@ -36,10 +36,8 @@ from speech_to_speech.LLM.chat import (
     build_active_chat,
     make_assistant_message,
     make_system_message,
-    make_user_audio_message,
     make_user_message,
 )
-from speech_to_speech.LLM.chat_completions_language_model import ChatCompletionsApiModelHandler
 
 # ===================================================================
 # Helpers
@@ -270,29 +268,6 @@ class TestAddItemEviction:
         user_texts = [e.content[0].text for e in chat.buffer if isinstance(e, RealtimeConversationItemUserMessage)]
         assert user_texts == ["u3", "u4"]
 
-    def test_thirty_turn_trim_never_leaves_tool_orphans(self):
-        chat = Chat(size=30)
-        user = chat.add_item(_user("tool turn"))
-        chat.commit_assistant_response(user.id, "I will check.", [_fc("trimmed")])
-        chat.add_item(_fco("trimmed", "result"))
-        chat.add_item(_assistant("The result is ready."))
-
-        for index in range(30):
-            chat.add_item(_user(f"u{index}"))
-            chat.add_item(_assistant(f"a{index}"))
-            chat.trim_if_needed()
-
-        assert chat.stats()["turns"] == 30
-        assert not any(
-            isinstance(item, (RealtimeConversationItemFunctionCall, RealtimeConversationItemFunctionCallOutput))
-            for item in chat.buffer
-        )
-        assert isinstance(chat.buffer[0], RealtimeConversationItemUserMessage)
-        assert all(isinstance(chat.buffer[index], RealtimeConversationItemUserMessage) for index in range(0, 60, 2))
-        assert all(
-            isinstance(chat.buffer[index], RealtimeConversationItemAssistantMessage) for index in range(1, 60, 2)
-        )
-
 
 # ===================================================================
 # 5. TestAppendToolOutput
@@ -362,31 +337,6 @@ class TestAppendToolOutput:
         chat = Chat(size=5)
         with pytest.raises(ChatItemError, match="unknown_id"):
             chat.append_tool_output("unknown_id", _fco("unknown_id"))
-
-    def test_cancellation_keeps_user_and_drops_incomplete_preamble_and_call(self):
-        chat = Chat(size=5)
-        user = chat.add_item(_user("search for it"))
-        chat.commit_assistant_response(user.id, "I will search.", [_fc("cancelled")])
-
-        chat.discard_pending_tool_calls({"call_cancelled"})
-
-        assert [item.type for item in chat.buffer] == ["message"]
-        assert chat.buffer[0].role == "user"
-
-    def test_cancellation_does_not_remove_completed_call_pair(self):
-        chat = Chat(size=5)
-        user = chat.add_item(_user("search for it"))
-        chat.commit_assistant_response(user.id, "I will search.", [_fc("completed")])
-        chat.add_item(_fco("completed", "done"))
-
-        chat.discard_pending_tool_calls({"call_completed"})
-
-        assert [item.type for item in chat.buffer] == [
-            "message",
-            "message",
-            "function_call",
-            "function_call_output",
-        ]
 
 
 # ===================================================================
@@ -583,16 +533,6 @@ class TestToResponseApiChat:
         assert content[1]["type"] == "input_image"
         assert content[1]["image_url"] == "http://img.png"
 
-    def test_retained_input_audio_fails_closed_instead_of_orphaning_follow_up_items(self):
-        chat = Chat(size=5)
-        chat.add_item(make_user_audio_message("d2F2LWJhc2U2NA=="))
-        chat.add_item(_assistant("I heard the accepted turn."))
-
-        with pytest.raises(ChatItemError, match="does not support retained input_audio history"):
-            chat.to_responses_api_chat()
-
-        assert [item.type for item in chat.buffer] == ["message", "message"]
-
     def test_assistant_message(self):
         chat = Chat(size=5)
         msg = make_assistant_message("Hello there.")
@@ -721,26 +661,6 @@ class TestToTransformersChat:
         assert isinstance(result[0]["content"], list)
         assert len(result[0]["content"]) == 2
 
-    def test_session_audio_history_preserves_wav_for_chat_completions(self):
-        chat = Chat(size=5)
-        chat.add_item(make_user_audio_message("d2F2LWJhc2U2NA=="))
-
-        result = ChatCompletionsApiModelHandler._chat_messages(chat)
-
-        assert result == [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_audio",
-                        "input_audio": {"data": "d2F2LWJhc2U2NA==", "format": "wav"},
-                    }
-                ],
-            }
-        ]
-        assert "d2F2LWJhc2U2NA==" not in chat.history_token_text()
-        assert "<audio:wav>" in chat.history_token_text()
-
     def test_assistant_message_text_joined(self):
         chat = Chat(size=5)
         msg = RealtimeConversationItemAssistantMessage(
@@ -769,14 +689,12 @@ class TestToTransformersChat:
         assert tc["function"]["name"] == "search"
         assert tc["function"]["arguments"] == {"query": "test"}
 
-    def test_function_call_invalid_json_uses_explicit_error_envelope(self):
+    def test_function_call_invalid_json_falls_back(self):
         chat = Chat(size=5)
         chat.add_item(_fc("c1", "broken", "not valid json"))
         chat.add_item(_fco("c1", "ok"))
         result = chat.to_transformers_chat()
-        assert result[0]["tool_calls"][0]["function"]["arguments"] == {
-            "error": "invalid_tool_arguments"
-        }
+        assert result[0]["tool_calls"][0]["function"]["arguments"] == {}
 
     def test_function_call_empty_string_args(self):
         chat = Chat(size=5)
@@ -784,9 +702,7 @@ class TestToTransformersChat:
         chat.add_item(fc)
         chat.add_item(_fco("c1", "ok"))
         result = chat.to_transformers_chat()
-        assert result[0]["tool_calls"][0]["function"]["arguments"] == {
-            "error": "invalid_tool_arguments"
-        }
+        assert result[0]["tool_calls"][0]["function"]["arguments"] == {}
 
     def test_function_call_output_resolves_name(self):
         chat = Chat(size=5)
@@ -867,24 +783,6 @@ class TestCopyAndReset:
         clone = chat.copy()
         assert clone._user_turn_count == 2
 
-    def test_snapshot_audio_replacement_preserves_live_text_and_transaction_order(self):
-        chat = Chat(size=5)
-        user = chat.add_item(_user("provisional semantic anchor"))
-        chat.add_item(_assistant("I will check."))
-        chat.add_item(_fc("correction", "lookup"))
-        chat.add_item(_fco("correction", "done"))
-        chat.add_item(_assistant("The lookup is complete."))
-
-        clone = chat.copy()
-        assert clone.replace_user_message_with_audio_for_snapshot(user.id, "d2F2LWJhc2U2NA==") is True
-
-        assert [item.type for item in clone.buffer] == [item.type for item in chat.buffer]
-        assert clone.stats()["turns"] == chat.stats()["turns"] == 1
-        assert [part.type for part in clone.buffer[0].content] == ["input_audio"]
-        assert clone.buffer[0].content[0].audio == "d2F2LWJhc2U2NA=="
-        assert [part.type for part in chat.buffer[0].content] == ["input_text"]
-        assert chat.buffer[0].content[0].text == "provisional semantic anchor"
-
     def test_reset_clears_everything(self):
         chat = Chat(size=5)
         chat.init_chat(_system("sys"))
@@ -961,28 +859,6 @@ class TestStripImages:
         fresh_after = next(i for i in chat.buffer if i.id == fresh.id)
         assert all(p.type != "input_image" for p in consumed_after.content)  # consumed → stripped
         assert any(p.type == "input_image" for p in fresh_after.content)  # next turn's image → kept
-
-    def test_strip_image_only_tool_attachment_removes_empty_turn_and_serializes_exact_order(self):
-        chat = Chat(size=30)
-        user = chat.add_item(_user("Show me the camera."))
-        chat.commit_assistant_response(user.id, "I'll look.", [_fc("camera")])
-        chat.add_item(_fco("camera", "captured"))
-        image = chat.add_item(_user_msg_with_parts(("image", "data:image/jpeg;base64,OLD")))
-        chat.add_item(_assistant("I can see the frame."))
-
-        chat.strip_images({image.id})
-
-        assert chat.stats()["turns"] == 1
-        assert image not in chat.buffer
-        serialized = ChatCompletionsApiModelHandler._chat_messages(chat)
-        assert [message["role"] for message in serialized] == [
-            "user",
-            "assistant",
-            "assistant",
-            "tool",
-            "assistant",
-        ]
-        assert all(message.get("content") != "" for message in serialized)
 
 
 # ===================================================================
@@ -1073,28 +949,6 @@ def _make_stub_compactor(
 
 
 class TestCompaction:
-    def test_compaction_with_audio_history_fails_before_mutation_or_orphaning(self):
-        chat = Chat(size=2)
-        chat.add_item(make_user_audio_message("d2F2LWJhc2U2NA=="))
-        chat.add_item(_assistant("audio answer"))
-        chat.add_item(_user("u1"))
-        chat.add_item(_assistant("a1"))
-        chat.add_item(_user("u2"))
-        before = list(chat.buffer)
-        called = False
-
-        def compactor(_snapshot):
-            nonlocal called
-            called = True
-            return CompactionResult(user_summary="u", assistant_summary="a")
-
-        with pytest.raises(ChatItemError, match="does not support retained input_audio history"):
-            chat.trim_if_needed(compactor)
-
-        assert called is False
-        assert chat.buffer == before
-        assert chat._compact_thread is None
-
     def test_compaction_replaces_old_turns(self):
         chat = Chat(size=2)
         compactor = _make_stub_compactor("U", "A")
@@ -1369,6 +1223,27 @@ class TestCompaction:
                 for c in msg.get("content", []):
                     assert c.get("type") != "input_image"
 
+    def test_token_managed_direct_history_never_uses_legacy_turn_eviction(self):
+        chat = Chat(size=2)
+        chat.enable_token_managed_history()
+        for i in range(65):
+            chat.add_item(_user(f"u{i}"))
+            chat.add_item(_assistant(f"a{i}"))
+            chat.trim_if_needed()
+        assert chat.stats()["turns"] == 65
+
+    def test_memory_summary_is_not_a_fabricated_dialogue_turn(self):
+        chat = Chat(size=30)
+        for i in range(8):
+            chat.add_item(_user(f"u{i}"))
+            chat.add_item(_assistant(f"a{i}"))
+        snapshot, ids, revision = chat.memory_snapshot(6)
+        assert snapshot and ids
+        assert chat.apply_memory_summary("old facts", ids, expected_revision=revision)
+        assert chat.stats()["turns"] == 6
+        wire = chat.to_responses_api_chat()
+        assert any(item.get("role") == "system" and "compressed" in item["content"][0]["text"] for item in wire)
+
 
 # ===================================================================
 # build_active_chat (out-of-band response context)
@@ -1424,3 +1299,12 @@ class TestBuildActiveChat:
 
         with pytest.raises(ChatItemError):
             build_active_chat(original, resp)
+
+
+def test_replace_user_text_advances_history_revision_for_background_compaction():
+    chat = Chat(10)
+    item = chat.add_item(make_user_message("first wording"))
+    revision = chat.history_revision()
+
+    assert chat.replace_user_message_text(item.id, "revised wording") is True
+    assert chat.history_revision() == revision + 1

@@ -6,9 +6,8 @@ import logging
 import os
 import re
 import threading
-import unicodedata
 import wave
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator
 from io import BytesIO
 from time import perf_counter, time
 from typing import Any
@@ -18,29 +17,22 @@ import numpy as np
 from openai.types.realtime.conversation_item import RealtimeConversationItemFunctionCall
 from openai.types.responses import ResponseFunctionToolCall
 
-from speech_to_speech.LLM.chat import (
-    make_user_audio_message,
-    make_user_message,
-)
+from speech_to_speech.LLM.chat import make_assistant_message, make_user_message
 from speech_to_speech.LLM.chat_completions_language_model import (
     ChatCompletionsApiModelHandler,
     _to_chat_tool_choice,
     _to_chat_tools,
 )
-from speech_to_speech.LLM.native_tool_diagnostics import NativeToolStreamDiagnostics
-from speech_to_speech.LLM.voice_prompt import VOICE_INPUT_TOOL_POLICY
 from speech_to_speech.pipeline.cancellable_http import CancellableAsyncSSEStream
 from speech_to_speech.pipeline.events import PipelineMetricEvent
 from speech_to_speech.pipeline.handler_types import STTIn, STTOut
 from speech_to_speech.pipeline.messages import DirectAssistantResponse, PartialTranscription
 from speech_to_speech.pipeline.model_operations import ModelOperationCoordinator, ModelOperationToken
+from speech_to_speech.pipeline.response_ownership import response_epoch_admission, response_epoch_history_transaction
 from speech_to_speech.STT.base_stt_handler import BaseSTTHandler
 from speech_to_speech.utils.utils import _generate_id
 
 logger = logging.getLogger(__name__)
-
-DIRECT_AUDIO_TEMPERATURE = 0.1
-DIRECT_AUDIO_TOP_P = 0.9
 
 
 def _response_max_tokens(value: Any, fallback: Any = 384) -> int:
@@ -49,68 +41,31 @@ def _response_max_tokens(value: Any, fallback: Any = 384) -> int:
         return min(1024, max(64, int(value if value is not None else fallback)))
     except (TypeError, ValueError):
         return 384
-
-
 _TRANSCRIPT_MARKER = "USER_TRANSCRIPT:"
-_MEMORY_MARKER = "USER_MEMORY:"
 _RESPONSE_MARKER = "ASSISTANT_RESPONSE:"
 _LANGUAGE_MARKER = "ASSISTANT_LANGUAGE:"
 _PREAMBLE_MARKER = "ASSISTANT_PREAMBLE:"
-_CAMERA_CONTEXT_MARKER = "CAMERA_CONTEXT:"
 _PREVIEW_TRANSCRIPT_MARKER = "TRANSCRIPT:"
 _FINAL_TRANSCRIPT_RE = re.compile(
     r"(?ims)^\s*(?:USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER)\s*:\s*(.+?)"
-    r"(?=^\s*(?:USER_MEMORY|ASSISTANT_LANGUAGE|CAMERA_CONTEXT|ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|"
-    r"ASSISTANT|RESPONSE)\s*:|\Z)"
+    r"(?=^\s*(?:ASSISTANT_LANGUAGE|ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:|\Z)"
 )
-_FINAL_MEMORY_RE = re.compile(
-    r"(?ims)^\s*USER_MEMORY\s*:\s*(.+?)"
-    r"(?=^\s*(?:USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER|ASSISTANT_LANGUAGE|CAMERA_CONTEXT|"
-    r"ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:|\Z)"
-)
-_ASSISTANT_RESPONSE_RE = re.compile(
-    r"(?ims)^\s*(?:ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:\s*(.+?)"
-    r"(?=^\s*(?:USER_MEMORY|USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER|ASSISTANT_LANGUAGE|"
-    r"CAMERA_CONTEXT|ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:|\Z)"
-)
+_ASSISTANT_RESPONSE_RE = re.compile(r"(?ims)^\s*(?:ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:\s*(.+)\Z")
 _ASSISTANT_LANGUAGE_RE = re.compile(r"(?im)^\s*ASSISTANT_LANGUAGE\s*:\s*([^\r\n]+)")
-_CAMERA_CONTEXT_RE = re.compile(r"(?im)^\s*CAMERA_CONTEXT\s*:\s*([^\r\n]+)")
 _ASSISTANT_PREAMBLE_RE = re.compile(
     r"(?ims)^\s*ASSISTANT_PREAMBLE\s*:\s*(.+?)"
-    r"(?=^\s*(?:USER_MEMORY|USER_TRANSCRIPT|ASSISTANT_LANGUAGE|CAMERA_CONTEXT|ASSISTANT_RESPONSE|"
-    r"ASSISTANT|RESPONSE)\s*:|\Z)"
+    r"(?=^\s*(?:ASSISTANT_LANGUAGE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:|\Z)"
 )
-_MEMORY_CONTROL_MARKER_RE = re.compile(
-    r"(?i)(?:USER_MEMORY|USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER|ASSISTANT_LANGUAGE|"
-    r"CAMERA_CONTEXT|ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:"
-)
-_OUTPUT_MARKER_RE = re.compile(r"(?im)^\s*(?:ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:")
-_CONTROL_LINE_RE = re.compile(
-    r"(?im)^\s*(?:USER_MEMORY|USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER|ASSISTANT_LANGUAGE|"
-    r"CAMERA_CONTEXT|ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:[^\r\n]*(?:\r?\n|$)"
-)
-_TRAILING_RESPONSE_CONTROL_RE = re.compile(
-    r"(?im)^\s*(?:USER_MEMORY|USER_TRANSCRIPT|USER_SPEECH|TRANSCRIPT|USER|ASSISTANT_LANGUAGE|"
-    r"CAMERA_CONTEXT|ASSISTANT_PREAMBLE|ASSISTANT_RESPONSE|ASSISTANT|RESPONSE)\s*:"
-)
-_MAX_USER_MEMORY_CHARS = 600
 _SENTENCE_RE = re.compile(r"(.+?[.!?](?:\s+|$))", re.DOTALL)
-
-
-def _failure_sentinel_key(value: str) -> str:
-    normalized = " ".join(unicodedata.normalize("NFKC", value).casefold().split())
-    start = 0
-    end = len(normalized)
-    while start < end and unicodedata.category(normalized[start])[0] in {"P", "Z"}:
-        start += 1
-    while end > start and unicodedata.category(normalized[end - 1])[0] in {"P", "Z"}:
-        end -= 1
-    return normalized[start:end]
-
-
+_TRANSCRIPT_CONTROL_TEXT = (
+    "listen to the attached user audio",
+    "respond directly as a concise voice assistant",
+    "do not include a transcript",
+    "user_transcript:",
+    "assistant_response:",
+)
 _TRANSCRIPT_FAILURE_SENTINELS = frozenset(
-    _failure_sentinel_key(value)
-    for value in {
+    {
         "inaudible",
         "unintelligible",
         "garbled",
@@ -135,128 +90,8 @@ _TRANSCRIPT_FAILURE_SENTINELS = frozenset(
         "could not transcribe the audio",
         "transcription failed",
         "transcription unavailable",
-        "无法听清",
-        "无法理解音频",
-        "音频不清晰",
-        "音频无法辨认",
-        "未检测到语音",
-        "未检测到可理解的语音",
-        "无法转录音频",
-        "转录失败",
-        "聞き取れません",
-        "音声が不明瞭です",
-        "音声を理解できません",
-        "音声を認識できません",
-        "発話が検出されませんでした",
-        "文字起こしに失敗しました",
-        "알아들을 수 없습니다",
-        "오디오가 불명확합니다",
-        "음성을 이해할 수 없습니다",
-        "음성이 감지되지 않았습니다",
-        "알아들을 수 있는 음성이 감지되지 않았습니다",
-        "전사에 실패했습니다",
-        "unverständlich",
-        "audio unverständlich",
-        "unklares audio",
-        "keine sprache erkannt",
-        "keine verständliche sprache erkannt",
-        "audio konnte nicht verstanden werden",
-        "transkription fehlgeschlagen",
-        "incompréhensible",
-        "audio incompréhensible",
-        "audio peu clair",
-        "aucune parole détectée",
-        "aucune parole intelligible détectée",
-        "impossible de comprendre l'audio",
-        "échec de la transcription",
-        "неразборчиво",
-        "неразборчивый звук",
-        "аудио неразборчиво",
-        "речь не обнаружена",
-        "разборчивая речь не обнаружена",
-        "не удалось понять аудио",
-        "не удалось расшифровать аудио",
-        "ошибка транскрипции",
-        "inaudível",
-        "ininteligível",
-        "áudio ininteligível",
-        "áudio pouco claro",
-        "nenhuma fala detectada",
-        "nenhuma fala inteligível detectada",
-        "não foi possível entender o áudio",
-        "falha na transcrição",
-        "ininteligible",
-        "audio ininteligible",
-        "audio poco claro",
-        "no se detectó habla",
-        "no se detectó habla inteligible",
-        "no se pudo entender el audio",
-        "no se pudo transcribir el audio",
-        "falló la transcripción",
-        "inudibile",
-        "incomprensibile",
-        "audio incomprensibile",
-        "audio poco chiaro",
-        "nessun parlato rilevato",
-        "nessun parlato intelligibile rilevato",
-        "impossibile comprendere l'audio",
-        "trascrizione non riuscita",
     }
 )
-
-_ASSISTANT_LANGUAGE_ALIASES = {
-    "auto": "Auto",
-    "automatic": "Auto",
-    "mixed": "Auto",
-    "mixed language": "Auto",
-    "multilingual": "Auto",
-    "zh": "Chinese",
-    "zh-cn": "Chinese",
-    "zh-hans": "Chinese",
-    "zh-hant": "Chinese",
-    "cmn": "Chinese",
-    "chinese": "Chinese",
-    "中文": "Chinese",
-    "汉语": "Chinese",
-    "漢語": "Chinese",
-    "普通话": "Chinese",
-    "en": "English",
-    "en-us": "English",
-    "en-gb": "English",
-    "english": "English",
-    "ja": "Japanese",
-    "jp": "Japanese",
-    "japanese": "Japanese",
-    "日本語": "Japanese",
-    "ko": "Korean",
-    "kr": "Korean",
-    "korean": "Korean",
-    "한국어": "Korean",
-    "de": "German",
-    "german": "German",
-    "deutsch": "German",
-    "fr": "French",
-    "french": "French",
-    "français": "French",
-    "francais": "French",
-    "ru": "Russian",
-    "russian": "Russian",
-    "русский": "Russian",
-    "pt": "Portuguese",
-    "pt-br": "Portuguese",
-    "pt-pt": "Portuguese",
-    "portuguese": "Portuguese",
-    "português": "Portuguese",
-    "portugues": "Portuguese",
-    "es": "Spanish",
-    "spanish": "Spanish",
-    "español": "Spanish",
-    "espanol": "Spanish",
-    "castellano": "Spanish",
-    "it": "Italian",
-    "italian": "Italian",
-    "italiano": "Italian",
-}
 
 
 class GemmaAudioSTTHandler(BaseSTTHandler):
@@ -295,18 +130,11 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         self.cancel_scope = cancel_scope
         self.model_operations = model_operations
         self._preview_transcripts: dict[tuple[str | None, int | None], str] = {}
-        # One semantic anchor per session/turn. Revisions replace its cumulative
-        # WAV in place instead of creating multiple user turns.
-        self._accepted_user_items: dict[tuple[str, str], tuple[str, int]] = {}
-        self._accepted_user_audio: dict[tuple[str, str], tuple[str, int]] = {}
-        # A successful model-generated memory keeps exactly one prior accepted
-        # WAV out of durable chat so the immediately following turn can correct
-        # that provisional anchor without accumulating session audio.
-        self._provisional_user_audio: dict[tuple[str, Any], tuple[tuple[str, str], str, str]] = {}
-        self._accepted_user_lock = threading.Lock()
+        self._committed_user_turns: set[tuple[str | None, int | None]] = set()
         self._active_resources: set[Any] = set()
         self._active_turn: tuple[str | None, int | None] | None = None
         self._active_response_lock = threading.Lock()
+        self._operation_context = threading.local()
         logger.info("Gemma audio direct mode configured for %s at %s", self.model_name, self.base_url)
 
     def on_speculative_turns_attached(self) -> None:
@@ -337,8 +165,23 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         progressive = vad_audio.mode == "progressive"
         if progressive and not self._live_preview_enabled(runtime_config):
             return
+        local_pipeline = getattr(runtime_config, "local_pipeline", None) or {}
+        if not progressive:
+            _, response_epoch, _ = self._response_identity(vad_audio)
+            wait_until_current = local_pipeline.get("_wait_response_epoch_current")
+            if response_epoch is not None and callable(wait_until_current):
+                # With response interruption disabled, accepted speech may be
+                # queued behind an already-audible answer.  Wait for its real
+                # terminal event instead of misclassifying the accepted turn as
+                # stale before Gemma ever sees it.
+                if not wait_until_current(response_epoch):
+                    return
+            # A queued response may wait while cancellation advances the
+            # shared generation. Once this exact response epoch is promoted,
+            # bind its operation to the current generation rather than the
+            # stale value captured when the queued worker first entered.
+            generation = self.cancel_scope.generation if self.cancel_scope is not None else None
         if coordinator is not None:
-            local_pipeline = getattr(runtime_config, "local_pipeline", None) or {}
             session_id = str(local_pipeline.get("_session_id") or "") or None
             operation = coordinator.acquire(
                 kind="transcription_preview" if progressive else "direct_audio",
@@ -353,15 +196,18 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 if progressive:
                     self._emit_metric(vad_audio, "transcription", "live_dropped", detail={"reason": "model_busy"})
                 return
-            coordinator.bind_cancel(operation, self.cancel_active)
         try:
+            if operation is not None and coordinator is not None:
+                self._operation_context.value = (coordinator, operation)
             if operation is not None and coordinator is not None and not coordinator.is_current(operation):
                 return
             if progressive:
-                yield from self._iter_progressive_transcriptions(vad_audio)
+                yield from self._iter_progressive_transcriptions(vad_audio, generation=generation)
                 return
             yield from self._process_direct(vad_audio, generation)
         finally:
+            if hasattr(self._operation_context, "value"):
+                del self._operation_context.value
             if operation is not None and coordinator is not None:
                 coordinator.release(operation)
 
@@ -406,6 +252,11 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         terminal_error: str | None = None
         try:
             for response in self._iter_direct_responses(audio, vad_audio, generation=generation):
+                # A streamed event can unblock only after a newer input has
+                # already invalidated this owner.  Do not let that late event
+                # reach the notifier/TTS side of the pipeline.
+                if not self._direct_output_admitted(vad_audio, generation):
+                    return
                 if first and (response.text or response.tools):
                     self._emit_metric(vad_audio, "gemma", "first_token", elapsed_ms=(perf_counter() - start_s) * 1000)
                     first = False
@@ -431,20 +282,6 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             )
             status = "cancelled" if self._request_is_stale(vad_audio, generation) else failed_status or "complete"
             self._emit_metric(vad_audio, "gemma", status, elapsed_ms=total_s * 1000)
-            if self._owns_user_context(vad_audio):
-                self._emit_history_metric(
-                    vad_audio,
-                    (
-                        "user_retained_after_cancel"
-                        if status == "cancelled"
-                        else "user_retained_after_failure"
-                        if terminal_error
-                        else "user_retained_without_response"
-                    ),
-                    input_kind="input_audio",
-                    committed=True,
-                )
-                self._finish_user_context(vad_audio)
         if terminal_error and not self._request_is_stale(vad_audio, generation):
             yield self._direct(
                 vad_audio,
@@ -454,11 +291,53 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 generation=generation,
             )
 
+    @staticmethod
+    def _response_identity(vad_audio: STTIn) -> tuple[int | None, int | None, str | None]:
+        runtime_config = getattr(vad_audio, "runtime_config", None)
+        local = getattr(runtime_config, "local_pipeline", None)
+        input_epoch = getattr(vad_audio, "input_epoch", None)
+        response_epoch = getattr(vad_audio, "response_epoch", None)
+        response_id = getattr(vad_audio, "response_id", None)
+        if isinstance(local, dict):
+            input_epoch = input_epoch if input_epoch is not None else local.get("_input_epoch")
+            response_epoch = response_epoch if response_epoch is not None else local.get("_response_epoch")
+            response_id = response_id if response_id is not None else local.get("_response_id")
+        return input_epoch, response_epoch, response_id
+
+    def _assistant_only_exchange_id(self, vad_audio: STTIn) -> str:
+        """Return an opaque, stable boundary for one accepted direct turn.
+
+        This records provenance only: it deliberately contains no inferred
+        transcript. The accepted VAD turn keeps a tool preamble, call/output,
+        and terminal answer in the same exchange even if a follow-up receives a
+        fresh model response identity; ``created_at_s`` distinguishes legacy
+        callers that did not yet populate a turn revision.
+        """
+        return "direct:{turn_id}:{revision}:{created_at:.9f}".format(
+            turn_id=vad_audio.turn_id or "-",
+            revision=vad_audio.turn_revision if vad_audio.turn_revision is not None else "-",
+            created_at=float(getattr(vad_audio, "created_at_s", 0.0) or 0.0),
+        )
+
     def _request_is_stale(self, vad_audio: STTIn, generation: int | None) -> bool:
         if generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation):
             return True
+        runtime_config = getattr(vad_audio, "runtime_config", None)
+        _, response_epoch, _ = self._response_identity(vad_audio)
+        admission = response_epoch_admission(
+            runtime_config=runtime_config,
+            response_epoch=response_epoch,
+            cancel_scope=getattr(self, "cancel_scope", None),
+        )
+        if admission is not None:
+            return not admission
         tracker = getattr(self, "speculative_turns", None)
         return tracker is not None and not tracker.is_latest(vad_audio.turn_id, vad_audio.turn_revision)
+
+    def _direct_output_admitted(self, vad_audio: STTIn, generation: int | None = None) -> bool:
+        """Gate every direct-stream side effect on the claimed response owner."""
+
+        return not self._request_is_stale(vad_audio, generation)
 
     def _emit_metric(
         self,
@@ -469,7 +348,20 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         elapsed_ms: float | None = None,
         detail: dict[str, Any] | None = None,
     ) -> None:
+        # Metrics are response-scoped output too.  A cancellation metric owned
+        # by the router is emitted there; a detached Gemma worker never gets to
+        # publish a late success/failure timing event.
+        runtime_config = getattr(vad_audio, "runtime_config", None)
+        _, response_epoch, _ = self._response_identity(vad_audio)
+        admission = response_epoch_admission(
+            runtime_config=runtime_config,
+            response_epoch=response_epoch,
+            cancel_scope=self.cancel_scope,
+        )
+        if admission is False:
+            return
         if self.text_output_queue is not None:
+            input_epoch, response_epoch, response_id = self._response_identity(vad_audio)
             self.text_output_queue.put(
                 PipelineMetricEvent(
                     stage=stage,
@@ -478,6 +370,9 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                     elapsed_ms=elapsed_ms,
                     turn_id=vad_audio.turn_id,
                     turn_revision=vad_audio.turn_revision,
+                    input_epoch=input_epoch,
+                    response_epoch=response_epoch,
+                    response_id=response_id,
                     detail=detail or {},
                 )
             )
@@ -500,180 +395,6 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             wav.writeframes(pcm16.tobytes())
         return out.getvalue()
 
-    @staticmethod
-    def _turn_revision(vad_audio: STTIn) -> int:
-        revision = getattr(vad_audio, "turn_revision", None)
-        return revision if isinstance(revision, int) else 0
-
-    @classmethod
-    def _turn_key(cls, vad_audio: STTIn) -> tuple[str, str]:
-        runtime_config = getattr(vad_audio, "runtime_config", None)
-        local_pipeline = getattr(runtime_config, "local_pipeline", None) or {}
-        session_id = str(local_pipeline.get("_session_id") or "").strip()
-        chat = cls._conversation_chat(vad_audio)
-        session_key = session_id or (f"chat-{id(chat)}" if chat is not None else f"runtime-{id(runtime_config)}")
-        turn_id = getattr(vad_audio, "turn_id", None)
-        return session_key, str(turn_id) if turn_id is not None else f"anonymous-{id(vad_audio)}"
-
-    @staticmethod
-    def _conversation_chat(vad_audio: STTIn) -> Any | None:
-        runtime_config = getattr(vad_audio, "runtime_config", None)
-        return getattr(runtime_config, "chat", None)
-
-    def _emit_history_metric(self, vad_audio: STTIn, status: str, *, input_kind: str, committed: bool) -> None:
-        chat = self._conversation_chat(vad_audio)
-        stats = chat.stats() if chat is not None and callable(getattr(chat, "stats", None)) else {}
-        self._emit_metric(
-            vad_audio,
-            "history",
-            status,
-            detail={
-                "input_kind": input_kind,
-                "committed": committed,
-                "turns": int(stats.get("turns", 0)),
-                "items": int(stats.get("items", 0)),
-                "pending_tool_calls": int(stats.get("pending_tool_calls", 0)),
-                "trim_count": int(stats.get("trim_count", 0)),
-            },
-        )
-
-    def _owned_user_context(self, vad_audio: STTIn) -> tuple[str, int] | None:
-        with self._accepted_user_lock:
-            return self._accepted_user_items.get(self._turn_key(vad_audio))
-
-    def _owns_user_context(self, vad_audio: STTIn) -> bool:
-        owned = self._owned_user_context(vad_audio)
-        return owned is not None and owned[1] == self._turn_revision(vad_audio)
-
-    @classmethod
-    def _history_scope_key(cls, vad_audio: STTIn) -> tuple[str, Any]:
-        """Keep retained WAVs isolated to both the logical session and Chat."""
-
-        return cls._turn_key(vad_audio)[0], cls._conversation_chat(vad_audio)
-
-    def _provisional_history_audio(self, vad_audio: STTIn) -> tuple[str, str] | None:
-        """Return the previous turn's one-shot WAV overlay, if any."""
-
-        lock = getattr(self, "_accepted_user_lock", None)
-        provisional_audio = getattr(self, "_provisional_user_audio", None)
-        if lock is None or provisional_audio is None:
-            # Payload-only release probes construct this adapter without its
-            # stateful setup because they never commit accepted turns.
-            return None
-        key = self._turn_key(vad_audio)
-        scope = self._history_scope_key(vad_audio)
-        with lock:
-            provisional = provisional_audio.get(scope)
-            if provisional is None or provisional[0] == key:
-                return None
-            return provisional[1], provisional[2]
-
-    def _commit_accepted_audio(
-        self,
-        vad_audio: STTIn,
-        encoded_audio: str,
-        *,
-        consume_previous: bool = False,
-    ) -> str | None:
-        """Persist one accepted turn before generation using its original mono WAV."""
-
-        chat = self._conversation_chat(vad_audio)
-        if chat is None:
-            return None
-        key = self._turn_key(vad_audio)
-        scope = self._history_scope_key(vad_audio)
-        revision = self._turn_revision(vad_audio)
-        with self._accepted_user_lock:
-            provisional = self._provisional_user_audio.get(scope)
-            existing = self._accepted_user_items.get(key)
-            if existing is not None:
-                item_id, owned_revision = existing
-                if revision < owned_revision:
-                    return None
-                if revision == owned_revision:
-                    return item_id
-                if chat.replace_user_message_audio(item_id, encoded_audio):
-                    self._accepted_user_items[key] = (item_id, revision)
-                    self._accepted_user_audio[key] = (encoded_audio, revision)
-                    if consume_previous and provisional is not None and provisional[0] != key:
-                        self._provisional_user_audio.pop(scope, None)
-                    self._emit_history_metric(
-                        vad_audio,
-                        "user_superseded",
-                        input_kind="input_audio",
-                        committed=True,
-                    )
-                    return item_id
-                self._accepted_user_items.pop(key, None)
-                self._accepted_user_audio.pop(key, None)
-            item = chat.add_item(make_user_audio_message(encoded_audio))
-            assert item.id is not None
-            self._accepted_user_items[key] = (item.id, revision)
-            self._accepted_user_audio[key] = (encoded_audio, revision)
-            if consume_previous and provisional is not None and provisional[0] != key:
-                self._provisional_user_audio.pop(scope, None)
-        self._emit_history_metric(vad_audio, "user_committed", input_kind="input_audio", committed=True)
-        return item.id
-
-    def _ensure_user_context(
-        self,
-        vad_audio: STTIn,
-        transcript: str | None,
-        user_memory: str | None = None,
-    ) -> str | None:
-        """Return the accepted user item, preferring transcript over semantic memory."""
-
-        chat = self._conversation_chat(vad_audio)
-        if chat is None:
-            return None
-        transcript = self._validate_transcript(transcript)
-        user_memory = None if transcript else self._validate_user_memory(user_memory)
-        semantic_text = transcript or user_memory
-        semantic_kind = "transcript" if transcript else "semantic_memory" if user_memory else "input_audio"
-        key = self._turn_key(vad_audio)
-        revision = self._turn_revision(vad_audio)
-        upgraded = False
-        with self._accepted_user_lock:
-            owned = self._accepted_user_items.get(key)
-            if owned is None:
-                if not semantic_text:
-                    return None
-                item = chat.add_item(make_user_message(semantic_text))
-                assert item.id is not None
-                item_id = item.id
-                self._accepted_user_items[key] = (item_id, revision)
-                committed_new = True
-            else:
-                item_id, owned_revision = owned
-                if revision < owned_revision:
-                    return None
-                if revision > owned_revision:
-                    self._accepted_user_items[key] = (item_id, revision)
-                committed_new = False
-            if semantic_text:
-                # Ownership validation and semantic replacement are one
-                # transaction. Otherwise rev0 can pass the check, rev1 can
-                # replace the cumulative WAV, and rev0 can then overwrite the
-                # newer anchor with stale metadata.
-                upgraded = chat.replace_user_message_text(item_id, semantic_text)
-        if committed_new:
-            self._emit_history_metric(vad_audio, "user_committed", input_kind=semantic_kind, committed=True)
-            return item_id
-        if upgraded:
-            self._emit_history_metric(vad_audio, "user_upgraded", input_kind=semantic_kind, committed=True)
-        return item_id
-
-    def _finish_user_context(self, vad_audio: STTIn) -> None:
-        key = self._turn_key(vad_audio)
-        revision = self._turn_revision(vad_audio)
-        with self._accepted_user_lock:
-            owned = self._accepted_user_items.get(key)
-            if owned is not None and owned[1] == revision:
-                self._accepted_user_items.pop(key, None)
-            accepted_audio = self._accepted_user_audio.get(key)
-            if accepted_audio is not None and accepted_audio[1] == revision:
-                self._accepted_user_audio.pop(key, None)
-
     def _model_endpoint(self, vad_audio: STTIn | None) -> tuple[str, str, str | None]:
         runtime_config = getattr(vad_audio, "runtime_config", None) if vad_audio is not None else None
         endpoint = getattr(runtime_config, "model_endpoint", None)
@@ -681,14 +402,8 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             return self.base_url, self.model_name, self.api_key
         return endpoint.base_url.rstrip("/"), endpoint.model, endpoint.api_key
 
-    def _payload(
-        self,
-        audio: np.ndarray,
-        vad_audio: STTIn | None = None,
-        *,
-        encoded_audio: str | None = None,
-    ) -> dict[str, Any]:
-        encoded = encoded_audio or base64.b64encode(self._wav_bytes(audio)).decode("ascii")
+    def _payload(self, audio: np.ndarray, vad_audio: STTIn | None = None) -> dict[str, Any]:
+        encoded = base64.b64encode(self._wav_bytes(audio)).decode("ascii")
         if vad_audio is None:
             vad_audio = type("VadAudioShim", (), {"runtime_config": None})()
         runtime_config = getattr(vad_audio, "runtime_config", None)
@@ -697,70 +412,47 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         system_parts = [self.system_prompt]
         if session_instructions:
             system_parts.append(session_instructions)
-
-        history: list[dict[str, Any]] = []
-        has_provisional_previous_audio = False
         chat = getattr(runtime_config, "chat", None)
-        if chat is not None and callable(getattr(chat, "copy", None)):
-            # Read the one-shot cache before taking the Chat lock in copy().
-            # Accepted-turn mutations use the opposite order, so nesting the
-            # two locks here could deadlock a concurrent cumulative revision.
-            provisional = self._provisional_history_audio(vad_audio)
-            history_chat = chat.copy()
-            owned = self._owned_user_context(vad_audio)
-            if owned is not None:
-                # The live user message below is the only representation of the
-                # current semantic turn, even while a newer cumulative revision
-                # replaces the persistent anchor.
-                history_chat.remove_user_message(owned[0])
-            if provisional is not None:
-                has_provisional_previous_audio = history_chat.replace_user_message_with_audio_for_snapshot(*provisional)
-            history = [
-                message
-                for message in ChatCompletionsApiModelHandler._chat_messages(history_chat)
-                if message.get("role") != "system"
-            ]
-
-        semantic_instructions = (
-            "The accepted turn may use any language, accent, or code-switching. Follow the language or languages "
-            "naturally used in the current utterance unless the user or session instructions request another response "
-            "language. Stay focused on the user's intended topic unless the user explicitly asks about system internals. "
-            "For every meaningful accepted turn, begin with USER_MEMORY as one short, affirmative, content-faithful "
-            "semantic paraphrase of what the user means. Preserve names, numbers, negation, ordinary references, and the "
-            "language of the request; resolve references from conversation context without adding facts. Omit USER_MEMORY "
-            "only when no meaningful intent is recoverable; in that rare case, ask one short, context-specific question "
-            "using natural wording that varies with the conversation. USER_MEMORY is hidden session context, not an answer or a tool "
-            "result, and must not gate, alter, or replace the assistant response or tool call. Begin meaningful turns with:\n"
-            "USER_MEMORY: <short affirmative semantic paraphrase>\n"
-            "Then continue with:\n"
+        memory_summary = chat.memory_summary() if chat is not None and callable(getattr(chat, "memory_summary", None)) else None
+        if memory_summary:
+            # This is internal provenance, not a fabricated conversation turn.
+            # Direct Gemma owns one request-local system prompt, so include
+            # memory here instead of allowing the historical system filter to
+            # discard it.
+            system_parts.append("Conversation memory (compressed; not a verbatim user quote): " + memory_summary)
+        system_parts.append(
+            "Treat accepted user audio as an ordinary semantic user message. Infer its likely intent from the whole "
+            "accepted turn and answer naturally or call an appropriate provided tool. It may use any language, accent, "
+            "or code-switching. Follow the language or languages naturally used in the current utterance unless the user "
+            "or session instructions request another response language. Do not mention transcription, audio quality, "
+            "garbling, attached audio, or internal audio processing unless the user explicitly asks about that topic. "
+            "USER_TRANSCRIPT is optional display metadata and must never replace or gate the semantic response. "
+            "If exact words are unavailable, omit USER_TRANSCRIPT instead of filling it with a failure label. "
+            "When available, use this plain-text shape:\n"
+            "USER_TRANSCRIPT: <short transcript of what the user said>\n"
             "ASSISTANT_LANGUAGE: <single language name for a monolingual spoken answer; Auto for a mixed-language "
             "or otherwise unspecified spoken answer>\n"
-        )
-        if has_provisional_previous_audio:
-            semantic_instructions += (
-                "The immediately prior user audio is available only for resolving this turn. The current correction "
-                "wins; preserve it in USER_MEMORY. "
-            )
-        if self._camera_tool_available(vad_audio):
-            semantic_instructions += (
-                "CAMERA_CONTEXT: <current, historical, or none>\n"
-                "Use current when the user asks what is visible now, asks you to look again, or asks what changed; this "
-                "requires a new camera_snapshot before any result-dependent answer. Use historical only for a question "
-                "explicitly about a prior observation. Use none when no camera context is involved. Then continue with:\n"
-            )
-        semantic_instructions += (
             "ASSISTANT_RESPONSE: <your spoken answer>\n"
-            "When a provided tool is needed, call it in the same response and never fabricate its result. You may "
-            "put one brief, natural acknowledgement in ASSISTANT_PREAMBLE: <acknowledgement>; otherwise call the "
-            "tool silently. Do not emit a result-dependent ASSISTANT_RESPONSE until the tool result is available. "
+            "When a provided tool is needed, call it in the same response and never fabricate its result. Before the "
+            "function call, provide one brief, natural acknowledgement whose wording fits the specific request and "
+            "varies with the conversation; do not reuse a stock phrase. Put it in ASSISTANT_PREAMBLE: "
+            "<acknowledgement>; plain ASSISTANT_RESPONSE text is also accepted for "
+            "compatibility. Do not emit a result-dependent ASSISTANT_RESPONSE until the tool result is available. "
+            "Ask a brief, content-focused follow-up only when the request itself lacks a detail needed to complete it. "
             "Do not wrap plain-text responses in JSON or Markdown."
         )
-        system_parts.append(semantic_instructions)
-        system_parts.append(VOICE_INPUT_TOOL_POLICY)
         user_content: list[dict[str, Any]] = []
         for image_url in self._conversation_image_urls(runtime_config):
             user_content.append({"type": "image_url", "image_url": {"url": image_url}})
         user_content.append({"type": "input_audio", "input_audio": {"data": encoded, "format": self.audio_format}})
+
+        history: list[dict[str, Any]] = []
+        if chat is not None and callable(getattr(chat, "copy", None)):
+            history = [
+                message
+                for message in ChatCompletionsApiModelHandler._chat_messages(chat.copy())
+                if message.get("role") != "system"
+            ]
 
         _, model_name, _ = self._model_endpoint(vad_audio)
         payload: dict[str, Any] = {
@@ -775,23 +467,38 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             "stream": self.stream,
             **self.gen_kwargs,
         }
-        # Direct-audio semantics are intentionally low-variance. Keep release
-        # probes and production on the same sampling contract.
-        payload["temperature"] = DIRECT_AUDIO_TEMPERATURE
-        payload["top_p"] = DIRECT_AUDIO_TOP_P
         local_pipeline = getattr(runtime_config, "local_pipeline", None) or {}
         payload["max_tokens"] = _response_max_tokens(local_pipeline.get("max_response_tokens"), payload.get("max_tokens"))
         chat_template_kwargs = dict(payload.get("chat_template_kwargs") or {})
         chat_template_kwargs.setdefault("enable_thinking", False)
         payload["chat_template_kwargs"] = chat_template_kwargs
         tools = getattr(session, "tools", None) if session is not None else None
-        tool_choice = getattr(session, "tool_choice", None) if session is not None else None
         if tools:
             chat_tools = _to_chat_tools(tools)
             if chat_tools:
                 payload["tools"] = chat_tools
-        if tool_choice is not None:
-            payload["tool_choice"] = _to_chat_tool_choice(tool_choice)
+                tool_choice = getattr(session, "tool_choice", None)
+                if tool_choice is not None:
+                    payload["tool_choice"] = _to_chat_tool_choice(tool_choice)
+        # Keep only bounded, non-content telemetry for idle compaction.  The
+        # values mirror this exact outgoing request; no raw audio, transcript,
+        # prompt, tool schema, or credential is retained in runtime state.
+        if runtime_config is not None:
+            memory_block = "Conversation memory (compressed; not a verbatim user quote): " + memory_summary if memory_summary else ""
+            local_pipeline["_history_compaction_budget"] = {
+                "history_serialized_chars": len(json.dumps(history, ensure_ascii=False, separators=(",", ":"))),
+                "system_serialized_chars": len("\n\n".join(system_parts)),
+                "memory_serialized_chars": len(memory_block),
+                "tools_serialized_chars": len(json.dumps(payload.get("tools") or [], ensure_ascii=False, separators=(",", ":"))),
+                "response_allowance_tokens": int(payload["max_tokens"]),
+                "media_reserve_tokens_estimate": max(1024, int(len(audio) / max(1, self.sample_rate) * 100)),
+                "image_reserve_tokens_estimate": 256 * len(self._conversation_image_urls(runtime_config)),
+                "endpoint_identity": {
+                    "provider": getattr(getattr(runtime_config, "model_endpoint", None), "provider", None),
+                    "base_url": getattr(getattr(runtime_config, "model_endpoint", None), "base_url", None),
+                    "model": model_name,
+                },
+            }
         return payload
 
     def _transcription_payload(self, audio: np.ndarray, vad_audio: STTIn | None = None) -> dict[str, Any]:
@@ -819,7 +526,9 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             "chat_template_kwargs": {"enable_thinking": False},
         }
 
-    def _iter_progressive_transcriptions(self, vad_audio: STTIn) -> Iterator[PartialTranscription]:
+    def _iter_progressive_transcriptions(
+        self, vad_audio: STTIn, *, generation: int | None = None
+    ) -> Iterator[PartialTranscription]:
         audio = self._as_float32_mono(vad_audio.audio)
         key = (vad_audio.turn_id, vad_audio.turn_revision)
         start_s = perf_counter()
@@ -835,10 +544,15 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 self._transcription_payload(audio, vad_audio),
                 api_key=api_key,
             )
-            self._track_active(response, vad_audio)
+            if self._track_active(response, vad_audio) is False:
+                response.close()
+                return
             try:
                 response.wait_for_headers()
                 for line in response.iter_lines():
+                    if not self._direct_output_admitted(vad_audio, generation):
+                        response.close()
+                        return
                     if not line:
                         continue
                     if line.startswith("data:"):
@@ -849,20 +563,14 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                         data = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if not isinstance(data, Mapping):
-                        continue
                     choices = data.get("choices") or []
-                    if not isinstance(choices, list):
-                        continue
                     if not choices:
                         continue
-                    choice = choices[0]
-                    if not isinstance(choice, Mapping):
-                        continue
-                    delta = choice.get("delta") or {}
-                    if not isinstance(delta, Mapping):
-                        continue
-                    content = delta.get("content") or choice.get("text")
+                    if not self._direct_output_admitted(vad_audio, generation):
+                        response.close()
+                        return
+                    delta = choices[0].get("delta") or {}
+                    content = delta.get("content") or choices[0].get("text")
                     if not content:
                         continue
                     if first:
@@ -938,32 +646,19 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
     ) -> Iterator[DirectAssistantResponse]:
         base_url, _, api_key = self._model_endpoint(vad_audio)
         url = f"{base_url}/chat/completions"
-        encoded_audio = base64.b64encode(self._wav_bytes(audio)).decode("ascii")
-        payload_built = False
-        try:
-            # Snapshot prior history first. Otherwise current audio appears once
-            # in history and once as the live user message in the same request.
-            payload = self._payload(audio, vad_audio, encoded_audio=encoded_audio)
-            payload_built = True
-        finally:
-            # VAD admission, not optional metadata or payload serialization, is
-            # the accepted-turn boundary.
-            self._commit_accepted_audio(vad_audio, encoded_audio, consume_previous=payload_built)
+        payload = self._payload(audio, vad_audio)
         response: CancellableAsyncSSEStream | None = None
         try:
             if payload.get("stream", self.stream):
                 self._emit_metric(vad_audio, "gemma", "waiting_headers", detail={"operation": "direct_audio"})
                 response = self._stream_request(url, payload, api_key=api_key)
-                self._track_active(response, vad_audio)
+                if self._track_active(response, vad_audio) is False:
+                    response.close()
+                    return
                 try:
                     response.wait_for_headers()
                     self._emit_metric(vad_audio, "gemma", "generating", detail={"operation": "direct_audio"})
-                    yield from self._consume_stream(
-                        response,
-                        vad_audio,
-                        generation=generation,
-                        tool_choice=payload.get("tool_choice", "auto"),
-                    )
+                    yield from self._consume_stream(response, vad_audio, generation=generation)
                 finally:
                     self._untrack_active(response)
                     response.close()
@@ -971,15 +666,17 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             buffered_payload = dict(payload)
             buffered_payload["stream"] = True
             response = self._stream_request(url, buffered_payload, api_key=api_key)
-            self._track_active(response, vad_audio)
+            if self._track_active(response, vad_audio) is False:
+                response.close()
+                return
             raw = ""
             tool_accum: dict[int, dict[str, str]] = {}
-            tool_diagnostics = NativeToolStreamDiagnostics(
-                tool_choice=buffered_payload.get("tool_choice", "auto")
-            )
             try:
                 response.wait_for_headers()
                 for line in response.iter_lines():
+                    if not self._direct_output_admitted(vad_audio, generation):
+                        response.close()
+                        return
                     if not line:
                         continue
                     if line.startswith("data:"):
@@ -990,46 +687,19 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                         data = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if not isinstance(data, Mapping):
-                        tool_diagnostics.observe_malformed_stream_shape()
-                        continue
                     choices = data.get("choices") or []
-                    if not isinstance(choices, list):
-                        tool_diagnostics.observe_malformed_stream_shape()
-                        continue
                     if not choices:
                         continue
-                    choice = choices[0]
-                    tool_diagnostics.observe_choice(choice)
-                    if not isinstance(choice, Mapping):
-                        continue
-                    delta = choice.get("delta") or {}
-                    if not isinstance(delta, Mapping):
-                        continue
+                    if not self._direct_output_admitted(vad_audio, generation):
+                        response.close()
+                        return
+                    delta = choices[0].get("delta") or {}
                     self._accumulate_tool_deltas(delta, tool_accum)
-                    content = delta.get("content") or choice.get("text")
-                    if content is not None and not isinstance(content, str):
-                        continue
-                    raw += content or ""
+                    raw += str(delta.get("content") or choices[0].get("text") or "")
             finally:
                 self._untrack_active(response)
                 response.close()
-            tools = (
-                self._tool_calls_from_accum(
-                    tool_accum,
-                    chat=self._conversation_chat(vad_audio),
-                    turn_id=getattr(vad_audio, "turn_id", None),
-                )
-                if tool_diagnostics.native_calls_allowed
-                else []
-            )
-            tool_detail = tool_diagnostics.finalize(tool_accum, completed_call_count=len(tools))
-            self._emit_metric(
-                vad_audio,
-                "gemma",
-                "tool_contract",
-                detail=tool_detail,
-            )
+            tools = self._tool_calls_from_accum(tool_accum)
             text = raw
             yield from self._responses_from_text(text, vad_audio, tools=tools, generation=generation)
         except (httpx.HTTPError, RuntimeError):
@@ -1041,7 +711,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             cancelled = (
                 generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation)
             )
-            if superseded or cancelled:
+            if superseded or cancelled or not self._direct_output_admitted(vad_audio, generation):
                 self._emit_metric(vad_audio, "gemma", "cancelled", detail={"operation": "direct_audio"})
                 logger.info(
                     "Gemma audio transport closed for superseded request turn=%s rev=%s",
@@ -1055,26 +725,17 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 response.close()
 
     def _consume_stream(
-        self,
-        response: CancellableAsyncSSEStream,
-        vad_audio: STTIn,
-        *,
-        generation: int | None = None,
-        tool_choice: Any = "auto",
+        self, response: CancellableAsyncSSEStream, vad_audio: STTIn, *, generation: int | None = None
     ) -> Iterator[DirectAssistantResponse]:
         raw_text = ""
         tool_accum: dict[int, dict[str, str]] = {}
-        tool_diagnostics = NativeToolStreamDiagnostics(tool_choice=tool_choice)
         assistant_started = False
         pending_response = ""
-        assistant_response_closed = False
         transcript_value: str | None = None
         language_code: str | None = None
-        camera_current = False
-        suppress_response_stream = False
         full_buffer_tts = self._full_buffer_tts(getattr(vad_audio, "runtime_config", None))
         for line in response.iter_lines():
-            if generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation):
+            if not self._direct_output_admitted(vad_audio, generation):
                 logger.info("Gemma audio request cancelled for turn=%s", vad_audio.turn_id)
                 response.close()
                 return
@@ -1087,29 +748,21 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             try:
                 data = json.loads(line)
             except json.JSONDecodeError:
-                logger.debug("Ignoring non-JSON Gemma stream event (chars=%d)", len(line))
-                continue
-            if not isinstance(data, Mapping):
-                tool_diagnostics.observe_malformed_stream_shape()
+                logger.debug("Ignoring non-JSON Gemma stream line: %r", line)
                 continue
             choices = data.get("choices") or []
-            if not isinstance(choices, list):
-                tool_diagnostics.observe_malformed_stream_shape()
-                continue
             if not choices:
                 continue
-            choice = choices[0]
-            tool_diagnostics.observe_choice(choice)
-            if not isinstance(choice, Mapping):
-                continue
-            delta = choice.get("delta") or {}
-            if not isinstance(delta, Mapping):
-                continue
+            # Every SSE event is an admission boundary.  In particular, tool
+            # deltas must not be accumulated into a call that can later escape
+            # after a newer input has superseded this response.
+            if not self._direct_output_admitted(vad_audio, generation):
+                response.close()
+                return
+            delta = choices[0].get("delta") or {}
             self._accumulate_tool_deltas(delta, tool_accum)
-            content = delta.get("content") or choice.get("text")
+            content = delta.get("content") or choices[0].get("text")
             if not content:
-                continue
-            if not isinstance(content, str):
                 continue
             raw_text += str(content)
             if not assistant_started and _RESPONSE_MARKER in raw_text:
@@ -1117,18 +770,19 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                 transcript = self._extract_transcript(before)
                 transcript_value = transcript
                 language_code = self._effective_assistant_language(before)
-                camera_available = self._camera_tool_available(vad_audio)
-                camera_context = self._extract_camera_context(before)
-                camera_current = camera_available and camera_context == "current"
-                # Hold camera-capable responses until the complete control
-                # envelope is available. A duplicate or conflicting marker may
-                # arrive later and must not retroactively invalidate prose
-                # already sent to TTS.
-                suppress_response_stream = camera_available
                 if transcript:
-                    # Transcript metadata only upgrades the already persisted
-                    # accepted-audio item; it is not the admission boundary.
-                    user_committed = self._ensure_user_context(vad_audio, transcript) is not None
+                    # Establish the user transcript before assistant chunks are
+                    # forwarded, so the Realtime UI and conversation chronology
+                    # cannot render the assistant first.
+                    if not self._direct_output_admitted(vad_audio, generation):
+                        response.close()
+                        return
+                    user_committed = self._commit_user_context(vad_audio, transcript, generation=generation)
+                    if user_committed:
+                        self._committed_user_turns.add((vad_audio.turn_id, vad_audio.turn_revision))
+                    if not self._direct_output_admitted(vad_audio, generation):
+                        response.close()
+                        return
                     yield self._direct(
                         vad_audio,
                         "",
@@ -1136,18 +790,18 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                         is_final=False,
                         context_committed=user_committed,
                         transcript_finalized=True,
-                        language_code=language_code,
                         generation=generation,
                     )
                 assistant_started = True
                 pending_response = after
-            elif assistant_started and not assistant_response_closed:
+            elif assistant_started:
                 pending_response += str(content)
-            if assistant_started and not assistant_response_closed:
-                pending_response, assistant_response_closed = self._visible_response_prefix(pending_response)
-            if assistant_started and not full_buffer_tts and not suppress_response_stream:
+            if assistant_started and not full_buffer_tts:
                 chunks, pending_response = self._pop_sentence_chunks(pending_response)
                 for chunk in chunks:
+                    if not self._direct_output_admitted(vad_audio, generation):
+                        response.close()
+                        return
                     yield self._direct(
                         vad_audio,
                         chunk,
@@ -1155,63 +809,67 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
                         language_code=language_code,
                         generation=generation,
                     )
-        tools = (
-            self._tool_calls_from_accum(
-                tool_accum,
-                chat=self._conversation_chat(vad_audio),
-                turn_id=getattr(vad_audio, "turn_id", None),
-            )
-            if tool_diagnostics.native_calls_allowed
-            else []
-        )
-        tool_detail = tool_diagnostics.finalize(tool_accum, completed_call_count=len(tools))
-        self._emit_metric(
-            vad_audio,
-            "gemma",
-            "tool_contract",
-            detail=tool_detail,
-        )
-        tools, camera_context, _ = self._enforce_camera_context(vad_audio, raw_text, tools)
-        camera_current = camera_context == "current"
-        camera_out_of_order = self._camera_context_is_out_of_order(raw_text)
-        if generation is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(generation):
+        tools = self._tool_calls_from_accum(tool_accum)
+        if not self._direct_output_admitted(vad_audio, generation):
             return
         preamble = self._tool_preamble(raw_text, tools) if tools else None
+        # In phrase-streaming mode, completed ASSISTANT_RESPONSE sentences have
+        # already been emitted above.  A tool acknowledgement may use that
+        # compatibility marker instead of ASSISTANT_PREAMBLE; emitting the
+        # extracted preamble again on the terminal tool event would speak the
+        # acknowledgement twice.  Only the unflushed tail belongs on that
+        # terminal event.  Full-buffer mode has emitted no text yet and keeps
+        # the complete preamble behaviour.
         final_text = (
-            preamble
+            pending_response.strip()
+            if assistant_started and not full_buffer_tts
+            else preamble
             if tools and preamble
-            else ""
-            if camera_current or camera_out_of_order
             else pending_response.strip()
             if assistant_started
             else self._fallback_response_text(raw_text)
         )
         transcript = self._validate_transcript(transcript_value or self._extract_transcript(raw_text))
-        user_memory = None if transcript else self._extract_user_memory(raw_text)
         self._emit_metric(
             vad_audio,
             "transcription",
             "transcript_available" if transcript else "transcript_unavailable",
             detail={"mode": "final", "source": "primary"},
         )
-        full_response = preamble or (
-            "" if camera_current or camera_out_of_order else self._fallback_response_text(raw_text)
-        )
-        # The complete envelope is authoritative. A later duplicate or
-        # conflicting marker must fail closed to Auto for this response and its
-        # same-turn tool continuation.
-        language_code = self._effective_assistant_language(raw_text)
+        full_response = preamble or self._fallback_response_text(raw_text)
+        language_code = language_code or self._effective_assistant_language(raw_text)
+        if not transcript:
+            # Transcript metadata is optional. Preserve the actual answer as
+            # assistant-only provenance; never invent the user's words.
+            committed = self._commit_context(vad_audio, None, full_response, tools, generation=generation)
+            if not self._direct_output_admitted(vad_audio, generation):
+                return
+            yield self._direct(
+                vad_audio,
+                final_text,
+                tools=tools,
+                is_final=True,
+                context_committed=committed,
+                language_code=language_code,
+                generation=generation,
+            )
+            self._preview_transcripts.pop((vad_audio.turn_id, vad_audio.turn_revision), None)
+            return
+        user_key = (vad_audio.turn_id, vad_audio.turn_revision)
         committed = self._commit_context(
             vad_audio,
             transcript,
             full_response,
             tools,
-            user_memory=user_memory,
+            include_user=user_key not in self._committed_user_turns,
+            generation=generation,
         )
-        self._finish_user_context(vad_audio)
+        self._committed_user_turns.discard(user_key)
         self._preview_transcripts.pop((vad_audio.turn_id, vad_audio.turn_revision), None)
         if final_text:
             logger.info("Gemma audio response ready (%d characters)", len(final_text))
+        if not self._direct_output_admitted(vad_audio, generation):
+            return
         yield self._direct(
             vad_audio,
             final_text,
@@ -1231,11 +889,10 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         tools: list[ResponseFunctionToolCall] | None = None,
         generation: int | None = None,
     ) -> Iterator[DirectAssistantResponse]:
+        if not self._direct_output_admitted(vad_audio, generation):
+            return
         transcript = self._extract_transcript(text)
-        user_memory = None if transcript else self._extract_user_memory(text)
         tools = tools or []
-        tools, camera_context, _ = self._enforce_camera_context(vad_audio, text, tools)
-        camera_out_of_order = self._camera_context_is_out_of_order(text)
         language_code = self._effective_assistant_language(text)
         preamble = self._tool_preamble(text, tools) if tools else None
         self._emit_metric(
@@ -1244,22 +901,29 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             "transcript_available" if transcript else "transcript_unavailable",
             detail={"mode": "final", "source": "primary"},
         )
-        response_text = preamble or (
-            ""
-            if camera_context == "current" or camera_out_of_order
-            else self._fallback_response_text(text)
-        )
+        if not transcript:
+            response_text = preamble or self._fallback_response_text(text)
+            committed = self._commit_context(vad_audio, None, response_text, tools, generation=generation)
+            if not self._direct_output_admitted(vad_audio, generation):
+                return
+            yield self._direct(
+                vad_audio,
+                response_text,
+                tools=tools,
+                is_final=True,
+                context_committed=committed,
+                language_code=language_code,
+                generation=generation,
+            )
+            self._preview_transcripts.pop((vad_audio.turn_id, vad_audio.turn_revision), None)
+            return
+        response_text = preamble or self._fallback_response_text(text)
         if response_text:
             logger.info("Gemma audio response ready (%d characters)", len(response_text))
-        committed = self._commit_context(
-            vad_audio,
-            transcript,
-            response_text,
-            tools,
-            user_memory=user_memory,
-        )
-        self._finish_user_context(vad_audio)
+        committed = self._commit_context(vad_audio, transcript, response_text, tools, generation=generation)
         self._preview_transcripts.pop((vad_audio.turn_id, vad_audio.turn_revision), None)
+        if not self._direct_output_admitted(vad_audio, generation):
+            return
         yield self._direct(
             vad_audio,
             response_text,
@@ -1286,6 +950,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         error: str | None = None,
     ) -> DirectAssistantResponse:
         runtime_config = getattr(vad_audio, "runtime_config", None)
+        input_epoch, response_epoch, response_id = self._response_identity(vad_audio)
         if language_code and runtime_config is not None:
             runtime_config.local_pipeline["assistant_language"] = language_code
         return DirectAssistantResponse(
@@ -1301,6 +966,9 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             context_committed=context_committed,
             transcript_finalized=transcript_finalized,
             cancel_generation=generation,
+            input_epoch=input_epoch,
+            response_epoch=response_epoch,
+            response_id=response_id,
             error=error,
         )
 
@@ -1311,77 +979,83 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         assistant_text: str,
         tools: list[ResponseFunctionToolCall],
         *,
-        user_memory: str | None = None,
+        include_user: bool = True,
+        generation: int | None = None,
     ) -> bool:
-        chat = self._conversation_chat(vad_audio)
+        runtime_config = getattr(vad_audio, "runtime_config", None)
+        chat = getattr(runtime_config, "chat", None)
         if chat is None:
             return False
-        transcript = self._validate_transcript(transcript)
-        user_memory = None if transcript else self._validate_user_memory(user_memory)
-        key = self._turn_key(vad_audio)
-        revision = self._turn_revision(vad_audio)
-        with self._accepted_user_lock:
-            accepted = self._accepted_user_audio.get(key)
-            rollback_audio = accepted[0] if accepted is not None and accepted[1] == revision else None
-        user_item_id = self._ensure_user_context(vad_audio, transcript, user_memory)
-        if user_item_id is None:
-            self._emit_history_metric(vad_audio, "response_uncommitted", input_kind="missing", committed=False)
-            return False
-        function_calls = [
-            RealtimeConversationItemFunctionCall(
-                type="function_call",
-                name=tool.name,
-                arguments=tool.arguments,
-                call_id=tool.call_id,
-                id=tool.id,
-                status=tool.status,
-            )
-            for tool in tools
-        ]
-        scope = self._history_scope_key(vad_audio)
-        with self._accepted_user_lock:
-            owned = self._accepted_user_items.get(key)
-            if owned != (user_item_id, revision):
-                self._emit_history_metric(vad_audio, "response_uncommitted", input_kind="missing", committed=False)
+        _, response_epoch, _ = self._response_identity(vad_audio)
+        # Hold this only while mutating Chat. The shared tracker makes VAD
+        # invalidation/checkpoint rollback atomic with the entire
+        # user/assistant/function-call transaction, not merely one item.
+        with response_epoch_history_transaction(
+            runtime_config=runtime_config,
+            response_epoch=response_epoch,
+        ) as epoch_admitted:
+            if not epoch_admitted or not self._direct_output_admitted(vad_audio, generation):
                 return False
-            # Keep ownership validation and assistant/tool persistence in one
-            # transaction. A newer cumulative revision cannot claim the anchor
-            # between these two operations and receive a stale response.
-            try:
-                chat.commit_assistant_response(user_item_id, assistant_text, function_calls)
-            except Exception:
-                # Model metadata is provisional until the response-side
-                # transaction validates. Restore the admitted WAV so a failed
-                # call cannot leave an unbacked semantic guess in history.
-                if rollback_audio is not None:
-                    chat.replace_user_message_audio(user_item_id, rollback_audio)
-                raise
+            committed = False
+            exchange_id = self._assistant_only_exchange_id(vad_audio) if not transcript else None
+            if include_user and transcript:
+                chat.add_item(make_user_message(transcript))
+                committed = True
+            if assistant_text:
+                assistant_item = make_assistant_message(assistant_text)
+                chat.add_item(assistant_item)
+                if exchange_id:
+                    chat.mark_assistant_only_exchange(assistant_item.id, exchange_id)
+                committed = True
+            for tool in tools:
+                tool_item = RealtimeConversationItemFunctionCall(
+                        type="function_call",
+                        name=tool.name,
+                        arguments=tool.arguments,
+                        call_id=tool.call_id,
+                        id=tool.id,
+                        status=tool.status,
+                    )
+                chat.add_item(tool_item)
+                if exchange_id:
+                    chat.mark_direct_exchange_item(tool_item.id, exchange_id)
+                committed = True
+            # Direct-audio history is intentionally allowed to contain a
+            # settled assistant-only answer when the optional transcript is
+            # absent.  It is truthful provenance (there is no invented user
+            # wording) and remains protected by the same audible rollback.
+            chat.enable_token_managed_history()
             # Keep unresolved function-call pairs intact; the normal tool
             # follow-up path trims after its final assistant response commits.
-            if not tools:
-                chat.trim_if_needed(None)
-            accepted_audio = self._accepted_user_audio.get(key)
-            if user_memory and accepted_audio is not None and accepted_audio[1] == revision:
-                self._provisional_user_audio[scope] = (key, user_item_id, accepted_audio[0])
-            else:
-                provisional = self._provisional_user_audio.get(scope)
-                if provisional is not None and provisional[0] == key:
-                    self._provisional_user_audio.pop(scope, None)
-        self._emit_history_metric(
-            vad_audio,
-            "response_committed",
-            input_kind="transcript" if transcript else "semantic_memory" if user_memory else "input_audio",
-            committed=True,
-        )
-        return True
+            if committed and not tools:
+                runtime_config.local_pipeline["_history_maintenance_needed"] = True
+            return committed
+
+    def _commit_user_context(
+        self,
+        vad_audio: STTIn,
+        transcript: str,
+        *,
+        generation: int | None = None,
+    ) -> bool:
+        runtime_config = getattr(vad_audio, "runtime_config", None)
+        chat = getattr(runtime_config, "chat", None)
+        if chat is None:
+            return False
+        _, response_epoch, _ = self._response_identity(vad_audio)
+        with response_epoch_history_transaction(
+            runtime_config=runtime_config,
+            response_epoch=response_epoch,
+        ) as epoch_admitted:
+            if not epoch_admitted or not self._direct_output_admitted(vad_audio, generation):
+                return False
+            chat.add_item(make_user_message(transcript))
+            return True
 
     @staticmethod
     def _extract_transcript(text: str) -> str | None:
         match = _FINAL_TRANSCRIPT_RE.search(text)
         if not match:
-            return None
-        output = _OUTPUT_MARKER_RE.search(text)
-        if output is not None and match.start() > output.start():
             return None
         return GemmaAudioSTTHandler._validate_transcript(match.group(1))
 
@@ -1392,47 +1066,17 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         transcript = str(value).strip().strip('"')
         if not transcript or "\n" in transcript or len(transcript) > 1200:
             return None
-        failure_key = _failure_sentinel_key(transcript)
+        normalized = " ".join(transcript.lower().split())
+        if transcript.startswith("[") and transcript.endswith("]"):
+            return None
+        failure_key = normalized.strip(" \t\r\n\"'`[]()<>.,!?;:")
         if failure_key in _TRANSCRIPT_FAILURE_SENTINELS:
             return None
+        if any(control in normalized for control in _TRANSCRIPT_CONTROL_TEXT):
+            return None
+        if normalized.startswith(("system:", "assistant:", "response:", "user:")):
+            return None
         return transcript
-
-    @staticmethod
-    def _extract_user_memory(text: str) -> str | None:
-        match = _FINAL_MEMORY_RE.search(text)
-        if not match:
-            return None
-        output = _OUTPUT_MARKER_RE.search(text)
-        if output is not None and match.start() > output.start():
-            return None
-        return GemmaAudioSTTHandler._validate_user_memory(match.group(1))
-
-    @staticmethod
-    def _validate_user_memory(value: str | None) -> str | None:
-        if not value:
-            return None
-        raw_memory = str(value).strip().strip('"')
-        if (
-            not raw_memory
-            or len(raw_memory) > _MAX_USER_MEMORY_CHARS
-            or "\n" in raw_memory
-            or "\r" in raw_memory
-            or any(ord(character) < 32 for character in raw_memory)
-        ):
-            return None
-        memory = " ".join(raw_memory.split())
-        failure_key = _failure_sentinel_key(memory)
-        if failure_key in _TRANSCRIPT_FAILURE_SENTINELS or _MEMORY_CONTROL_MARKER_RE.search(memory):
-            return None
-        return memory
-
-    def on_session_end(self) -> None:
-        super().on_session_end()
-        with self._accepted_user_lock:
-            self._accepted_user_items.clear()
-            self._accepted_user_audio.clear()
-            self._provisional_user_audio.clear()
-        self._preview_transcripts.clear()
 
     @staticmethod
     def _extract_preview_transcript(text: str) -> str | None:
@@ -1445,31 +1089,18 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         if _PREVIEW_TRANSCRIPT_MARKER not in text:
             return None
         prefix, transcript = text.split(_PREVIEW_TRANSCRIPT_MARKER, 1)
-        if (
-            prefix.strip()
-            or _TRANSCRIPT_MARKER in transcript
-            or _MEMORY_MARKER in transcript
-            or _RESPONSE_MARKER in transcript
-            or _CAMERA_CONTEXT_MARKER in transcript
-        ):
+        if prefix.strip() or _TRANSCRIPT_MARKER in transcript or _RESPONSE_MARKER in transcript:
             return None
         transcript = transcript.strip().strip('"')
         return GemmaAudioSTTHandler._validate_transcript(transcript)
 
     @staticmethod
     def _extract_assistant_language(text: str) -> str | None:
-        matches = _ASSISTANT_LANGUAGE_RE.findall(text)
-        if len(matches) != 1:
+        match = _ASSISTANT_LANGUAGE_RE.search(text)
+        if not match:
             return None
-        value = matches[0].strip().strip('"')
+        value = match.group(1).strip().strip('"')
         return value if value and len(value) <= 40 else None
-
-    @staticmethod
-    def _canonical_assistant_language(value: str | None) -> str:
-        if not value:
-            return "Auto"
-        key = _failure_sentinel_key(unicodedata.normalize("NFKC", str(value)).replace("_", "-"))
-        return _ASSISTANT_LANGUAGE_ALIASES.get(key, "Auto")
 
     @staticmethod
     def _effective_assistant_language(text: str) -> str:
@@ -1481,115 +1112,7 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         previous turn or the clone reference metadata.
         """
 
-        return GemmaAudioSTTHandler._canonical_assistant_language(
-            GemmaAudioSTTHandler._extract_assistant_language(text)
-        )
-
-    @staticmethod
-    def _camera_tool_available(vad_audio: STTIn) -> bool:
-        runtime_config = getattr(vad_audio, "runtime_config", None)
-        session = getattr(runtime_config, "session", None)
-        for tool in getattr(session, "tools", None) or []:
-            if isinstance(tool, dict):
-                name = tool.get("name")
-                if not name and isinstance(tool.get("function"), dict):
-                    name = tool["function"].get("name")
-            else:
-                name = getattr(tool, "name", None)
-                if not name:
-                    name = getattr(getattr(tool, "function", None), "name", None)
-            if name == "camera_snapshot":
-                return True
-        return False
-
-    @staticmethod
-    def _extract_camera_context(text: str) -> str | None:
-        matches = list(_CAMERA_CONTEXT_RE.finditer(text))
-        if len(matches) != 1:
-            return None
-        output_match = _OUTPUT_MARKER_RE.search(text)
-        if output_match is not None and matches[0].start() >= output_match.start():
-            return None
-        value = _failure_sentinel_key(matches[0].group(1).strip().strip('"'))
-        return value if value in {"current", "historical", "none"} else None
-
-    @staticmethod
-    def _camera_context_is_out_of_order(text: str) -> bool:
-        matches = list(_CAMERA_CONTEXT_RE.finditer(text))
-        output_match = _OUTPUT_MARKER_RE.search(text)
-        if len(matches) != 1 or output_match is None or matches[0].start() < output_match.start():
-            return False
-        value = _failure_sentinel_key(matches[0].group(1).strip().strip('"'))
-        return value == "current"
-
-    def _enforce_camera_context(
-        self,
-        vad_audio: STTIn,
-        text: str,
-        tools: list[ResponseFunctionToolCall],
-    ) -> tuple[list[ResponseFunctionToolCall], str | None, bool]:
-        """Enforce a model-declared live-view requirement without inferring from content.
-
-        Missing or malformed classification is privacy fail-closed: it never
-        causes a capture. Metrics contain only the enum/call identity.
-        """
-
-        non_camera_tools = [tool for tool in tools if tool.name != "camera_snapshot"]
-        if not self._camera_tool_available(vad_audio):
-            return non_camera_tools, None, False
-        camera_context = self._extract_camera_context(text)
-        if camera_context is None:
-            self._emit_metric(
-                vad_audio,
-                "camera",
-                "freshness_unclassified",
-                detail={"camera_context": "unclassified", "enforced": False},
-            )
-            return non_camera_tools, None, False
-        if camera_context != "current":
-            self._emit_metric(
-                vad_audio,
-                "camera",
-                "freshness_classified",
-                detail={"camera_context": camera_context, "enforced": False},
-            )
-            return non_camera_tools, camera_context, False
-
-        first_camera = next((tool for tool in tools if tool.name == "camera_snapshot"), None)
-        if first_camera is None:
-            synthetic_index = len(tools)
-            injected = self._tool_calls_from_accum(
-                {synthetic_index: {"name": "camera_snapshot", "args": "{}", "id": ""}},
-                chat=self._conversation_chat(vad_audio),
-                turn_id=getattr(vad_audio, "turn_id", None),
-            )[0]
-            tools = [*non_camera_tools, injected]
-            first_camera = injected
-            enforced = True
-        else:
-            # One current observation needs exactly one frame. Preserve all
-            # non-camera calls and the first model-provided camera call.
-            retained: list[ResponseFunctionToolCall] = []
-            camera_retained = False
-            for tool in tools:
-                if tool.name != "camera_snapshot":
-                    retained.append(tool)
-                elif not camera_retained:
-                    retained.append(tool)
-                    camera_retained = True
-            tools = retained
-            enforced = False
-        self._emit_metric(
-            vad_audio,
-            "camera",
-            "freshness_enforced" if enforced else "freshness_satisfied",
-            detail={
-                "camera_context": camera_context,
-                "enforced": enforced,
-                "call_id": first_camera.call_id,
-            },
-        )
-        return tools, camera_context, enforced
+        return GemmaAudioSTTHandler._extract_assistant_language(text) or "Auto"
 
     @staticmethod
     def _extract_assistant_preamble(text: str) -> str | None:
@@ -1603,26 +1126,42 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
 
     @classmethod
     def _tool_preamble(cls, text: str, tools: list[ResponseFunctionToolCall]) -> str | None:
-        """Return only an explicit model-provided native-tool lead-in."""
+        """Return a spoken lead-in for every native tool call.
+
+        A model-provided acknowledgement is preferred, but tool execution must
+        never become silent just because the model omitted an optional marker.
+        """
         if not tools:
             return None
-        return cls._extract_assistant_preamble(text)
+        preamble = cls._extract_assistant_preamble(text)
+        if preamble:
+            return preamble
+        response = _ASSISTANT_RESPONSE_RE.search(text)
+        if response:
+            value = " ".join(response.group(1).strip().split())
+            if value and len(value) <= 280:
+                return value
+        names = {tool.name for tool in tools}
+        seed = "|".join(f"{tool.name}:{tool.call_id or tool.id or ''}" for tool in tools)
+        if "camera_snapshot" in names:
+            choices = ("I'll take a closer look.", "Let me see what you're showing me.", "I'll check the camera view.")
+        elif "web_search" in names:
+            choices = ("I'll look that up.", "I'll check the latest information.", "I'll find that for you.")
+        else:
+            choices = ("I'll take care of that.", "I'll check on it.", "I'll look into it.")
+        index = 0
+        for char in seed:
+            index = (index * 33 + ord(char)) % len(choices)
+        return choices[index]
 
     @staticmethod
     def _fallback_response_text(text: str) -> str:
         assistant = _ASSISTANT_RESPONSE_RE.search(text)
         if assistant:
             return assistant.group(1).strip()
-        return _CONTROL_LINE_RE.sub("", text).strip()
-
-    @staticmethod
-    def _visible_response_prefix(text: str) -> tuple[str, bool]:
-        """Return response prose before a trailing protocol-control line."""
-
-        match = _TRAILING_RESPONSE_CONTROL_RE.search(text)
-        if not match:
-            return text, False
-        return text[: match.start()].rstrip(), True
+        if _FINAL_TRANSCRIPT_RE.search(text) or _ASSISTANT_PREAMBLE_RE.search(text):
+            return ""
+        return text.strip()
 
     @staticmethod
     def _pop_sentence_chunks(text: str) -> tuple[list[str], str]:
@@ -1636,74 +1175,58 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
         return chunks, text[pos:]
 
     @staticmethod
-    def _accumulate_tool_deltas(delta: Mapping[str, Any], tool_accum: dict[int, dict[str, str]]) -> None:
-        fragments = delta.get("tool_calls") or []
-        if not isinstance(fragments, list):
-            return
-        for tc in fragments:
-            if not isinstance(tc, Mapping):
-                continue
-            raw_index = tc.get("index", 0)
-            if raw_index is None:
-                raw_index = 0
-            if isinstance(raw_index, bool) or not isinstance(raw_index, int) or raw_index < 0:
-                continue
-            index = raw_index
+    def _accumulate_tool_deltas(delta: dict[str, Any], tool_accum: dict[int, dict[str, str]]) -> None:
+        for tc in delta.get("tool_calls") or []:
+            index = int(tc.get("index") or 0)
             entry = tool_accum.setdefault(index, {"name": "", "args": "", "id": ""})
             if tc.get("id"):
                 entry["id"] = str(tc["id"])
             fn = tc.get("function") or {}
-            if not isinstance(fn, Mapping):
-                continue
             if fn.get("name"):
                 entry["name"] = str(fn["name"])
             if fn.get("arguments"):
                 entry["args"] += str(fn["arguments"])
 
     @staticmethod
-    def _tool_calls_from_accum(
-        tool_accum: dict[int, dict[str, str]],
-        *,
-        chat: Any | None = None,
-        turn_id: str | None = None,
-    ) -> list[ResponseFunctionToolCall]:
+    def _tool_calls_from_accum(tool_accum: dict[int, dict[str, str]]) -> list[ResponseFunctionToolCall]:
         tools: list[ResponseFunctionToolCall] = []
         used_call_ids: set[str] = set()
-        safe_turn_id = re.sub(r"[^A-Za-z0-9_-]+", "_", str(turn_id or "turn")).strip("_")[:48] or "turn"
         for index in sorted(tool_accum):
             entry = tool_accum[index]
             if not entry["name"]:
                 continue
             raw_call_id = entry["id"].strip()
-            fallback_call_id = f"call_{safe_turn_id}_{index}"
-            if raw_call_id and re.fullmatch(r"call_[A-Za-z0-9_-]+", raw_call_id):
+            if not raw_call_id:
+                call_id = _generate_id("call")
+                source = "generated"
+            elif raw_call_id.startswith("call_"):
                 call_id = raw_call_id
                 source = "native"
             else:
-                call_id = fallback_call_id
-                source = "canonical"
-            if chat is not None and callable(getattr(chat, "canonical_call_id", None)):
-                canonical = chat.canonical_call_id(call_id, used_call_ids)
-                if source == "native" and canonical != call_id:
-                    call_id = fallback_call_id
-                    canonical = chat.canonical_call_id(call_id, used_call_ids)
-                    source = "canonical_reused"
-            else:
-                canonical = call_id
-                suffix = 1
-                while canonical in used_call_ids:
-                    canonical = f"{call_id}_{suffix}"
+                # llama.cpp may return opaque tool IDs while the Realtime chat
+                # contract requires call_* IDs. Normalize only at this adapter
+                # boundary, then use the same value for every later transaction.
+                call_id = f"call_{raw_call_id}"
+                source = "normalized"
+            if call_id in used_call_ids:
+                base_call_id = call_id
+                suffix = index
+                while call_id in used_call_ids:
+                    call_id = f"{base_call_id}_{suffix}"
                     suffix += 1
-            if canonical != call_id:
                 source = f"{source}_deduplicated"
-            call_id = canonical
             used_call_ids.add(call_id)
-            logger.info("Direct audio tool call prepared (stage=adapter source=%s)", source)
+            logger.info(
+                "Direct audio tool call prepared (stage=adapter name=%s call_id=%s source=%s)",
+                entry["name"],
+                call_id,
+                source,
+            )
             tools.append(
                 ResponseFunctionToolCall(
                     type="function_call",
                     name=entry["name"],
-                    arguments=entry["args"],
+                    arguments=entry["args"] or "{}",
                     call_id=call_id,
                     id=_generate_id("fc"),
                     status="completed",
@@ -1722,10 +1245,23 @@ class GemmaAudioSTTHandler(BaseSTTHandler):
             except Exception:
                 logger.debug("Gemma audio transport was already closed during cancellation")
 
-    def _track_active(self, resource: Any, vad_audio: STTIn) -> None:
+    def _track_active(self, resource: Any, vad_audio: STTIn) -> bool:
         with self._active_response_lock:
             self._active_resources.add(resource)
             self._active_turn = (vad_audio.turn_id, vad_audio.turn_revision)
+        context = getattr(getattr(self, "_operation_context", None), "value", None)
+        if context is None:
+            return True
+        coordinator, operation = context
+        bound = coordinator.bind_cancel(operation, self.cancel_active)
+        cancellation_requested = getattr(coordinator, "cancellation_requested", None)
+        cancelled = callable(cancellation_requested) and cancellation_requested(operation)
+        if not bound or cancelled:
+            # Close synchronously as well as through the registered callback so
+            # a pre-registration cancellation cannot enter wait_for_headers.
+            self.cancel_active()
+            return False
+        return True
 
     def _untrack_active(self, resource: Any) -> None:
         with self._active_response_lock:

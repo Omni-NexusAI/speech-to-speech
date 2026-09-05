@@ -75,10 +75,28 @@ class BaseHandler(Generic[InT, OutT]):
         pass
 
     def output_for_queue(self, output: OutT, source_input: InT) -> OutT | AudioOutput:
+        # A handler may already have frozen both response identity and source
+        # sample rate (the audio.cpp candidate does). Never reconstruct it from
+        # mutable runtime settings or collapse the provider clock to 16 kHz.
+        if isinstance(output, AudioOutput):
+            return output
         cancel_generation = getattr(source_input, "cancel_generation", None)
-        if cancel_generation is not None and (isinstance(output, bytes) or hasattr(output, "tobytes")):
+        input_epoch = getattr(source_input, "input_epoch", None)
+        response_epoch = getattr(source_input, "response_epoch", None)
+        response_id = getattr(source_input, "response_id", None)
+        has_response_identity = any(
+            value is not None
+            for value in (cancel_generation, input_epoch, response_epoch, response_id)
+        )
+        if has_response_identity and (isinstance(output, bytes) or hasattr(output, "tobytes")):
             audio = cast(bytes | np.ndarray, output)
-            return AudioOutput(audio=audio, cancel_generation=cancel_generation)
+            return AudioOutput(
+                audio=audio,
+                cancel_generation=cancel_generation,
+                input_epoch=input_epoch,
+                response_epoch=response_epoch,
+                response_id=response_id,
+            )
         return output
 
     def run(self) -> None:

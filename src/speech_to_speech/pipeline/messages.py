@@ -46,6 +46,9 @@ class VADAudio(PipelineMessage):
     turn_revision: int | None = None
     created_at_s: float = Field(default_factory=perf_counter)
     runtime_config: RuntimeConfig | None = None
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
 
 
 # â”€â”€ STT â†’ TranscriptionNotifier â†’ LLM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -99,6 +102,11 @@ class DirectAssistantResponse(PipelineMessage):
     # still carry the request generation through LM output and TTS so a
     # barge-in cannot synthesize abandoned assistant text later.
     cancel_generation: int | None = None
+    # Conversation-wide ownership values.  They are optional during the
+    # protocol migration so older callers keep their existing contract.
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
     # A terminal transport failure still has to traverse the direct response
     # path so the realtime service can emit response.done and release its slot.
     error: str | None = None
@@ -125,6 +133,9 @@ class LLMResponseChunk(PipelineMessage):
     turn_revision: int | None = None
     speech_stopped_at_s: float | None = None
     cancel_generation: int | None = None
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
 
 
 class TokenUsage(PipelineMessage):
@@ -133,8 +144,12 @@ class TokenUsage(PipelineMessage):
     tag: Literal["token_usage"] = "token_usage"
     input_tokens: int
     output_tokens: int
+    runtime_config: RuntimeConfig | None = None
     turn_id: str | None = None
     turn_revision: int | None = None
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
 
 
 class EndOfResponse(PipelineMessage):
@@ -147,10 +162,14 @@ class EndOfResponse(PipelineMessage):
     """
 
     tag: Literal["end_of_response"] = "end_of_response"
+    runtime_config: RuntimeConfig | None = None
     turn_id: str | None = None
     turn_revision: int | None = None
     cancel_generation: int | None = None
     error: str | None = None
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
 
 
 # â”€â”€ LMOutputProcessor â†’ TTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -168,14 +187,26 @@ class TTSInput(PipelineMessage):
     turn_revision: int | None = None
     speech_stopped_at_s: float | None = None
     cancel_generation: int | None = None
+    # TTS freezes its synthesis context by response_epoch.  input_epoch keeps
+    # diagnostics and stale-output rejection connected to the accepted speech.
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
 
 
 class AudioOutput(PipelineMessage):
-    """Audio queue item tagged with the response generation that produced it."""
+    """Audio queue item with immutable response identity and source PCM clock."""
 
     tag: Literal["audio_output"] = "audio_output"
     audio: bytes | np.ndarray
     cancel_generation: int | None = None
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
+    # Outbound synthesis is normally 16 kHz. The isolated audio.cpp candidate
+    # preserves model-native PCM16/24 kHz through the router instead of being
+    # silently mislabeled or downsampled.
+    source_sample_rate: int = 16000
 
 
 # â”€â”€ Realtime service â†’ LLM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -199,6 +230,12 @@ class GenerateResponseRequest(PipelineMessage):
     turn_id: str | None = None
     turn_revision: int | None = None
     speech_stopped_at_s: float | None = None
+    # Conversation-scoped ownership is claimed before model admission.  Every
+    # downstream result must echo this identity so detached work can be
+    # rejected without relying on transport timing or response flags.
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
 
 
 # â”€â”€ Binary sentinels (audio/output queue) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

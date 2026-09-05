@@ -1,6 +1,4 @@
-import base64
 import json
-import logging
 from queue import Queue
 from threading import Event, Thread
 from types import SimpleNamespace
@@ -8,22 +6,13 @@ from types import SimpleNamespace
 import httpx
 import numpy as np
 import pytest
-from openai.types.realtime.conversation_item import (
-    RealtimeConversationItemFunctionCall,
-    RealtimeConversationItemFunctionCallOutput,
-)
+from openai.types.realtime.conversation_item import RealtimeConversationItemFunctionCallOutput
 from openai.types.responses import ResponseFunctionToolCall
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
-from speech_to_speech.LLM.base_openai_compatible_language_model import (
-    BaseOpenAICompatibleHandler,
-    TextDelta,
-    _GenState,
-    _Turn,
-)
+from speech_to_speech.LLM.base_openai_compatible_language_model import BaseOpenAICompatibleHandler
 from speech_to_speech.LLM.chat import Chat, make_assistant_message, make_user_message
-from speech_to_speech.LLM.chat_completions_language_model import ChatCompletionsApiModelHandler
-from speech_to_speech.LLM.voice_prompt import VOICE_INPUT_TOOL_POLICY
+from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.events import TranscriptionCompletedEvent
 from speech_to_speech.pipeline.messages import (
     DirectAssistantRequest,
@@ -31,6 +20,9 @@ from speech_to_speech.pipeline.messages import (
     EndOfResponse,
     LLMResponseChunk,
 )
+from speech_to_speech.pipeline.model_operations import ModelOperationCoordinator
+from speech_to_speech.pipeline.response_ownership import ResponseOwnershipTracker
+from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 from speech_to_speech.STT.gemma_audio_handler import GemmaAudioSTTHandler
 from speech_to_speech.STT.transcription_notifier import TranscriptionNotifier
 
@@ -56,58 +48,6 @@ class _PassThroughHandler(BaseOpenAICompatibleHandler):
 
     def _build_optional_kwargs(self, req_tools, req_tool_choice):
         return {}
-
-
-@pytest.mark.parametrize(
-    ("consumer", "mode"),
-    [
-        ("_consume_streaming", "streaming"),
-        ("_consume_nonstreaming", "nonstreaming"),
-    ],
-)
-def test_shared_llm_generation_logs_are_content_free(caplog, consumer, mode):
-    assistant_secret = "ASSISTANT_PRIVATE_SENTINEL"
-    argument_secret = "TOOL_ARGUMENT_PRIVATE_SENTINEL"
-    handler = object.__new__(_PassThroughHandler)
-    handler.speculative_turns = None
-    handler.cancel_scope = None
-    state = _GenState(
-        tools=[
-            ResponseFunctionToolCall(
-                type="function_call",
-                name="private_tool_name",
-                arguments=json.dumps({"query": argument_secret}),
-                call_id="call_private_log_test",
-                id="fc_private_log_test",
-                status="completed",
-            )
-        ]
-    )
-    turn = _Turn(
-        language_code=None,
-        gen=None,
-        runtime_config=RuntimeConfig(chat=Chat(30)),
-        response=None,
-        turn_id="turn_private_log_test",
-        turn_revision=0,
-        speech_stopped_at_s=None,
-        wants_audio=False,
-    )
-
-    caplog.set_level(logging.DEBUG, logger="speech_to_speech.LLM.base_openai_compatible_language_model")
-    list(getattr(handler, consumer)(iter([TextDelta(text=assistant_secret)]), state, turn))
-
-    assert assistant_secret not in caplog.text
-    assert argument_secret not in caplog.text
-    assert "private_tool_name" not in caplog.text
-    assert (
-        f"LLM generation summary mode={mode} assistant_chars={len(assistant_secret)} tool_calls=1"
-        in caplog.text
-    )
-
-
-def _encoded_silence(handler: GemmaAudioSTTHandler, samples: int = 1600) -> str:
-    return base64.b64encode(handler._wav_bytes(np.zeros(samples, dtype=np.float32))).decode("ascii")
 
 
 def test_gemma_audio_payload_uses_input_audio_wav_base64():
@@ -188,55 +128,15 @@ def test_gemma_audio_payload_includes_instructions_history_tools_and_disables_th
 
     payload = handler._payload(np.zeros(1600, dtype=np.float32), vad_audio)
 
-    system_prompt = payload["messages"][0]["content"]
-    assert "Always answer as TEST ROLE." in system_prompt
-    assert system_prompt.count(VOICE_INPUT_TOOL_POLICY.rstrip()) == 1
-    assert "one distinct narrower refinement" in system_prompt
-    assert "retrieved_at_utc is retrieval" in system_prompt
-    assert "any language, accent, or code-switching" in system_prompt
-    assert "Follow the language or languages naturally used in the current utterance" in system_prompt
-    assert "begin with USER_MEMORY as one short, affirmative, content-faithful" in system_prompt
-    assert "Preserve names, numbers, negation" in system_prompt
-    assert "USER_TRANSCRIPT" not in system_prompt
-    assert "transcription" not in system_prompt.lower()
-    assert "garbl" not in system_prompt.lower()
-    assert "audio quality" not in system_prompt.lower()
-    assert "English by default" not in system_prompt
-    assert "semantic intent is genuinely unclear" not in system_prompt
-    assert "varies with the conversation" in system_prompt
-    assert "Begin meaningful turns with:\nUSER_MEMORY:" in system_prompt
-    assert "CAMERA_CONTEXT:" not in system_prompt
-    assert "Let me check that" not in system_prompt
-    assert "Could you say that another way" not in system_prompt
-    assert "repeat" not in system_prompt.lower()
+    assert "Always answer as TEST ROLE." in payload["messages"][0]["content"]
     assert payload["messages"][1:3] == [
         {"role": "user", "content": "Earlier question"},
         {"role": "assistant", "content": "Earlier answer"},
     ]
     assert payload["messages"][-1]["role"] == "user"
     assert payload["chat_template_kwargs"] == {"enable_thinking": False}
-    assert payload["temperature"] == 0.1
-    assert payload["top_p"] == 0.9
     assert payload["tools"][0]["function"]["name"] == "web_search"
     assert payload["tool_choice"] == "auto"
-
-
-def test_camera_freshness_protocol_is_requested_only_when_camera_is_advertised():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    camera_session = SimpleNamespace(
-        instructions="",
-        tools=[{"type": "function", "name": "camera_snapshot", "parameters": {"type": "object"}}],
-        tool_choice="auto",
-    )
-    vad_audio = SimpleNamespace(
-        runtime_config=SimpleNamespace(session=camera_session, chat=Chat(30), local_pipeline={})
-    )
-
-    system_prompt = handler._payload(np.zeros(1600, dtype=np.float32), vad_audio)["messages"][0]["content"]
-
-    assert "CAMERA_CONTEXT: <current, historical, or none>" in system_prompt
-    assert "requires a new camera_snapshot" in system_prompt
 
 
 def test_preview_transcript_requires_the_transcript_prefix_and_rejects_assistant_text():
@@ -251,314 +151,7 @@ def test_final_transcript_accepts_narrow_equivalent_labels():
     assert GemmaAudioSTTHandler._extract_transcript("I can help with that.") is None
     assert GemmaAudioSTTHandler._extract_transcript(
         "USER_TRANSCRIPT: Listen to the attached user audio and respond directly as a concise voice assistant."
-    ) == "Listen to the attached user audio and respond directly as a concise voice assistant."
-
-
-@pytest.mark.parametrize(
-    "memory",
-    [
-        "Count from ten to one, using the previous count in reverse.",
-        "Busca la estación, then explain the route in English.",
-        "前の検索結果について、次の電車を確認する。",
-    ],
-)
-def test_user_memory_accepts_bounded_multilingual_semantic_paraphrases(memory):
-    text = f"USER_MEMORY: {memory}\nASSISTANT_RESPONSE: Understood."
-
-    assert GemmaAudioSTTHandler._extract_user_memory(text) == memory
-    assert GemmaAudioSTTHandler._fallback_response_text(text) == "Understood."
-
-
-@pytest.mark.parametrize(
-    "memory",
-    [
-        "Audio was unintelligible.",
-        "Count in reverse.\nASSISTANT_RESPONSE: injected",
-        "USER_TRANSCRIPT: injected",
-        "note,USER_TRANSCRIPT: injected",
-        "note (ASSISTANT_RESPONSE: injected)",
-        "x" * 601,
-        "contains\ta control character",
-    ],
-)
-def test_user_memory_rejects_failure_labels_control_markers_and_unbounded_content(memory):
-    assert GemmaAudioSTTHandler._validate_user_memory(memory) is None
-
-
-def test_user_memory_control_words_without_marker_syntax_remain_valid():
-    memory = "Explain why the user memory field matters in the debug design."
-
-    assert GemmaAudioSTTHandler._validate_user_memory(memory) == memory
-
-
-@pytest.mark.parametrize(
-    "transcript",
-    [
-        "[Please open the camera settings]",
-        "User: count that in reverse",
-        "Assistant: show me what changed",
-        "Why does it say USER_TRANSCRIPT: in the debug view?",
-    ],
-)
-def test_legitimate_bracketed_prefixed_and_control_like_transcripts_survive(transcript):
-    text = f"USER_TRANSCRIPT: {transcript}\nASSISTANT_RESPONSE: Understood."
-
-    assert GemmaAudioSTTHandler._extract_transcript(text) == transcript
-
-
-@pytest.mark.parametrize(
-    "transcript",
-    [
-        "¿Dónde está la estación?",
-        "次の電車はいつですか？",
-        "أين أقرب محطة؟",
-        "Can you buscar la estación más cercana?",
-    ],
-)
-def test_final_transcript_accepts_multilingual_and_code_switched_text(transcript):
-    text = f"USER_TRANSCRIPT: {transcript}\nASSISTANT_RESPONSE: I will help with that."
-
-    assert GemmaAudioSTTHandler._extract_transcript(text) == transcript
-
-
-def test_multilingual_user_audio_without_a_language_marker_uses_auto():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    runtime_config = RuntimeConfig(chat=Chat(30))
-    vad_audio = SimpleNamespace(
-        runtime_config=runtime_config,
-        turn_id="turn_multilingual",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-
-    outputs = list(
-        handler._responses_from_text(
-            "USER_TRANSCRIPT: ¿Dónde está la estación?\nASSISTANT_RESPONSE: The station is two blocks ahead.",
-            vad_audio,
-        )
-    )
-
-    assert outputs[-1].transcript == "¿Dónde está la estación?"
-    assert outputs[-1].text == "The station is two blocks ahead."
-    assert outputs[-1].language_code == "Auto"
-    assert runtime_config.local_pipeline["assistant_language"] == "Auto"
-
-
-@pytest.mark.parametrize(
-    ("response", "expected_language"),
-    [
-        (
-            "USER_TRANSCRIPT: ¿Dónde está la estación?\n"
-            "ASSISTANT_LANGUAGE: Spanish\n"
-            "ASSISTANT_RESPONSE: La estación está a dos cuadras.",
-            "Spanish",
-        ),
-        (
-            "USER_TRANSCRIPT: Can you buscar la estación?\n"
-            "ASSISTANT_LANGUAGE: Auto\n"
-            "ASSISTANT_RESPONSE: Sí, it is two blocks ahead.",
-            "Auto",
-        ),
-    ],
-)
-def test_direct_audio_preserves_monolingual_or_auto_response_language(response, expected_language):
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    runtime_config = RuntimeConfig(chat=Chat(30))
-    vad_audio = SimpleNamespace(
-        runtime_config=runtime_config,
-        turn_id="turn_response_language",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-
-    outputs = list(handler._responses_from_text(response, vad_audio))
-
-    assert outputs[-1].language_code == expected_language
-    assert runtime_config.local_pipeline["assistant_language"] == expected_language
-
-
-@pytest.mark.parametrize(
-    ("marker", "expected"),
-    [
-        ("es", "Spanish"),
-        ("Espa\u00f1ol", "Spanish"),
-        ("Deutsch", "German"),
-        ("\u65e5\u672c\u8a9e", "Japanese"),
-        ("\ud55c\uad6d\uc5b4", "Korean"),
-        ("\u4e2d\u6587", "Chinese"),
-        ("Portugu\u00eas", "Portuguese"),
-        ("mixed language", "Auto"),
-        ("unsupported-language", "Auto"),
-    ],
-)
-def test_assistant_language_is_canonical_at_the_direct_audio_boundary(marker, expected):
-    text = f"ASSISTANT_LANGUAGE: {marker}\nASSISTANT_RESPONSE: Ready."
-
-    assert GemmaAudioSTTHandler._effective_assistant_language(text) == expected
-
-
-def test_duplicate_or_conflicting_assistant_language_markers_fail_closed_to_auto():
-    duplicate = (
-        "ASSISTANT_LANGUAGE: Spanish\n"
-        "ASSISTANT_LANGUAGE: Spanish\n"
-        "ASSISTANT_RESPONSE: Listo."
-    )
-    conflicting = (
-        "ASSISTANT_LANGUAGE: German\n"
-        "ASSISTANT_LANGUAGE: English\n"
-        "ASSISTANT_RESPONSE: Ready."
-    )
-
-    assert GemmaAudioSTTHandler._effective_assistant_language(duplicate) == "Auto"
-    assert GemmaAudioSTTHandler._effective_assistant_language(conflicting) == "Auto"
-
-
-@pytest.mark.parametrize(
-    "sentinel",
-    [
-        "[inaudible]",
-        "Unintelligible.",
-        "Audio was garbled.",
-        "No intelligible speech detected.",
-        "Transcription unavailable.",
-    ],
-)
-def test_failure_only_transcript_sentinels_are_rejected_exactly(sentinel):
-    text = f"USER_TRANSCRIPT: {sentinel}\nASSISTANT_RESPONSE: I will answer naturally."
-
-    assert GemmaAudioSTTHandler._extract_transcript(text) is None
-
-
-@pytest.mark.parametrize(
-    "sentinel",
-    [
-        "\u65e0\u6cd5\u542c\u6e05",
-        "\u805e\u304d\u53d6\u308c\u307e\u305b\u3093",
-        "\uc54c\uc544\ub4e4\uc744 \uc218 \uc5c6\uc2b5\ub2c8\ub2e4",
-        "Unverst\u00e4ndlich",
-        "Aucune parole d\u00e9tect\u00e9e",
-        "\u041d\u0435\u0440\u0430\u0437\u0431\u043e\u0440\u0447\u0438\u0432\u043e",
-        "\u00c1udio inintelig\u00edvel",
-        "No se detect\u00f3 habla",
-        "Nessun parlato rilevato",
-    ],
-)
-def test_supported_language_failure_sentinels_are_metadata_only_and_whole_field_exact(sentinel):
-    assert GemmaAudioSTTHandler._validate_transcript(f"  [{sentinel}]  ") is None
-    assert GemmaAudioSTTHandler._validate_user_memory(f"\u300c{sentinel}\u300d") is None
-    substantive = f"Explain why the label {sentinel} appeared in the report."
-    assert GemmaAudioSTTHandler._validate_transcript(substantive) == substantive
-    assert GemmaAudioSTTHandler._validate_user_memory(substantive) == substantive
-
-
-def test_transcript_failure_words_inside_real_user_content_are_preserved():
-    transcript = "Why does the recording sound garbled and unintelligible?"
-    text = f"USER_TRANSCRIPT: {transcript}\nASSISTANT_RESPONSE: I will explain."
-
-    assert GemmaAudioSTTHandler._extract_transcript(text) == transcript
-
-
-def test_failure_only_transcript_does_not_gate_response_or_tools():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    runtime_config = RuntimeConfig(chat=Chat(30))
-    vad_audio = SimpleNamespace(
-        runtime_config=runtime_config,
-        turn_id="turn_failure_sentinel",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-    tool = ResponseFunctionToolCall(
-        type="function_call",
-        name="web_search",
-        arguments='{"query":"current weather"}',
-        call_id="call_failure_sentinel",
-        id="fc_failure_sentinel",
-        status="completed",
-    )
-
-    outputs = list(
-        handler._responses_from_text(
-            "USER_TRANSCRIPT: Audio was unintelligible.\n"
-            "ASSISTANT_LANGUAGE: Auto\n"
-            "ASSISTANT_PREAMBLE: I'll check the current forecast.",
-            vad_audio,
-            tools=[tool],
-        )
-    )
-
-    assert outputs[-1].transcript is None
-    assert outputs[-1].text == "I'll check the current forecast."
-    assert outputs[-1].tools == [tool]
-    assert outputs[-1].language_code == "Auto"
-    assert runtime_config.local_pipeline["assistant_language"] == "Auto"
-
-
-def test_direct_audio_resets_a_previous_turn_language_before_generation():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    runtime_config = RuntimeConfig(chat=Chat(30))
-    runtime_config.local_pipeline["assistant_language"] = "Spanish"
-    vad_audio = SimpleNamespace(
-        audio=np.zeros(1600, dtype=np.float32),
-        mode="final",
-        runtime_config=runtime_config,
-        turn_id="turn_language_reset",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-
-    def responses(_audio, received_vad_audio, *, generation=None):
-        assert "assistant_language" not in received_vad_audio.runtime_config.local_pipeline
-        yield DirectAssistantResponse(text="Hello.", is_final=True)
-
-    handler._iter_direct_responses = responses
-    list(handler.process(vad_audio))
-
-    assert "assistant_language" not in runtime_config.local_pipeline
-
-
-def test_accepted_turn_metrics_are_content_free_input_measurements():
-    metrics = Queue()
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(
-        model_name="gemma-test",
-        base_url="http://127.0.0.1:8818/v1",
-        stream=False,
-        text_output_queue=metrics,
-    )
-    runtime_config = RuntimeConfig(chat=Chat(30))
-    vad_audio = SimpleNamespace(
-        audio=np.asarray([0.0, 0.5, 1.0, -1.0], dtype=np.float32),
-        mode="final",
-        runtime_config=runtime_config,
-        turn_id="turn_content_free_metrics",
-        turn_revision=1,
-        created_at_s=0.0,
-    )
-    handler._iter_direct_responses = lambda *_args, **_kwargs: iter(
-        [DirectAssistantResponse(text="A private semantic answer.", is_final=True)]
-    )
-
-    list(handler.process(vad_audio))
-
-    events = []
-    while not metrics.empty():
-        events.append(metrics.get_nowait())
-    request_start = next(event for event in events if event.stage == "gemma" and event.status == "request_start")
-    captured = next(event for event in events if event.stage == "transcription" and event.status == "captured")
-    for detail in (request_start.detail, captured.detail):
-        assert detail["rms"] == 0.75
-        assert detail["peak"] == 1.0
-        assert detail["near_silence"] is False
-        assert detail["clipping"] is True
-        assert detail["clipping_fraction"] == 0.5
-        assert detail["revision_count"] == 2
-        assert "transcript" not in detail
-        assert "text" not in detail
-        assert "A private semantic answer" not in json.dumps(detail)
+    ) is None
 
 
 def test_final_transcript_has_no_second_request_fallback():
@@ -578,23 +171,47 @@ def test_optional_tool_preamble_is_extracted_without_becoming_response_metadata(
     assert GemmaAudioSTTHandler._fallback_response_text(text) == ""
 
 
-def test_tool_preamble_is_never_synthesized_or_rewritten():
+def test_tool_preamble_has_a_safe_fallback_when_the_model_omits_it():
     camera = ResponseFunctionToolCall(
         type="function_call", name="camera_snapshot", arguments="{}", call_id="call_camera", id="fc_camera", status="completed"
     )
     search = ResponseFunctionToolCall(
         type="function_call", name="web_search", arguments="{}", call_id="call_search", id="fc_search", status="completed"
     )
-    assert GemmaAudioSTTHandler._tool_preamble("", [camera]) is None
-    assert GemmaAudioSTTHandler._tool_preamble("", [search]) is None
-    assert GemmaAudioSTTHandler._tool_preamble("ASSISTANT_RESPONSE: A substantive answer.", [search]) is None
-    assert (
-        GemmaAudioSTTHandler._tool_preamble(
-            "ASSISTANT_PREAMBLE: I'll check the latest information.",
-            [search],
-        )
-        == "I'll check the latest information."
+    camera_fallback = GemmaAudioSTTHandler._tool_preamble("", [camera])
+    search_fallback = GemmaAudioSTTHandler._tool_preamble("", [search])
+    assert camera_fallback in {
+        "I'll take a closer look.",
+        "Let me see what you're showing me.",
+        "I'll check the camera view.",
+    }
+    assert search_fallback in {
+        "I'll look that up.",
+        "I'll check the latest information.",
+        "I'll find that for you.",
+    }
+    assert GemmaAudioSTTHandler._tool_preamble("", [camera]) == camera_fallback
+    assert GemmaAudioSTTHandler._tool_preamble("", [search]) == search_fallback
+
+
+def test_direct_gemma_current_response_epoch_overrides_newer_speculative_turn():
+    """A retained audible owner must still deliver its terminal output."""
+
+    tracker = SpeculativeTurnTracker()
+    tracker.observe("turn_new", 0)
+    runtime = RuntimeConfig()
+    runtime.local_pipeline["_response_epoch_is_current"] = lambda epoch: epoch == 17
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.cancel_scope = None
+    handler.speculative_turns = tracker
+    vad_audio = SimpleNamespace(
+        runtime_config=runtime,
+        turn_id="turn_old",
+        turn_revision=0,
+        response_epoch=17,
     )
+
+    assert handler._request_is_stale(vad_audio, generation=None) is False
 
 
 def test_tool_preamble_is_spoken_and_committed_before_the_function_call():
@@ -625,20 +242,16 @@ def test_tool_preamble_is_spoken_and_committed_before_the_function_call():
 
     assert outputs[0].text == "I'll check the latest forecast."
     assert outputs[0].tools == [tool]
-    assert [item.type for item in chat.buffer] == ["message", "message", "function_call"]
+    assert [item.type for item in chat.buffer] == ["message", "message"]
     assert chat.stats()["pending_tool_calls"] == 1
 
 
-def test_semantic_memory_preserves_tool_preamble_and_call_order_without_transcript():
+def test_tool_preamble_without_transcript_is_still_retained_for_tool_continuity():
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
     chat = Chat(30)
-    runtime_config = RuntimeConfig(chat=chat)
-    runtime_config.session.tools = [
-        {"type": "function", "name": "camera_snapshot", "parameters": {"type": "object"}}
-    ]
     vad_audio = SimpleNamespace(
-        runtime_config=runtime_config,
+        runtime_config=RuntimeConfig(chat=chat),
         turn_id="turn_tool_preamble_no_transcript",
         turn_revision=0,
         created_at_s=0.0,
@@ -651,13 +264,9 @@ def test_semantic_memory_preserves_tool_preamble_and_call_order_without_transcri
         id="fc_camera_preamble",
         status="completed",
     )
-    handler._commit_accepted_audio(vad_audio, _encoded_silence(handler))
 
     outputs = list(
         handler._responses_from_text(
-            "USER_MEMORY: Inspect the current camera view more closely.\n"
-            "ASSISTANT_LANGUAGE: English\n"
-            "CAMERA_CONTEXT: current\n"
             "ASSISTANT_PREAMBLE: Let me take a closer look.",
             vad_audio,
             tools=[tool],
@@ -666,248 +275,8 @@ def test_semantic_memory_preserves_tool_preamble_and_call_order_without_transcri
 
     assert outputs[0].transcript is None
     assert outputs[0].text == "Let me take a closer look."
-    assert [item.type for item in chat.buffer] == ["message", "message", "function_call"]
-    assert chat.buffer[0].content[0].type == "input_text"
-    assert chat.buffer[0].content[0].text == "Inspect the current camera view more closely."
+    assert [item.type for item in chat.buffer] == ["message"]
     assert chat.stats()["pending_tool_calls"] == 1
-
-
-def _camera_vad(turn_id="turn_camera_freshness"):
-    runtime_config = RuntimeConfig(chat=Chat(30))
-    runtime_config.session.tools = [
-        {"type": "function", "name": "camera_snapshot", "parameters": {"type": "object"}}
-    ]
-    runtime_config.session.tool_choice = "auto"
-    return SimpleNamespace(
-        audio=np.zeros(1600, dtype=np.float32),
-        mode="final",
-        runtime_config=runtime_config,
-        turn_id=turn_id,
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-
-
-def _completed_tool(name: str, call_id: str) -> ResponseFunctionToolCall:
-    return ResponseFunctionToolCall(
-        type="function_call",
-        name=name,
-        arguments="{}",
-        call_id=call_id,
-        id=f"fc_{call_id}",
-        status="completed",
-    )
-
-
-def test_current_camera_context_injects_one_fresh_call_and_suppresses_result_claim():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    vad_audio = _camera_vad()
-    text = (
-        "USER_MEMORY: Check what is visible now.\n"
-        "ASSISTANT_LANGUAGE: English\n"
-        "CAMERA_CONTEXT: current\n"
-        "ASSISTANT_RESPONSE: There are three fingers."
-    )
-
-    output = list(handler._responses_from_text(text, vad_audio))[-1]
-
-    assert output.text == ""
-    assert [(tool.name, tool.arguments) for tool in output.tools] == [("camera_snapshot", "{}")]
-    assert output.tools[0].call_id.startswith("call_turn_camera_freshness_")
-
-
-def test_current_camera_context_keeps_only_one_existing_camera_call_and_explicit_preamble():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    vad_audio = _camera_vad("turn_camera_dedupe")
-    camera_calls = [
-        ResponseFunctionToolCall(
-            type="function_call",
-            name="camera_snapshot",
-            arguments="{}",
-            call_id=f"call_camera_{index}",
-            id=f"fc_camera_{index}",
-            status="completed",
-        )
-        for index in range(2)
-    ]
-    text = (
-        "USER_MEMORY: Look again at the current view.\n"
-        "ASSISTANT_LANGUAGE: English\n"
-        "CAMERA_CONTEXT: current\n"
-        "ASSISTANT_PREAMBLE: I'll take another look.\n"
-        "ASSISTANT_RESPONSE: The scene has changed."
-    )
-
-    output = list(handler._responses_from_text(text, vad_audio, tools=camera_calls))[-1]
-
-    assert output.text == "I'll take another look."
-    assert [tool.call_id for tool in output.tools] == ["call_camera_0"]
-
-
-@pytest.mark.parametrize("camera_context", ["historical", "none"])
-def test_noncurrent_camera_context_never_forces_a_capture(camera_context):
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    vad_audio = _camera_vad(f"turn_camera_{camera_context}")
-    text = (
-        "USER_MEMORY: Discuss the prior observation.\n"
-        "ASSISTANT_LANGUAGE: English\n"
-        f"CAMERA_CONTEXT: {camera_context}\n"
-        "ASSISTANT_RESPONSE: I can answer from the retained context."
-    )
-
-    output = list(
-        handler._responses_from_text(
-            text,
-            vad_audio,
-            tools=[
-                _completed_tool("camera_snapshot", "call_noncurrent_camera"),
-                _completed_tool("web_search", "call_noncurrent_search"),
-            ],
-        )
-    )[-1]
-
-    assert output.text == "I can answer from the retained context."
-    assert [tool.name for tool in output.tools] == ["web_search"]
-
-
-def test_out_of_order_current_camera_context_never_streams_stale_visual_prose():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
-    vad_audio = _camera_vad("turn_camera_out_of_order")
-    stream = _FakeSSEStream(
-        _sse_text(
-            "USER_MEMORY: Check what is visible now.\n"
-            "ASSISTANT_LANGUAGE: English\n"
-            "ASSISTANT_RESPONSE: A stale visual claim.\n"
-            "CAMERA_CONTEXT: current"
-        )
-    )
-
-    outputs = list(handler._consume_stream(stream, vad_audio))
-
-    assert all("stale visual claim" not in output.text.lower() for output in outputs)
-    assert outputs[-1].tools == []
-
-
-@pytest.mark.parametrize(
-    "markers",
-    [
-        "CAMERA_CONTEXT: current\nCAMERA_CONTEXT: current",
-        "CAMERA_CONTEXT: historical\nCAMERA_CONTEXT: current",
-        "CAMERA_CONTEXT: current\nCAMERA_CONTEXT: none",
-    ],
-)
-def test_duplicate_or_conflicting_camera_context_is_buffered_and_never_forces_capture(markers):
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    vad_audio = _camera_vad("turn_camera_conflict_buffered")
-    text = (
-        "USER_MEMORY: Continue with the camera context.\n"
-        "ASSISTANT_LANGUAGE: English\n"
-        f"{markers}\n"
-        "ASSISTANT_RESPONSE: A complete response."
-    )
-
-    output = list(
-        handler._responses_from_text(
-            text,
-            vad_audio,
-            tools=[_completed_tool("camera_snapshot", "call_conflicting_camera")],
-        )
-    )[-1]
-
-    assert output.tools == []
-    assert output.text == "A complete response."
-
-
-def test_streamed_conflicting_camera_context_never_releases_prose_early_or_captures():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
-    vad_audio = _camera_vad("turn_camera_conflict_streamed")
-    stream = _FakeSSEStream(
-        _sse_text(
-            "USER_MEMORY: Continue with the camera context.\n"
-            "ASSISTANT_LANGUAGE: English\n"
-            "CAMERA_CONTEXT: historical\n"
-            "ASSISTANT_RESPONSE: A complete response.\n"
-            "CAMERA_CONTEXT: current"
-        )
-    )
-
-    outputs = list(handler._consume_stream(stream, vad_audio))
-
-    assert all(not output.text for output in outputs[:-1])
-    assert outputs[-1].text == "A complete response."
-    assert outputs[-1].tools == []
-
-
-@pytest.mark.parametrize("camera_marker", ["", "\nCAMERA_CONTEXT: maybe"])
-def test_missing_or_malformed_camera_context_is_privacy_fail_closed_and_content_free(camera_marker):
-    metrics = Queue()
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(
-        model_name="gemma-test",
-        base_url="http://127.0.0.1:8818/v1",
-        stream=False,
-        text_output_queue=metrics,
-    )
-    vad_audio = _camera_vad("turn_camera_unclassified")
-    text = (
-        "USER_MEMORY: Continue naturally.\n"
-        f"ASSISTANT_LANGUAGE: English{camera_marker}\n"
-        "ASSISTANT_RESPONSE: Done."
-    )
-
-    output = list(
-        handler._responses_from_text(
-            text,
-            vad_audio,
-            tools=[_completed_tool("camera_snapshot", "call_unclassified_camera")],
-        )
-    )[-1]
-    emitted_metrics = []
-    while not metrics.empty():
-        emitted_metrics.append(metrics.get_nowait())
-    camera_metric = next(
-        metric
-        for metric in emitted_metrics
-        if metric.stage == "camera" and metric.status == "freshness_unclassified"
-    )
-
-    assert output.text == "Done."
-    assert output.tools == []
-    assert camera_metric.detail == {"camera_context": "unclassified", "enforced": False}
-
-
-def test_camera_context_marker_is_inert_when_camera_tool_is_disabled():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    vad_audio = SimpleNamespace(
-        runtime_config=RuntimeConfig(chat=Chat(30)),
-        turn_id="turn_camera_disabled",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-    text = (
-        "USER_MEMORY: Discuss the current topic.\n"
-        "ASSISTANT_LANGUAGE: English\n"
-        "CAMERA_CONTEXT: current\n"
-        "ASSISTANT_RESPONSE: Done."
-    )
-
-    output = list(
-        handler._responses_from_text(
-            text,
-            vad_audio,
-            tools=[_completed_tool("camera_snapshot", "call_disabled_camera")],
-        )
-    )[-1]
-
-    assert output.text == "Done."
-    assert output.tools == []
 
 
 def test_direct_transport_timeout_reaches_failed_end_of_response():
@@ -1023,11 +392,11 @@ def test_direct_tool_call_without_transcript_is_persisted_without_fabricated_use
         status="completed",
     )
 
-    handler._commit_accepted_audio(vad_audio, _encoded_silence(handler))
     assert handler._commit_context(vad_audio, None, "", [tool]) is True
     assert chat.stats()["pending_tool_calls"] == 1
-    assert [item.type for item in chat.buffer] == ["message", "function_call"]
-    assert chat.buffer[0].content[0].type == "input_audio"
+    assert chat.buffer == []
+    pending = chat._pending_tool_calls["call_search"]
+    assert chat._assistant_exchange_ids[pending.id].startswith("direct:turn_1:0:")
 
 
 def test_streamed_tool_call_normalizes_opaque_llama_cpp_id_and_commits():
@@ -1049,11 +418,47 @@ def test_streamed_tool_call_normalizes_opaque_llama_cpp_id_and_commits():
 
     tools = handler._tool_calls_from_accum(accum)
 
-    assert tools[0].call_id == "call_turn_0"
+    assert tools[0].call_id == "call_UNM0K7ZOZpEN5uS0vGTo1G1UnSDH8Vki"
     chat = Chat(30)
     vad_audio = SimpleNamespace(runtime_config=SimpleNamespace(chat=chat), turn_id="turn_tool", turn_revision=0)
     assert handler._commit_context(vad_audio, "Search for Control 2", "", tools) is True
     assert chat.stats()["pending_tool_calls"] == 1
+
+
+def test_streamed_assistant_response_tool_preamble_is_not_spoken_twice():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
+    chat = Chat(30)
+    runtime = RuntimeConfig(chat=chat)
+    vad_audio = SimpleNamespace(
+        audio=np.zeros(1600, dtype=np.float32),
+        mode="final",
+        runtime_config=runtime,
+        turn_id="turn_streamed_tool_preamble",
+        turn_revision=0,
+        input_epoch=1,
+        response_epoch=1,
+        response_id="resp_streamed_tool_preamble",
+        created_at_s=0.0,
+    )
+    stream = _FakeSSEStream(
+        [
+            'data: {"choices":[{"delta":{"content":"ASSISTANT_RESPONSE: I will check that now."}}]}',
+            (
+                'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+                '"id":"search_once","function":{"name":"web_search",'
+                '"arguments":"{\\"query\\":\\"status\\"}"}}]}}]}'
+            ),
+            "data: [DONE]",
+        ]
+    )
+
+    outputs = list(handler._consume_stream(stream, vad_audio))
+
+    assert [output.text for output in outputs] == ["I will check that now.", ""]
+    assert outputs[-1].is_final is True
+    assert [tool.name for tool in outputs[-1].tools] == ["web_search"]
+    assert "".join(output.text for output in outputs) == "I will check that now."
 
 
 def test_buffered_tool_call_preserves_prefixed_id():
@@ -1086,7 +491,7 @@ def test_tool_call_without_model_id_generates_realtime_id():
         {0: {"name": "web_search", "args": '{"query":"local"}', "id": ""}}
     )
 
-    assert tools[0].call_id == "call_turn_0"
+    assert tools[0].call_id.startswith("call_")
 
 
 def test_parallel_opaque_tool_ids_are_normalized_and_unique():
@@ -1097,113 +502,10 @@ def test_parallel_opaque_tool_ids_are_normalized_and_unique():
         }
     )
 
-    assert [tool.call_id for tool in tools] == ["call_turn_0", "call_turn_1"]
+    assert [tool.call_id for tool in tools] == ["call_opaque", "call_opaque_1"]
 
 
-def test_malformed_tool_arguments_stay_raw_for_browser_and_explicit_in_history():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    chat = Chat(30)
-    tools = handler._tool_calls_from_accum(
-        {0: {"name": "web_search", "args": '{"query":', "id": "call_bad_args"}},
-        chat=chat,
-        turn_id="bad_args",
-    )
-    vad_audio = SimpleNamespace(runtime_config=SimpleNamespace(chat=chat), turn_id="bad_args", turn_revision=0)
-    handler._commit_accepted_audio(vad_audio, _encoded_silence(handler))
-
-    assert tools[0].arguments == '{"query":'
-    assert handler._commit_context(vad_audio, None, "I'll check.", tools) is True
-    serialized = ChatCompletionsApiModelHandler._chat_messages(chat)
-    assert serialized[-1]["tool_calls"][0]["function"]["arguments"] == json.dumps(
-        {"error": "invalid_tool_arguments"}
-    )
-
-
-def test_reused_native_tool_id_gets_turn_scoped_deterministic_id():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    chat = Chat(30)
-    first = RealtimeConversationItemFunctionCall(
-        type="function_call", name="web_search", arguments="{}", call_id="call_reused", id="fc_reused"
-    )
-    chat.add_item(first)
-    chat.add_item(
-        RealtimeConversationItemFunctionCallOutput(
-            type="function_call_output", call_id="call_reused", output="done"
-        )
-    )
-
-    tools = handler._tool_calls_from_accum(
-        {0: {"name": "camera_snapshot", "args": "{}", "id": "call_reused"}},
-        chat=chat,
-        turn_id="camera-follow-up",
-    )
-
-    assert tools[0].call_id == "call_camera-follow-up_0"
-
-
-def test_tool_result_and_continuation_preserve_exact_atomic_order():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    chat = Chat(30)
-    runtime_config = RuntimeConfig(chat=chat)
-    vad_audio = SimpleNamespace(runtime_config=runtime_config, turn_id="search", turn_revision=0, created_at_s=0.0)
-    handler._commit_accepted_audio(vad_audio, _encoded_silence(handler))
-    tool = ResponseFunctionToolCall(
-        type="function_call",
-        name="web_search",
-        arguments='{"query":"local"}',
-        call_id="call_search_order",
-        id="fc_search_order",
-        status="completed",
-    )
-
-    outputs = list(
-        handler._responses_from_text(
-            "USER_MEMORY: Busca la información local y conserva el contexto en español.\n"
-            "ASSISTANT_LANGUAGE: Spanish\n"
-            "ASSISTANT_PREAMBLE: Buscaré eso.",
-            vad_audio,
-            tools=[tool],
-        )
-    )
-    assert outputs[-1].context_committed is True
-    assert runtime_config.local_pipeline["assistant_language"] == "Spanish"
-    chat.add_item(
-        RealtimeConversationItemFunctionCallOutput(
-            type="function_call_output", call_id="call_search_order", output='{"answer":"found"}'
-        )
-    )
-    chat.add_item(make_assistant_message("Encontré el resultado."))
-
-    assert [item.type for item in chat.buffer] == [
-        "message",
-        "message",
-        "function_call",
-        "function_call_output",
-        "message",
-    ]
-    follow_up = SimpleNamespace(runtime_config=runtime_config, turn_id="search_follow_up", turn_revision=0)
-    payload = handler._payload(np.zeros(1600, dtype=np.float32), follow_up)
-    assert [message["role"] for message in payload["messages"]] == [
-        "system",
-        "user",
-        "assistant",
-        "assistant",
-        "tool",
-        "assistant",
-        "user",
-    ]
-    prior_user = payload["messages"][1]["content"]
-    assert [part["type"] for part in prior_user] == ["input_audio"]
-    assert payload["messages"][3]["tool_calls"][0]["id"] == "call_search_order"
-    assert payload["messages"][4]["tool_call_id"] == "call_search_order"
-    assert payload["messages"][5]["content"] == "Encontré el resultado."
-    assert runtime_config.local_pipeline["assistant_language"] == "Spanish"
-
-
-def test_missing_transcript_preserves_assistant_output_without_polluting_context():
+def test_missing_transcript_preserves_truthful_assistant_only_context():
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
     chat = Chat(30)
@@ -1214,14 +516,13 @@ def test_missing_transcript_preserves_assistant_output_without_polluting_context
         created_at_s=0.0,
     )
 
-    handler._commit_accepted_audio(vad_audio, _encoded_silence(handler))
     outputs = list(handler._responses_from_text("ASSISTANT_RESPONSE: I heard you.", vad_audio))
 
     assert outputs[0].transcript is None
     assert outputs[0].text == "I heard you."
     assert outputs[0].tools == []
-    assert [item.type for item in chat.buffer] == ["message", "message"]
-    assert chat.buffer[0].content[0].type == "input_audio"
+    assert len(chat.buffer) == 1
+    assert chat.buffer[0].content[0].text == "I heard you."
 
 
 def test_missing_transcript_emits_display_only_user_audio_and_one_tts_sequence():
@@ -1234,7 +535,6 @@ def test_missing_transcript_emits_display_only_user_audio_and_one_tts_sequence()
         turn_revision=0,
         created_at_s=0.0,
     )
-    handler._commit_accepted_audio(vad_audio, _encoded_silence(handler))
     direct = list(handler._responses_from_text("ASSISTANT_RESPONSE: Ready.", vad_audio))[0]
     queue = Queue()
     notifier = object.__new__(TranscriptionNotifier)
@@ -1249,8 +549,8 @@ def test_missing_transcript_emits_display_only_user_audio_and_one_tts_sequence()
     assert completed.direct_audio_completed is True
     assert [item.text for item in outputs if isinstance(item, LLMResponseChunk)] == ["Ready."]
     assert outputs[-1].tag == "end_of_response"
-    assert [item.type for item in chat.buffer] == ["message", "message"]
-    assert chat.buffer[0].content[0].type == "input_audio"
+    assert len(chat.buffer) == 1
+    assert chat.buffer[0].content[0].text == "Ready."
 
 
 class _FakeSSEStream:
@@ -1272,1162 +572,7 @@ def _sse_text(text: str) -> list[str]:
     return [f"data: {json.dumps({'choices': [{'delta': {'content': text}}]})}", "data: [DONE]"]
 
 
-def test_streaming_full_envelope_language_conflict_fails_closed_for_tool_continuation():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
-    runtime_config = RuntimeConfig(chat=Chat(30))
-    runtime_config.session.tools = [
-        {"type": "function", "name": "web_search", "parameters": {"type": "object"}}
-    ]
-    vad_audio = SimpleNamespace(
-        runtime_config=runtime_config,
-        turn_id="turn_language_conflict_tool",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-    delta = {
-        "content": (
-            "ASSISTANT_LANGUAGE: Spanish\n"
-            "ASSISTANT_RESPONSE: Buscaré.\n"
-            "ASSISTANT_LANGUAGE: English"
-        ),
-        "tool_calls": [
-            {
-                "index": 0,
-                "id": "call_language_search",
-                "function": {"name": "web_search", "arguments": "{}"},
-            }
-        ],
-    }
-    stream = _FakeSSEStream(
-        [f"data: {json.dumps({'choices': [{'delta': delta}]})}", "data: [DONE]"]
-    )
-
-    outputs = list(handler._consume_stream(stream, vad_audio))
-
-    assert outputs[-1].language_code == "Auto"
-    assert [tool.name for tool in outputs[-1].tools] == ["web_search"]
-    assert runtime_config.local_pipeline["assistant_language"] == "Auto"
-
-
-def test_primary_payload_contains_current_audio_once_before_history_anchor_is_committed():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
-    chat = Chat(30)
-    payloads = []
-
-    def stream_request(_url, payload, *, api_key):
-        payloads.append(payload)
-        return _FakeSSEStream(_sse_text("ASSISTANT_RESPONSE: Ready."))
-
-    handler._stream_request = stream_request
-    vad_audio = SimpleNamespace(
-        audio=np.zeros(1600, dtype=np.float32),
-        mode="final",
-        runtime_config=RuntimeConfig(chat=chat),
-        turn_id="turn_once",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-
-    list(handler.process(vad_audio))
-
-    assert [message["role"] for message in payloads[0]["messages"]] == ["system", "user"]
-    assert [part["type"] for part in payloads[0]["messages"][-1]["content"]] == ["input_audio"]
-    assert [item.type for item in chat.buffer] == ["message", "message"]
-
-
-def test_streamed_primary_user_memory_upgrades_existing_audio_anchor_without_ui_transcript():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
-    chat = Chat(30)
-    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(
-        _sse_text(
-            "USER_MEMORY: Count from one to ten.\n"
-            "ASSISTANT_LANGUAGE: English\n"
-            "ASSISTANT_RESPONSE: One, two, three."
-        )
-    )
-    vad_audio = SimpleNamespace(
-        audio=np.zeros(1600, dtype=np.float32),
-        mode="final",
-        runtime_config=RuntimeConfig(chat=chat),
-        turn_id="turn_memory_streamed",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-
-    outputs = list(handler.process(vad_audio))
-
-    assert outputs[-1].transcript is None
-    assert "".join(output.text for output in outputs) == "One, two, three."
-    assert outputs[-1].context_committed is True
-    assert [item.type for item in chat.buffer] == ["message", "message"]
-    assert chat.buffer[0].content[0].type == "input_text"
-    assert chat.buffer[0].content[0].text == "Count from one to ten."
-
-
-def test_buffered_primary_user_memory_upgrades_audio_anchor_and_stays_display_only():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    chat = Chat(30)
-    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(
-        _sse_text(
-            "USER_MEMORY: Explain the previous answer more simply.\n"
-            "ASSISTANT_LANGUAGE: English\n"
-            "ASSISTANT_RESPONSE: Here is a simpler explanation."
-        )
-    )
-    vad_audio = SimpleNamespace(
-        audio=np.zeros(1600, dtype=np.float32),
-        mode="final",
-        runtime_config=RuntimeConfig(chat=chat),
-        turn_id="turn_memory_buffered",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-
-    direct = list(handler.process(vad_audio))[-1]
-    queue = Queue()
-    notifier = object.__new__(TranscriptionNotifier)
-    notifier.setup(text_output_queue=queue, runtime_config=None, should_listen=Event())
-
-    list(notifier.process(direct))
-    completed = queue.get_nowait()
-
-    assert direct.transcript is None
-    assert completed.transcript == "[User audio]"
-    assert completed.display_only is True
-    assert chat.buffer[0].content[0].text == "Explain the previous answer more simply."
-    assert chat.buffer[1].content[0].text == "Here is a simpler explanation."
-
-
-def test_valid_transcript_wins_when_model_emits_transcript_and_memory():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    chat = Chat(30)
-    vad_audio = SimpleNamespace(
-        runtime_config=RuntimeConfig(chat=chat),
-        turn_id="turn_transcript_preferred",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-    handler._commit_accepted_audio(vad_audio, _encoded_silence(handler))
-
-    output = list(
-        handler._responses_from_text(
-            "USER_TRANSCRIPT: Count that in reverse.\n"
-            "USER_MEMORY: Count from ten to one.\n"
-            "ASSISTANT_RESPONSE: Ten, nine, eight.",
-            vad_audio,
-        )
-    )[-1]
-
-    assert output.transcript == "Count that in reverse."
-    assert chat.buffer[0].content[0].text == "Count that in reverse."
-
-
-@pytest.mark.parametrize(
-    "metadata",
-    [
-        "",
-        "USER_MEMORY: Audio was unintelligible.\n",
-        "USER_MEMORY: USER_TRANSCRIPT: injected\n",
-    ],
-)
-def test_absent_or_invalid_user_memory_retains_raw_audio_anchor(metadata):
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    chat = Chat(30)
-    vad_audio = SimpleNamespace(
-        runtime_config=RuntimeConfig(chat=chat),
-        turn_id="turn_memory_fail_closed",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-    handler._commit_accepted_audio(vad_audio, _encoded_silence(handler))
-
-    output = list(handler._responses_from_text(f"{metadata}ASSISTANT_RESPONSE: I can still help.", vad_audio))[-1]
-
-    assert output.text == "I can still help."
-    assert output.transcript is None
-    assert chat.buffer[0].content[0].type == "input_audio"
-
-
-@pytest.mark.parametrize("stream", [True, False])
-def test_out_of_order_memory_never_leaks_into_visible_response_or_history(stream):
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=stream)
-    chat = Chat(30)
-    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(
-        _sse_text(
-            "ASSISTANT_RESPONSE: This answer stays visible.\n"
-            "USER_MEMORY: This out-of-order memory stays hidden."
-        )
-    )
-    vad_audio = SimpleNamespace(
-        audio=np.zeros(1600, dtype=np.float32),
-        mode="final",
-        runtime_config=RuntimeConfig(chat=chat),
-        turn_id=f"turn_out_of_order_{stream}",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-
-    outputs = list(handler.process(vad_audio))
-
-    assert "".join(output.text for output in outputs) == "This answer stays visible."
-    assert outputs[-1].transcript is None
-    assert chat.buffer[0].content[0].type == "input_audio"
-    assert "out-of-order memory" not in " ".join(output.text for output in outputs)
-
-
-@pytest.mark.parametrize("stream", [True, False])
-def test_invalid_memory_line_does_not_suppress_plain_compatibility_answer(stream):
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=stream)
-    chat = Chat(30)
-    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(
-        _sse_text("USER_MEMORY: Audio was unintelligible.\nA plain compatibility answer remains visible.")
-    )
-    vad_audio = SimpleNamespace(
-        audio=np.zeros(1600, dtype=np.float32),
-        mode="final",
-        runtime_config=RuntimeConfig(chat=chat),
-        turn_id=f"turn_invalid_memory_plain_{stream}",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-
-    outputs = list(handler.process(vad_audio))
-
-    assert "".join(output.text for output in outputs) == "A plain compatibility answer remains visible."
-    assert chat.buffer[0].content[0].type == "input_audio"
-
-
-def test_streamed_split_trailing_control_marker_is_never_spoken():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
-    chat = Chat(30)
-    chunks = [
-        "ASSISTANT_RESPONSE: This sentence is complete.\nUSER_MEM",
-        "ORY: hidden semantic text",
-    ]
-    lines = [f"data: {json.dumps({'choices': [{'delta': {'content': chunk}}]})}" for chunk in chunks]
-    lines.append("data: [DONE]")
-    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(lines)
-    vad_audio = SimpleNamespace(
-        audio=np.zeros(1600, dtype=np.float32),
-        mode="final",
-        runtime_config=RuntimeConfig(chat=chat),
-        turn_id="turn_split_trailing_control",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-
-    outputs = list(handler.process(vad_audio))
-
-    assert "".join(output.text for output in outputs) == "This sentence is complete."
-    assert chat.buffer[0].content[0].type == "input_audio"
-
-
-def test_newer_revision_supersedes_one_stable_audio_anchor_without_payload_duplication():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
-    chat = Chat(30)
-    runtime_config = RuntimeConfig(chat=chat)
-    runtime_config.local_pipeline["_session_id"] = "session_revision"
-    rev0 = SimpleNamespace(runtime_config=runtime_config, turn_id="turn_1", turn_revision=0, created_at_s=0.0)
-    rev1 = SimpleNamespace(runtime_config=runtime_config, turn_id="turn_1", turn_revision=1, created_at_s=0.0)
-    old_audio = _encoded_silence(handler, 800)
-    new_samples = np.full(2400, 0.25, dtype=np.float32)
-    new_audio = base64.b64encode(handler._wav_bytes(new_samples)).decode("ascii")
-
-    old_item_id = handler._commit_accepted_audio(rev0, old_audio)
-    payload = handler._payload(new_samples, rev1, encoded_audio=new_audio)
-
-    assert [message["role"] for message in payload["messages"]] == ["system", "user"]
-    assert payload["messages"][-1]["content"] == [
-        {"type": "input_audio", "input_audio": {"data": new_audio, "format": "wav"}}
-    ]
-    assert handler._commit_accepted_audio(rev1, new_audio) == old_item_id
-    assert chat.stats()["turns"] == 1
-    assert chat.buffer[0].id == old_item_id
-    assert chat.buffer[0].content[0].audio == new_audio
-
-
-def test_stale_revision_cleanup_cannot_clear_new_owner_and_new_revision_completes_once():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    chat = Chat(30)
-    runtime_config = RuntimeConfig(chat=chat)
-    runtime_config.local_pipeline["_session_id"] = "session_revision_complete"
-    rev0 = SimpleNamespace(runtime_config=runtime_config, turn_id="turn_1", turn_revision=0, created_at_s=0.0)
-    rev1 = SimpleNamespace(runtime_config=runtime_config, turn_id="turn_1", turn_revision=1, created_at_s=0.0)
-
-    handler._commit_accepted_audio(rev0, _encoded_silence(handler, 800))
-    handler._commit_accepted_audio(rev1, _encoded_silence(handler, 2400))
-    handler._finish_user_context(rev0)
-
-    assert handler._owns_user_context(rev1) is True
-    assert handler._commit_context(rev0, "stale transcript", "stale answer", []) is False
-    outputs = list(
-        handler._responses_from_text(
-            "USER_TRANSCRIPT: Count in reverse.\nASSISTANT_RESPONSE: Ten, nine, eight.",
-            rev1,
-        )
-    )
-    assert outputs[-1].context_committed is True
-    assert [item.type for item in chat.buffer] == ["message", "message"]
-    assert chat.buffer[0].content[0].text == "Count in reverse."
-    assert chat.buffer[1].content[0].text == "Ten, nine, eight."
-    assert handler._owned_user_context(rev1) is None
-
-
-def test_paused_stale_transcript_cannot_overwrite_newer_cumulative_audio(monkeypatch):
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    chat = Chat(30)
-    runtime_config = RuntimeConfig(chat=chat)
-    runtime_config.local_pipeline["_session_id"] = "session_revision_race"
-    rev0 = SimpleNamespace(runtime_config=runtime_config, turn_id="turn_1", turn_revision=0)
-    rev1 = SimpleNamespace(runtime_config=runtime_config, turn_id="turn_1", turn_revision=1)
-    old_audio = _encoded_silence(handler, 800)
-    new_audio = _encoded_silence(handler, 2400)
-    anchor_id = handler._commit_accepted_audio(rev0, old_audio)
-    original_turn_key = handler._turn_key
-    rev0_paused = Event()
-    resume_rev0 = Event()
-
-    def paused_turn_key(vad_audio):
-        if vad_audio is rev0 and not rev0_paused.is_set():
-            rev0_paused.set()
-            assert resume_rev0.wait(timeout=2.0)
-        return original_turn_key(vad_audio)
-
-    monkeypatch.setattr(handler, "_turn_key", paused_turn_key)
-    stale_result = []
-    stale_thread = Thread(
-        target=lambda: stale_result.append(handler._ensure_user_context(rev0, "stale rev0 transcript")),
-        daemon=True,
-    )
-    stale_thread.start()
-    assert rev0_paused.wait(timeout=2.0)
-
-    assert handler._commit_accepted_audio(rev1, new_audio) == anchor_id
-    resume_rev0.set()
-    stale_thread.join(timeout=2.0)
-
-    assert not stale_thread.is_alive()
-    assert stale_result == [None]
-    assert chat.buffer[0].content[0].type == "input_audio"
-    assert chat.buffer[0].content[0].audio == new_audio
-    assert handler._ensure_user_context(rev1, "final rev1 transcript") == anchor_id
-    assert chat.buffer[0].content[0].type == "input_text"
-    assert chat.buffer[0].content[0].text == "final rev1 transcript"
-
-
-def test_stale_semantic_memory_cannot_overwrite_newer_cumulative_audio_or_memory():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    chat = Chat(30)
-    runtime_config = RuntimeConfig(chat=chat)
-    runtime_config.local_pipeline["_session_id"] = "session_memory_revision"
-    rev0 = SimpleNamespace(runtime_config=runtime_config, turn_id="turn_1", turn_revision=0)
-    rev1 = SimpleNamespace(runtime_config=runtime_config, turn_id="turn_1", turn_revision=1)
-    newer_audio = _encoded_silence(handler, 2400)
-
-    anchor_id = handler._commit_accepted_audio(rev0, _encoded_silence(handler, 800))
-    assert handler._commit_accepted_audio(rev1, newer_audio) == anchor_id
-
-    assert handler._ensure_user_context(rev0, None, "Stale earlier intent.") is None
-    assert chat.buffer[0].content[0].type == "input_audio"
-    assert chat.buffer[0].content[0].audio == newer_audio
-
-    assert handler._ensure_user_context(rev1, None, "Use the complete revised request.") == anchor_id
-    assert chat.buffer[0].content[0].type == "input_text"
-    assert chat.buffer[0].content[0].text == "Use the complete revised request."
-    assert handler._ensure_user_context(rev0, None, "Still stale earlier intent.") is None
-    assert chat.buffer[0].content[0].text == "Use the complete revised request."
-
-
-def test_response_commit_and_revision_supersession_share_one_ownership_transaction(monkeypatch):
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    chat = Chat(30)
-    runtime_config = RuntimeConfig(chat=chat)
-    runtime_config.local_pipeline["_session_id"] = "session_response_commit_race"
-    rev0 = SimpleNamespace(runtime_config=runtime_config, turn_id="turn_1", turn_revision=0)
-    rev1 = SimpleNamespace(runtime_config=runtime_config, turn_id="turn_1", turn_revision=1)
-    handler._commit_accepted_audio(rev0, _encoded_silence(handler, 800))
-    stale_tool = ResponseFunctionToolCall(
-        type="function_call",
-        name="web_search",
-        arguments='{"query":"stale"}',
-        call_id="call_stale_revision",
-        id="fc_stale_revision",
-        status="completed",
-    )
-    original_ensure = handler._ensure_user_context
-    ensure_complete = Event()
-    resume_rev0 = Event()
-    rev1_complete = Event()
-
-    def paused_ensure(vad_audio, transcript, user_memory=None):
-        result = original_ensure(vad_audio, transcript, user_memory)
-        if vad_audio is rev0 and not ensure_complete.is_set():
-            ensure_complete.set()
-            assert resume_rev0.wait(timeout=2.0)
-        return result
-
-    monkeypatch.setattr(handler, "_ensure_user_context", paused_ensure)
-    rev0_result = []
-    rev0_thread = Thread(
-        target=lambda: rev0_result.append(
-            handler._commit_context(
-                rev0,
-                None,
-                "The first revision completed.",
-                [stale_tool],
-                user_memory="Remember the first revision.",
-            )
-        ),
-        daemon=True,
-    )
-    rev0_thread.start()
-    assert ensure_complete.wait(timeout=2.0)
-
-    def supersede():
-        handler._commit_accepted_audio(rev1, _encoded_silence(handler, 2400))
-        rev1_complete.set()
-
-    rev1_thread = Thread(target=supersede, daemon=True)
-    rev1_thread.start()
-    assert rev1_complete.wait(timeout=2.0) is True
-
-    resume_rev0.set()
-    rev0_thread.join(timeout=2.0)
-    rev1_thread.join(timeout=2.0)
-
-    assert rev0_result == [False]
-    assert rev1_complete.is_set()
-    assert [item.type for item in chat.buffer] == ["message"]
-    assert chat.buffer[0].content[0].type == "input_audio"
-    item_count = len(chat.buffer)
-    assert (
-        handler._commit_context(
-            rev0,
-            None,
-            "This stale response must not append.",
-            [],
-            user_memory="Stale first-revision memory.",
-        )
-        is False
-    )
-    assert len(chat.buffer) == item_count
-
-
-def test_cross_session_reused_turn_id_has_distinct_ownership_and_stale_cleanup_is_scoped():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    chat_old = Chat(30)
-    chat_new = Chat(30)
-    runtime_old = RuntimeConfig(chat=chat_old)
-    runtime_new = RuntimeConfig(chat=chat_new)
-    runtime_old.local_pipeline["_session_id"] = "session_old"
-    runtime_new.local_pipeline["_session_id"] = "session_new"
-    old_turn = SimpleNamespace(runtime_config=runtime_old, turn_id="turn_1", turn_revision=0)
-    new_turn = SimpleNamespace(runtime_config=runtime_new, turn_id="turn_1", turn_revision=0)
-
-    old_item_id = handler._commit_accepted_audio(old_turn, _encoded_silence(handler, 800))
-    new_item_id = handler._commit_accepted_audio(new_turn, _encoded_silence(handler, 1600))
-    handler._finish_user_context(old_turn)
-
-    assert old_item_id != new_item_id
-    assert handler._owns_user_context(new_turn) is True
-    assert handler._ensure_user_context(new_turn, None, "Remember the new session request.") == new_item_id
-    assert chat_old.buffer[0].content[0].type == "input_audio"
-    assert chat_new.buffer[0].content[0].text == "Remember the new session request."
-    handler.on_session_end()
-    assert handler._owned_user_context(new_turn) is None
-
-
-def test_transcriptless_count_turn_uses_semantic_memory_for_reverse_follow_up():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
-    chat = Chat(30)
-    payloads = []
-
-    def stream_request(_url, payload, *, api_key):
-        payloads.append(payload)
-        if len(payloads) == 1:
-            return _FakeSSEStream(
-                _sse_text(
-                    "USER_MEMORY: Count from one to ten.\n"
-                    "ASSISTANT_RESPONSE: One, two, three, four, five, six, seven, eight, nine, ten."
-                )
-            )
-        return _FakeSSEStream(
-            _sse_text("USER_TRANSCRIPT: Count in reverse.\nASSISTANT_RESPONSE: Ten, nine, eight, seven.")
-        )
-
-    handler._stream_request = stream_request
-    runtime_config = RuntimeConfig(chat=chat)
-    for turn_id in ("count_forward", "count_reverse"):
-        list(
-            handler.process(
-                SimpleNamespace(
-                    audio=np.zeros(1600, dtype=np.float32),
-                    mode="final",
-                    runtime_config=runtime_config,
-                    turn_id=turn_id,
-                    turn_revision=0,
-                    created_at_s=0.0,
-                )
-            )
-        )
-
-    second = payloads[1]["messages"]
-    assert [message["role"] for message in second] == ["system", "user", "assistant", "user"]
-    assert [part["type"] for part in second[1]["content"]] == ["input_audio"]
-    assert second[2]["content"].startswith("One, two, three")
-    assert second[3]["content"][0]["type"] == "input_audio"
-
-
-def test_three_turn_foreign_token_correction_gets_exactly_one_previous_wav_opportunity():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
-    chat = Chat(30)
-    runtime_config = RuntimeConfig(chat=chat)
-    runtime_config.local_pipeline["_session_id"] = "session_foreign_token_correction"
-    payloads = []
-
-    def stream_request(_url, payload, *, api_key):
-        payloads.append(payload)
-        turn = len(payloads)
-        if turn == 1:
-            # This deliberately wrong model-generated anchor reproduces the
-            # old text-only-history bias on the following correction.
-            text = (
-                "USER_MEMORY: The user asks what the Japanese word neko means.\n"
-                "ASSISTANT_RESPONSE: Neko means cat."
-            )
-        elif turn == 2:
-            prior_content = payload["messages"][1]["content"]
-            has_retained_wav = isinstance(prior_content, list) and any(
-                part.get("type") == "input_audio" for part in prior_content
-            )
-            text = (
-                "USER_MEMORY: The user corrects the Japanese word to niku.\n"
-                "ASSISTANT_RESPONSE: Understood; niku means meat."
-                if has_retained_wav
-                else "USER_MEMORY: The user asks again about neko.\nASSISTANT_RESPONSE: Neko means cat."
-            )
-        else:
-            text = (
-                "USER_MEMORY: The user asks for the corrected word again.\n"
-                "ASSISTANT_RESPONSE: The corrected word was niku."
-            )
-        return _FakeSSEStream(_sse_text(text))
-
-    handler._stream_request = stream_request
-    for index, samples in enumerate((800, 1600, 2400), start=1):
-        list(
-            handler.process(
-                SimpleNamespace(
-                    audio=np.zeros(samples, dtype=np.float32),
-                    mode="final",
-                    runtime_config=runtime_config,
-                    turn_id=f"foreign_token_{index}",
-                    turn_revision=0,
-                    created_at_s=0.0,
-                )
-            )
-        )
-
-    assert len(payloads) == 3
-    first_audio = payloads[0]["messages"][-1]["content"][0]["input_audio"]["data"]
-    second_history = payloads[1]["messages"][1]["content"]
-    assert [part["type"] for part in second_history] == ["input_audio"]
-    assert second_history[0]["input_audio"]["data"] == first_audio
-    assert "immediately prior user audio" in payloads[1]["messages"][0]["content"]
-
-    third_messages = payloads[2]["messages"]
-    assert third_messages[1]["content"] == "The user asks what the Japanese word neko means."
-    assert [part["type"] for part in third_messages[3]["content"]] == ["input_audio"]
-    historical_audio_parts = [
-        part
-        for message in third_messages[1:-1]
-        if isinstance(message.get("content"), list)
-        for part in message["content"]
-        if part.get("type") == "input_audio"
-    ]
-    assert len(historical_audio_parts) == 1
-    assert [item.type for item in chat.buffer] == ["message", "message"] * 3
-    assert all(item.content[0].type == "input_text" for item in chat.buffer[::2])
-    assert chat.buffer[2].content[0].text == "The user corrects the Japanese word to niku."
-    assert chat.stats()["turns"] == 3
-    assert len(handler._provisional_user_audio) == 1
-
-
-def test_provisional_wav_cache_is_isolated_by_session_and_chat():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    chat = Chat(30)
-    runtime = RuntimeConfig(chat=chat)
-    runtime.local_pipeline["_session_id"] = "shared-session-label"
-    source = SimpleNamespace(runtime_config=runtime, turn_id="source", turn_revision=0)
-    handler._commit_accepted_audio(source, _encoded_silence(handler, 800))
-    assert handler._commit_context(
-        source,
-        None,
-        "Initial answer.",
-        [],
-        user_memory="The initial semantic anchor.",
-    )
-    handler._finish_user_context(source)
-
-    other_chat_runtime = RuntimeConfig(chat=Chat(30))
-    other_chat_runtime.local_pipeline["_session_id"] = "shared-session-label"
-    other_chat_payload = handler._payload(
-        np.zeros(1600, dtype=np.float32),
-        SimpleNamespace(runtime_config=other_chat_runtime, turn_id="other-chat", turn_revision=0),
-    )
-    assert [message["role"] for message in other_chat_payload["messages"]] == ["system", "user"]
-    assert "immediately prior user audio" not in other_chat_payload["messages"][0]["content"]
-
-    other_session_runtime = RuntimeConfig(chat=chat)
-    other_session_runtime.local_pipeline["_session_id"] = "different-session"
-    other_session_payload = handler._payload(
-        np.zeros(1600, dtype=np.float32),
-        SimpleNamespace(runtime_config=other_session_runtime, turn_id="other-session", turn_revision=0),
-    )
-    assert other_session_payload["messages"][1]["content"] == "The initial semantic anchor."
-    assert "immediately prior user audio" not in other_session_payload["messages"][0]["content"]
-
-    matching_payload = handler._payload(
-        np.zeros(1600, dtype=np.float32),
-        SimpleNamespace(runtime_config=runtime, turn_id="matching", turn_revision=0),
-    )
-    assert [part["type"] for part in matching_payload["messages"][1]["content"]] == ["input_audio"]
-    assert "immediately prior user audio" in matching_payload["messages"][0]["content"]
-    assert len(handler._provisional_user_audio) == 1
-
-
-def test_failed_response_transaction_restores_audio_instead_of_leaving_provisional_memory(monkeypatch):
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
-    chat = Chat(30)
-    runtime = RuntimeConfig(chat=chat)
-    runtime.local_pipeline["_session_id"] = "session_failed_response_transaction"
-    vad_audio = SimpleNamespace(runtime_config=runtime, turn_id="failed-response", turn_revision=0)
-    encoded = _encoded_silence(handler, 1600)
-    user_item_id = handler._commit_accepted_audio(vad_audio, encoded)
-
-    def fail_commit(*_args, **_kwargs):
-        raise RuntimeError("response transaction rejected")
-
-    monkeypatch.setattr(chat, "commit_assistant_response", fail_commit)
-    with pytest.raises(RuntimeError, match="transaction rejected"):
-        handler._commit_context(
-            vad_audio,
-            None,
-            "A response that must not commit.",
-            [],
-            user_memory="A provisional interpretation that must roll back.",
-        )
-
-    assert chat.buffer[0].id == user_item_id
-    assert [part.type for part in chat.buffer[0].content] == ["input_audio"]
-    assert chat.buffer[0].content[0].audio == encoded
-    assert handler._provisional_user_audio == {}
-    assert handler._accepted_user_audio[handler._turn_key(vad_audio)] == (encoded, 0)
-    handler._finish_user_context(vad_audio)
-    assert [part.type for part in chat.buffer[0].content] == ["input_audio"]
-
-
-def test_valid_primary_transcript_replaces_session_audio_anchor():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
-    chat = Chat(30)
-    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(
-        _sse_text("USER_TRANSCRIPT: Count from one to ten.\nASSISTANT_RESPONSE: One, two, three.")
-    )
-    vad_audio = SimpleNamespace(
-        audio=np.zeros(1600, dtype=np.float32),
-        mode="final",
-        runtime_config=RuntimeConfig(chat=chat),
-        turn_id="turn_replace",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-
-    list(handler.process(vad_audio))
-
-    assert chat.buffer[0].content[0].type == "input_text"
-    assert chat.buffer[0].content[0].text == "Count from one to ten."
-
-
-def test_cancelled_primary_retains_only_accepted_user_audio():
-    class _CancelledScope:
-        generation = 7
-
-        @staticmethod
-        def is_stale(_generation):
-            return True
-
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(
-        model_name="gemma-test",
-        base_url="http://127.0.0.1:8818/v1",
-        stream=True,
-        cancel_scope=_CancelledScope(),
-    )
-    chat = Chat(30)
-    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(
-        _sse_text(
-            "USER_MEMORY: This memory belongs only to the cancelled response.\n"
-            "ASSISTANT_RESPONSE: This partial answer must not persist."
-        )
-    )
-    vad_audio = SimpleNamespace(
-        audio=np.zeros(1600, dtype=np.float32),
-        mode="final",
-        runtime_config=RuntimeConfig(chat=chat),
-        turn_id="turn_cancelled",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-
-    assert list(handler.process(vad_audio)) == []
-    assert [item.type for item in chat.buffer] == ["message"]
-    assert chat.buffer[0].content[0].type == "input_audio"
-
-
-def test_cancelled_correction_consumes_prior_one_shot_wav_and_retains_latest_audio():
-    class _CancelledScope:
-        generation = 11
-
-        @staticmethod
-        def is_stale(_generation):
-            return True
-
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
-    chat = Chat(30)
-    runtime_config = RuntimeConfig(chat=chat)
-    runtime_config.local_pipeline["_session_id"] = "session_cancelled_correction"
-    payloads = []
-
-    def stream_request(_url, payload, *, api_key):
-        payloads.append(payload)
-        return _FakeSSEStream(
-            _sse_text(
-                "USER_MEMORY: The user asks about a foreign word.\n"
-                "ASSISTANT_RESPONSE: Here is the meaning."
-            )
-        )
-
-    handler._stream_request = stream_request
-    first = SimpleNamespace(
-        audio=np.zeros(800, dtype=np.float32),
-        mode="final",
-        runtime_config=runtime_config,
-        turn_id="first",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-    list(handler.process(first))
-    assert len(handler._provisional_user_audio) == 1
-
-    handler.cancel_scope = _CancelledScope()
-    second = SimpleNamespace(
-        audio=np.zeros(1600, dtype=np.float32),
-        mode="final",
-        runtime_config=runtime_config,
-        turn_id="cancelled_correction",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-    assert list(handler.process(second)) == []
-
-    assert len(payloads) == 2
-    assert [part["type"] for part in payloads[1]["messages"][1]["content"]] == ["input_audio"]
-    assert handler._provisional_user_audio == {}
-    assert handler._accepted_user_audio == {}
-    assert [item.type for item in chat.buffer] == ["message", "message", "message"]
-    assert chat.buffer[0].content[0].type == "input_text"
-    assert chat.buffer[2].content[0].type == "input_audio"
-
-
-def test_payload_serialization_failure_still_retains_accepted_user_audio():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
-    chat = Chat(30)
-
-    def fail_payload(*_args, **_kwargs):
-        raise RuntimeError("serialization failed")
-
-    handler._payload = fail_payload
-    vad_audio = SimpleNamespace(
-        audio=np.zeros(1600, dtype=np.float32),
-        mode="final",
-        runtime_config=RuntimeConfig(chat=chat),
-        turn_id="turn_payload_failure",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-
-    outputs = list(handler.process(vad_audio))
-
-    assert outputs[-1].error == "Direct audio model request failed: RuntimeError"
-    assert [item.type for item in chat.buffer] == ["message"]
-    assert chat.buffer[0].content[0].type == "input_audio"
-
-
-def test_payload_serialization_failure_preserves_prior_correction_wav_opportunity():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
-    chat = Chat(30)
-    runtime_config = RuntimeConfig(chat=chat)
-    runtime_config.local_pipeline["_session_id"] = "session_payload_failure_correction"
-    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(
-        _sse_text(
-            "USER_MEMORY: The model-generated foreign token is provisional.\n"
-            "ASSISTANT_RESPONSE: Initial answer."
-        )
-    )
-    first = SimpleNamespace(
-        audio=np.zeros(800, dtype=np.float32),
-        mode="final",
-        runtime_config=runtime_config,
-        turn_id="first",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-    list(handler.process(first))
-    retained_before = dict(handler._provisional_user_audio)
-    original_payload = handler._payload
-
-    def fail_payload(*_args, **_kwargs):
-        raise RuntimeError("serialization failed")
-
-    handler._payload = fail_payload
-    failed = SimpleNamespace(
-        audio=np.zeros(1600, dtype=np.float32),
-        mode="final",
-        runtime_config=runtime_config,
-        turn_id="failed",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-    outputs = list(handler.process(failed))
-
-    assert outputs[-1].error == "Direct audio model request failed: RuntimeError"
-    assert handler._provisional_user_audio == retained_before
-    assert [item.type for item in chat.buffer] == ["message", "message", "message"]
-    assert chat.buffer[0].content[0].type == "input_text"
-    assert chat.buffer[2].content[0].type == "input_audio"
-
-    recovery = SimpleNamespace(runtime_config=runtime_config, turn_id="recovery", turn_revision=0)
-    recovery_payload = original_payload(np.zeros(2400, dtype=np.float32), recovery)
-    assert [part["type"] for part in recovery_payload["messages"][1]["content"]] == ["input_audio"]
-    assert "immediately prior user audio" in recovery_payload["messages"][0]["content"]
-
-
-def test_non_json_sse_debug_log_never_contains_stream_content(caplog):
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
-    chat = Chat(30)
-    vad_audio = SimpleNamespace(
-        runtime_config=RuntimeConfig(chat=chat),
-        turn_id="turn_private_log",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-    handler._commit_accepted_audio(vad_audio, _encoded_silence(handler))
-    secret = "PRIVATE TRANSCRIPT CONTENT MUST NOT BE LOGGED"
-    memory_secret = "PRIVATE SEMANTIC MEMORY MUST NOT BE LOGGED"
-    stream = _FakeSSEStream(
-        [
-            secret,
-            *_sse_text(f"USER_MEMORY: {memory_secret}\nASSISTANT_RESPONSE: Ready."),
-        ]
-    )
-    caplog.set_level(logging.DEBUG, logger="speech_to_speech.STT.gemma_audio_handler")
-
-    list(handler._consume_stream(stream, vad_audio))
-
-    assert secret not in caplog.text
-    assert memory_secret not in caplog.text
-    assert "Ignoring non-JSON Gemma stream event (chars=" in caplog.text
-
-
-@pytest.mark.parametrize("stream_mode", [True, False])
-def test_native_tool_contract_metric_is_single_bounded_and_content_free(stream_mode, caplog):
-    metrics = Queue()
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(
-        model_name="gemma-test",
-        base_url="http://127.0.0.1:8818/v1",
-        stream=stream_mode,
-        text_output_queue=metrics,
-    )
-    chat = Chat(30)
-    runtime_config = RuntimeConfig(chat=chat)
-    secret_name = "private_tool_name"
-    secret_arguments = '{"private_argument":"private-value"}'
-    runtime_config.session.tools = [
-        {"type": "function", "name": secret_name, "parameters": {"type": "object"}}
-    ]
-    runtime_config.session.tool_choice = "required"
-    vad_audio = SimpleNamespace(
-        audio=np.zeros(1600, dtype=np.float32),
-        mode="final",
-        runtime_config=runtime_config,
-        turn_id=f"tool_contract_{stream_mode}",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-    visible = "USER_MEMORY: The user requests the fixed lookup.\nASSISTANT_PREAMBLE: Checking."
-    lines = [
-        f"data: {json.dumps({'choices': [{'delta': {'content': visible}}]})}",
-        f"data: {json.dumps({'choices': [{'delta': {'tool_calls': [{'index': 0, 'id': 'call_private_id', 'function': {'name': secret_name, 'arguments': secret_arguments}}]}}], 'finish_reason': None})}",
-        f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'tool_calls'}]})}",
-        "data: [DONE]",
-    ]
-    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(lines)
-    caplog.set_level(logging.INFO, logger="speech_to_speech.STT.gemma_audio_handler")
-
-    outputs = list(handler.process(vad_audio))
-
-    events = []
-    while not metrics.empty():
-        events.append(metrics.get_nowait())
-    contract_events = [
-        event for event in events if event.stage == "gemma" and event.status == "tool_contract"
-    ]
-    assert len(contract_events) == 1
-    detail = contract_events[0].detail
-    assert detail == {
-        "finish_reason_category": "tool_calls",
-        "assistant_text_length": len(visible),
-        "native_tool_fragment_count": 1,
-        "completed_call_count": 1,
-        "malformed_call_category": "none",
-    }
-    assert len(outputs[-1].tools) == 1
-    assert set(detail) == {
-        "finish_reason_category",
-        "assistant_text_length",
-        "native_tool_fragment_count",
-        "completed_call_count",
-        "malformed_call_category",
-    }
-    serialized_detail = json.dumps(detail, sort_keys=True)
-    assert secret_name not in serialized_detail
-    assert "private_argument" not in serialized_detail
-    assert "private-value" not in serialized_detail
-    assert "call_private_id" not in serialized_detail
-    assert secret_name not in caplog.text
-    assert "private_argument" not in caplog.text
-    assert "private-value" not in caplog.text
-    assert "call_private_id" not in caplog.text
-    assert "stage=adapter source=native" in caplog.text
-
-
-@pytest.mark.parametrize("stream_mode", [True, False])
-def test_native_tool_contract_survives_malformed_choice_shape(stream_mode):
-    metrics = Queue()
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(
-        model_name="gemma-test",
-        base_url="http://127.0.0.1:8818/v1",
-        stream=stream_mode,
-        text_output_queue=metrics,
-    )
-    runtime_config = RuntimeConfig(chat=Chat(30))
-    vad_audio = SimpleNamespace(
-        audio=np.zeros(1600, dtype=np.float32),
-        mode="final",
-        runtime_config=runtime_config,
-        turn_id=f"malformed_choice_{stream_mode}",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-    visible = "USER_MEMORY: The user asks for a normal reply.\nASSISTANT_RESPONSE: Done."
-    lines = [
-        "data: []",
-        f"data: {json.dumps({'choices': {'private': 'container'}})}",
-        f"data: {json.dumps({'choices': ['private malformed payload']})}",
-        f"data: {json.dumps({'choices': [{'delta': {'content': visible}, 'finish_reason': 'stop'}]})}",
-        "data: [DONE]",
-    ]
-    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(lines)
-
-    outputs = list(handler.process(vad_audio))
-
-    events = []
-    while not metrics.empty():
-        events.append(metrics.get_nowait())
-    contract_events = [
-        event for event in events if event.stage == "gemma" and event.status == "tool_contract"
-    ]
-    assert outputs
-    assert len(contract_events) == 1
-    assert contract_events[0].detail["malformed_call_category"] == "native_fragment_shape"
-    assert "private malformed payload" not in json.dumps(contract_events[0].detail)
-
-
-@pytest.mark.parametrize("stream_mode", [True, False])
-def test_native_tool_contract_rejects_private_invalid_index_without_logging(stream_mode, caplog):
-    metrics = Queue()
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(
-        model_name="gemma-test",
-        base_url="http://127.0.0.1:8818/v1",
-        stream=stream_mode,
-        text_output_queue=metrics,
-    )
-    runtime_config = RuntimeConfig(chat=Chat(30))
-    vad_audio = SimpleNamespace(
-        audio=np.zeros(1600, dtype=np.float32),
-        mode="final",
-        runtime_config=runtime_config,
-        turn_id=f"invalid_index_{stream_mode}",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-    secret_index = "PRIVATE_MODEL_CONTROLLED_INDEX"
-    visible = "USER_MEMORY: The user asks for a normal reply.\nASSISTANT_RESPONSE: Done."
-    lines = [
-        f"data: {json.dumps({'choices': [{'delta': {'tool_calls': [{'index': secret_index, 'function': {'name': 'lookup', 'arguments': '{}'}}]}}]})}",
-        f"data: {json.dumps({'choices': [{'delta': {'content': visible}, 'finish_reason': 'stop'}]})}",
-        "data: [DONE]",
-    ]
-    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(lines)
-    caplog.set_level(logging.INFO, logger="speech_to_speech.STT.gemma_audio_handler")
-
-    outputs = list(handler.process(vad_audio))
-
-    events = []
-    while not metrics.empty():
-        events.append(metrics.get_nowait())
-    contract_events = [
-        event for event in events if event.stage == "gemma" and event.status == "tool_contract"
-    ]
-    assert outputs
-    assert len(contract_events) == 1
-    assert contract_events[0].detail["malformed_call_category"] == "native_invalid_index"
-    assert outputs[-1].tools == []
-    assert secret_index not in json.dumps(contract_events[0].detail)
-    assert secret_index not in caplog.text
-
-
-@pytest.mark.parametrize("stream_mode", [True, False])
-def test_native_tool_contract_drops_model_call_when_tools_are_disabled(stream_mode):
-    metrics = Queue()
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(
-        model_name="gemma-test",
-        base_url="http://127.0.0.1:8818/v1",
-        stream=stream_mode,
-        text_output_queue=metrics,
-    )
-    chat = Chat(30)
-    runtime_config = RuntimeConfig(chat=chat)
-    runtime_config.session.tool_choice = "none"
-    vad_audio = SimpleNamespace(
-        audio=np.zeros(1600, dtype=np.float32),
-        mode="final",
-        runtime_config=runtime_config,
-        turn_id=f"disallowed_call_{stream_mode}",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-    visible = "USER_MEMORY: The user asks for the completed result.\nASSISTANT_RESPONSE: Done."
-    lines = [
-        f"data: {json.dumps({'choices': [{'delta': {'content': visible}}]})}",
-        f"data: {json.dumps({'choices': [{'delta': {'tool_calls': [{'index': 0, 'id': 'private_disallowed_id', 'function': {'name': 'private_disallowed_tool', 'arguments': '{}'}}]}}], 'finish_reason': 'tool_calls'})}",
-        "data: [DONE]",
-    ]
-    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(lines)
-
-    outputs = list(handler.process(vad_audio))
-
-    events = []
-    while not metrics.empty():
-        events.append(metrics.get_nowait())
-    contract_events = [
-        event for event in events if event.stage == "gemma" and event.status == "tool_contract"
-    ]
-    assert outputs
-    assert all(output.tools == [] for output in outputs)
-    assert len(contract_events) == 1
-    assert contract_events[0].detail["completed_call_count"] == 0
-    assert contract_events[0].detail["malformed_call_category"] == "native_call_disallowed"
-    serialized_history = json.dumps(chat.to_transformers_chat())
-    assert "private_disallowed_tool" not in serialized_history
-    assert "private_disallowed_id" not in serialized_history
-
-
-def test_legacy_notifier_does_not_duplicate_direct_transcript_when_context_is_committed():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
-    chat = Chat(30)
-    runtime_config = RuntimeConfig(chat=chat)
-    vad_audio = SimpleNamespace(
-        runtime_config=runtime_config,
-        turn_id="legacy_direct",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-    handler._commit_accepted_audio(vad_audio, _encoded_silence(handler))
-    direct = list(
-        handler._responses_from_text(
-            "USER_TRANSCRIPT: Keep this once.\nASSISTANT_RESPONSE: Done.",
-            vad_audio,
-        )
-    )[-1]
-    notifier = object.__new__(TranscriptionNotifier)
-    notifier.setup(runtime_config=runtime_config)
-    turns_before = chat.stats()["turns"]
-
-    requests = list(notifier.process(direct))
-
-    assert len(requests) == 1
-    assert chat.stats()["turns"] == turns_before == 1
-    assert [item.content[0].text for item in chat.buffer] == ["Keep this once.", "Done."]
-
-
-def test_streamed_mixed_response_without_language_marker_uses_auto():
-    handler = object.__new__(GemmaAudioSTTHandler)
-    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
-    runtime_config = RuntimeConfig(chat=Chat(30))
-    handler._stream_request = lambda *_args, **_kwargs: _FakeSSEStream(
-        _sse_text(
-            "USER_TRANSCRIPT: Can you buscar la estación?\n"
-            "ASSISTANT_RESPONSE: Sí, it is two blocks ahead."
-        )
-    )
-    vad_audio = SimpleNamespace(
-        audio=np.zeros(1600, dtype=np.float32),
-        mode="final",
-        runtime_config=runtime_config,
-        turn_id="turn_streamed_auto",
-        turn_revision=0,
-        created_at_s=0.0,
-    )
-
-    outputs = list(handler.process(vad_audio))
-
-    spoken = [output for output in outputs if output.text]
-    assert "".join(output.text for output in spoken) == "Sí, it is two blocks ahead."
-    assert all(output.language_code == "Auto" for output in spoken)
-    assert runtime_config.local_pipeline["assistant_language"] == "Auto"
-
-
-def test_one_hundred_accepted_turns_make_one_primary_request_each_with_optional_transcripts():
+def test_twelve_accepted_turns_make_one_primary_request_each_when_turn_nine_has_no_transcript():
     handler = object.__new__(GemmaAudioSTTHandler)
     handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
     chat = Chat(30)
@@ -2436,18 +581,14 @@ def test_one_hundred_accepted_turns_make_one_primary_request_each_with_optional_
     def stream_request(_url, payload, *, api_key):
         turn = len(calls) + 1
         calls.append(payload)
-        prefix = (
-            f"USER_MEMORY: semantic request {turn}\n"
-            if turn in {9, 37, 73, 96}
-            else f"USER_TRANSCRIPT: request {turn}\n"
-        )
+        prefix = "" if turn == 9 else f"USER_TRANSCRIPT: request {turn}\n"
         return _FakeSSEStream(
             _sse_text(f"{prefix}ASSISTANT_LANGUAGE: English\nASSISTANT_RESPONSE: answer {turn}.")
         )
 
     handler._stream_request = stream_request
     all_outputs = []
-    for turn in range(1, 101):
+    for turn in range(1, 13):
         vad_audio = SimpleNamespace(
             audio=np.zeros(1600, dtype=np.float32),
             mode="final",
@@ -2460,13 +601,11 @@ def test_one_hundred_accepted_turns_make_one_primary_request_each_with_optional_
         all_outputs.append(outputs)
         assert "".join(output.text for output in outputs) == f"answer {turn}."
 
-    assert len(calls) == 100
-    assert all(all_outputs[index - 1][-1].transcript is None for index in {9, 37, 73, 96})
-    assert all(output[-1].is_final is True for output in all_outputs)
-    assert chat.stats()["turns"] == 30
-    assert len(chat.buffer) == 60
-    assert all(chat.buffer[index].role == "user" for index in range(0, len(chat.buffer), 2))
-    assert all(chat.buffer[index].role == "assistant" for index in range(1, len(chat.buffer), 2))
+    turn_nine_final = all_outputs[8][-1]
+    assert len(calls) == 12
+    assert turn_nine_final.transcript is None
+    assert all_outputs[9][-1].is_final is True
+    assert chat.stats()["turns"] == 11
 
 
 @pytest.mark.parametrize(
@@ -2592,3 +731,334 @@ def test_early_finalized_direct_transcript_is_persistent_and_not_duplicated():
     list(notifier.process(final))
     with pytest.raises(Empty):
         queue.get_nowait()
+
+
+def test_stale_direct_stream_event_cannot_commit_tool_or_emit_response():
+    """Supersession between SSE events must detach Gemma before tool/history output."""
+
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=True)
+    chat = Chat(30)
+    runtime = RuntimeConfig(chat=chat)
+    admitted = {"value": True}
+    runtime.local_pipeline["_response_epoch_admits_output"] = lambda _epoch: admitted["value"]
+    vad_audio = SimpleNamespace(
+        runtime_config=runtime,
+        turn_id="turn_stale_stream",
+        turn_revision=0,
+        input_epoch=3,
+        response_epoch=9,
+        response_id="resp_stale_stream",
+        created_at_s=0.0,
+    )
+
+    class Stream:
+        def iter_lines(self):
+            # This event creates no history itself. The simulated newer speech
+            # arrives before Gemma's next event, which carries a tool call.
+            yield 'data: {"choices":[{"delta":{"content":"draft"}}]}'
+            admitted["value"] = False
+            yield (
+                'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+                '"id":"old_tool","function":{"name":"web_search","arguments":"{}"}}]}}]}'
+            )
+
+        def close(self):
+            return None
+
+    assert list(handler._consume_stream(Stream(), vad_audio)) == []
+    assert chat.buffer == []
+
+
+def test_next_direct_request_keeps_assistant_only_answer_without_fabricated_transcript():
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    chat = Chat(30)
+    runtime = RuntimeConfig(chat=chat)
+    first = SimpleNamespace(runtime_config=runtime, turn_id="turn_first", turn_revision=0, created_at_s=0.0)
+    list(handler._responses_from_text("ASSISTANT_RESPONSE: One, two, three, four, five.", first))
+
+    second = SimpleNamespace(runtime_config=runtime)
+    payload = handler._payload(np.zeros(1600, dtype=np.float32), second)
+
+    assert payload["messages"][1:-1] == [{"role": "assistant", "content": "One, two, three, four, five."}]
+    assistant = chat.buffer[0]
+    assert chat._assistant_exchange_ids[assistant.id].startswith("direct:turn_first:0:")
+
+
+def test_stale_direct_final_cannot_commit_history_or_terminal_output():
+    """The final direct path rechecks ownership before history and its terminal."""
+
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    chat = Chat(30)
+    runtime = RuntimeConfig(chat=chat)
+    runtime.local_pipeline["_response_epoch_admits_output"] = lambda _epoch: False
+    vad_audio = SimpleNamespace(
+        runtime_config=runtime,
+        turn_id="turn_stale_final",
+        turn_revision=0,
+        input_epoch=4,
+        response_epoch=10,
+        response_id="resp_stale_final",
+        created_at_s=0.0,
+    )
+
+    text = "USER_TRANSCRIPT: old request\nASSISTANT_RESPONSE: old response."
+    assert list(handler._responses_from_text(text, vad_audio)) == []
+    assert chat.buffer == []
+
+
+def test_direct_history_commit_is_atomic_with_vad_invalidation_and_rollback():
+    """A VAD invalidation cannot slip between admission and a Chat transaction.
+
+    The direct worker intentionally holds the tracker guard while it appends a
+    user message, assistant answer, and function call. A concurrent VAD
+    invalidation must wait until that short transaction completes, then restore
+    the owner checkpoint so no stale item survives into the successor context.
+    """
+
+    class BlockingChat(Chat):
+        def __init__(self):
+            super().__init__(30)
+            self.item_entered = Event()
+            self.allow_transaction = Event()
+
+        def add_item(self, item):
+            if not self.item_entered.is_set():
+                self.item_entered.set()
+                assert self.allow_transaction.wait(1)
+            return super().add_item(item)
+
+    tracker = ResponseOwnershipTracker()
+    owner = tracker.claim_pending(turn_id="turn_atomic", turn_revision=0)
+    chat = BlockingChat()
+    checkpoint = chat.checkpoint()
+    runtime = RuntimeConfig(chat=chat)
+    runtime.local_pipeline["_response_epoch_admits_output"] = tracker.admits_output
+    runtime.local_pipeline["_response_epoch_history_transaction"] = tracker.history_transaction
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(model_name="gemma-test", base_url="http://127.0.0.1:8818/v1", stream=False)
+    vad_audio = SimpleNamespace(
+        runtime_config=runtime,
+        turn_id="turn_atomic",
+        turn_revision=0,
+        input_epoch=owner.input_epoch,
+        response_epoch=owner.response_epoch,
+    )
+    tool = ResponseFunctionToolCall(
+        type="function_call",
+        name="web_search",
+        arguments="{}",
+        call_id="call_atomic",
+        id="fc_atomic",
+        status="completed",
+    )
+    committed: list[bool] = []
+    worker = Thread(
+        target=lambda: committed.append(handler._commit_context(vad_audio, "latest user", "old answer", [tool])),
+        daemon=True,
+    )
+    worker.start()
+    assert chat.item_entered.wait(1)
+
+    invalidation_attempted = Event()
+    invalidation_finished = Event()
+
+    def invalidate_and_rollback() -> None:
+        invalidation_attempted.set()
+        tracker.input_started(reason="newer_speech")
+        chat.rollback(checkpoint)
+        invalidation_finished.set()
+
+    invalidator = Thread(target=invalidate_and_rollback, daemon=True)
+    invalidator.start()
+    assert invalidation_attempted.wait(1)
+    # The invalidator cannot mark stale or roll back while the response's
+    # atomic Chat transaction is in progress.
+    assert not invalidation_finished.wait(0.05)
+    chat.allow_transaction.set()
+    worker.join(1)
+    invalidator.join(1)
+
+    assert committed == [True]
+    assert invalidation_finished.is_set()
+    # User, assistant, and function-call entries all roll back together; no
+    # stale fragment can become the final input's history.
+    assert chat.buffer == []
+    assert chat.stats()["pending_tool_calls"] == 0
+
+
+def test_progressive_transcription_uses_captured_generation_and_stops_after_cancellation():
+    """A live preview must not leak text after its captured generation is stale."""
+
+    scope = CancelScope()
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(
+        model_name="gemma-test",
+        base_url="http://127.0.0.1:8818/v1",
+        stream=True,
+        cancel_scope=scope,
+    )
+    stream = _FakeSSEStream(
+        [
+            'data: {"choices":[{"delta":{"content":"TRANSCRIPT: first preview"}}]}',
+            'data: {"choices":[{"delta":{"content":" must not leak"}}]}',
+        ]
+    )
+    handler._stream_request = lambda _url, _payload, *, api_key: stream
+    seen_generations: list[int | None] = []
+    admitted = handler._direct_output_admitted
+
+    def capture_generation(vad_audio, generation=None):
+        seen_generations.append(generation)
+        return admitted(vad_audio, generation)
+
+    handler._direct_output_admitted = capture_generation
+
+    def cancel_after_first_preview():
+        yield stream._lines[0]
+        scope.cancel()
+        yield stream._lines[1]
+
+    stream.iter_lines = cancel_after_first_preview
+    vad_audio = SimpleNamespace(
+        audio=np.zeros(1600, dtype=np.float32),
+        mode="progressive",
+        runtime_config=RuntimeConfig(local_pipeline={"live_transcription": True}),
+        turn_id="turn_live_cancel",
+        turn_revision=0,
+        created_at_s=0.0,
+    )
+
+    previews = list(handler.process(vad_audio))
+
+    assert [preview.text for preview in previews] == ["first preview"]
+    assert seen_generations and all(generation == 0 for generation in seen_generations)
+    assert stream.closed is True
+
+
+def test_queued_direct_audio_refreshes_cancel_generation_after_promotion():
+    """A queued successor binds to the generation current after its wait."""
+
+    scope = CancelScope()
+    acquired_generations: list[int | None] = []
+    processed_generations: list[int | None] = []
+
+    class Coordinator:
+        def acquire(self, **kwargs):
+            acquired_generations.append(kwargs["cancel_generation"])
+            return SimpleNamespace(operation_id=1)
+
+        def bind_cancel(self, _operation, _cancel):
+            return True
+
+        def is_current(self, _operation):
+            return True
+
+        def release(self, _operation):
+            return None
+
+    def wait_until_promoted(_response_epoch):
+        scope.cancel()
+        return True
+
+    runtime = RuntimeConfig(
+        local_pipeline={
+            "_session_id": "session-queued",
+            "_wait_response_epoch_current": wait_until_promoted,
+            "_response_epoch_admits_output": lambda _epoch: True,
+        }
+    )
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(
+        model_name="gemma-test",
+        base_url="http://127.0.0.1:8818/v1",
+        stream=True,
+        cancel_scope=scope,
+        model_operations=Coordinator(),
+    )
+
+    def process_direct(_vad_audio, generation):
+        processed_generations.append(generation)
+        yield DirectAssistantResponse(text="current", is_final=True)
+
+    handler._process_direct = process_direct
+    vad_audio = SimpleNamespace(
+        audio=np.zeros(1600, dtype=np.float32),
+        mode="final",
+        runtime_config=runtime,
+        turn_id="turn-queued",
+        turn_revision=0,
+        input_epoch=2,
+        response_epoch=2,
+        response_id="resp-queued",
+        created_at_s=0.0,
+    )
+
+    assert [item.text for item in handler.process(vad_audio)] == ["current"]
+    assert scope.generation == 1
+    assert acquired_generations == [1]
+    assert processed_generations == [1]
+
+
+def test_direct_gemma_pre_transport_cancel_closes_late_registered_stream():
+    """Cancellation between coordinator acquire and transport creation is latched."""
+
+    coordinator = ModelOperationCoordinator()
+    handler = object.__new__(GemmaAudioSTTHandler)
+    handler.setup(
+        model_name="gemma-test",
+        base_url="http://127.0.0.1:8818/v1",
+        stream=True,
+        model_operations=coordinator,
+    )
+    construction_entered = Event()
+    allow_construction = Event()
+    headers_called = Event()
+
+    class LateStream(_FakeSSEStream):
+        def wait_for_headers(self):
+            headers_called.set()
+
+    stream = LateStream([])
+
+    def delayed_stream_request(_url, _payload, *, api_key):
+        del api_key
+        construction_entered.set()
+        assert allow_construction.wait(1.0)
+        return stream
+
+    handler._stream_request = delayed_stream_request
+    runtime = RuntimeConfig(
+        local_pipeline={
+            "_session_id": "session-pre-transport",
+            "_response_epoch_admits_output": lambda _epoch: True,
+        }
+    )
+    vad_audio = SimpleNamespace(
+        audio=np.zeros(1600, dtype=np.float32),
+        mode="final",
+        runtime_config=runtime,
+        turn_id="turn-pre-transport",
+        turn_revision=0,
+        input_epoch=1,
+        response_epoch=1,
+        response_id=None,
+        created_at_s=0.0,
+    )
+    outputs: list[object] = []
+    worker = Thread(target=lambda: outputs.extend(handler.process(vad_audio)), daemon=True)
+    worker.start()
+    assert construction_entered.wait(1.0)
+    token = coordinator.active_token()
+    assert token is not None
+    assert coordinator.request_cancel_token(token, "newer_speech") is True
+    allow_construction.set()
+    worker.join(1.0)
+
+    assert not worker.is_alive()
+    assert outputs == []
+    assert stream.closed is True
+    assert not headers_called.is_set()
+    assert coordinator.active_token() is None

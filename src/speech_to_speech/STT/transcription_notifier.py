@@ -71,6 +71,9 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
                             context_committed=transcription.context_committed,
                             display_only=not bool(transcript),
                             direct_audio_completed=True,
+                            input_epoch=transcription.input_epoch,
+                            response_epoch=transcription.response_epoch,
+                            response_id=transcription.response_id,
                         )
                     )
                 elif transcript and not transcription.is_final:
@@ -102,6 +105,9 @@ class TranscriptionNotifier(BaseHandler[STTOut, Union[STTOut, LLMIn]]):
                 response=transcription.response,
                 context_committed=transcription.context_committed,
                 cancel_generation=transcription.cancel_generation,
+                input_epoch=transcription.input_epoch,
+                response_epoch=transcription.response_epoch,
+                response_id=transcription.response_id,
                 error=transcription.error,
             )
             return

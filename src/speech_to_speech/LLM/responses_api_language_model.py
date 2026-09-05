@@ -24,6 +24,7 @@ from speech_to_speech.LLM.base_openai_compatible_language_model import (
     TextDelta,
     ToolCall,
     Usage,
+    _ModelOperationCancelled,
 )
 from speech_to_speech.LLM.chat import Chat
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn
@@ -95,7 +96,8 @@ class ResponsesApiModelHandler(BaseOpenAICompatibleHandler):
 
     def _request(self, api_input: Any, optional_kwargs: dict[str, Any], runtime_config: Any) -> Any:
         client, model_name, _ = self._client_for(runtime_config)
-        self._set_active_client(client)
+        if not self._set_active_client(client):
+            raise _ModelOperationCancelled()
         return client.responses.create(
             model=model_name,
             input=api_input,

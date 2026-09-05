@@ -105,6 +105,21 @@ def test_late_cancel_binding_is_invoked() -> None:
     assert not result_holder[0].detached
 
 
+def test_cancellation_request_is_latched_until_real_transport_binds() -> None:
+    coordinator = ModelOperationCoordinator()
+    token = _acquire(coordinator)
+    assert token is not None
+
+    assert coordinator.request_cancel_token(token, "pre_transport") is True
+    assert coordinator.cancellation_requested(token) is True
+
+    closed = threading.Event()
+    assert coordinator.bind_cancel(token, closed.set) is True
+    assert closed.wait(0.5)
+    coordinator.release(token)
+    assert coordinator.cancellation_requested(token) is False
+
+
 def test_stuck_generation_detaches_without_poisoning_new_owner() -> None:
     coordinator = ModelOperationCoordinator()
     stale = _acquire(coordinator)
@@ -135,3 +150,34 @@ def test_stale_work_never_acquires_model_owner() -> None:
         cancel_generation=2,
         stale=lambda: True,
     ) is None
+
+
+def test_captured_cancellation_wait_never_cancels_successor() -> None:
+    coordinator = ModelOperationCoordinator()
+    stale = _acquire(coordinator)
+    released = threading.Event()
+
+    assert stale is not None
+
+    def release_stale() -> None:
+        coordinator.release(stale)
+        released.set()
+
+    assert coordinator.bind_cancel(stale, release_stale)
+    captured = coordinator.request_cancel("superseded")
+    assert captured == stale
+    assert released.wait(0.5)
+
+    successor = _acquire(coordinator, "post_tool")
+    successor_cancelled = threading.Event()
+    assert successor is not None
+    assert coordinator.bind_cancel(successor, successor_cancelled.set)
+
+    result = coordinator.wait_for_cancellation(captured, "superseded", timeout_s=0.5)
+
+    assert result.operation == stale
+    assert result.released
+    assert coordinator.is_current(successor)
+    assert not successor_cancelled.is_set()
+    assert coordinator.request_cancel_token(stale, "late_old_cancel") is False
+    coordinator.release(successor)

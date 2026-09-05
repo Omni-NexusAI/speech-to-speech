@@ -34,6 +34,7 @@ from speech_to_speech.LLM.base_openai_compatible_language_model import (
     TextDelta,
     ToolCall,
     Usage,
+    _ModelOperationCancelled,
 )
 from speech_to_speech.LLM.chat import Chat
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn
@@ -250,11 +251,14 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
                 timeout=self.request_timeout,
             )
             stream = ChatCompletionSSEStream(transport, ChatCompletionChunk)
-            self._set_active_client(stream)
+            if not self._set_active_client(stream):
+                stream.close()
+                raise _ModelOperationCancelled()
             stream.wait_for_headers()
             return stream
         client, model_name, extra_body = self._client_for(runtime_config)
-        self._set_active_client(client)
+        if not self._set_active_client(client):
+            raise _ModelOperationCancelled()
         return client.chat.completions.create(
             model=model_name,
             messages=api_input,  # type: ignore[arg-type]  # runtime dicts match the Chat Completions message shape

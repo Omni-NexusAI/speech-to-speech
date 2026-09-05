@@ -1,11 +1,6 @@
 // @ts-check
 
-import { AEC3_FRAME_MS, AEC3_OUTPUT_RATE, Aec3WasmSession } from "./aec3-abi.js?v=3-opaque-echo-route";
-import { StrictEchoGate, classifyStrictEcho } from "./strict-echo-gate.js?v=2-opaque-echo-route";
-import {
-  mixedChannelSample,
-  StatefulPolyphaseResampler,
-} from "../capture-resampler.js?v=1-stateful-polyphase";
+import { AEC3_FRAME_MS, AEC3_OUTPUT_RATE, Aec3WasmSession } from "./aec3-abi.js";
 
 const DEFAULT_CHUNK_MS = 40;
 const GATE_ATTACK_MS = 5;
@@ -34,16 +29,6 @@ class FloatRing {
     }
   }
 
-  pushOne(sample) {
-    if (this.length === this.buffer.length) {
-      this.read = (this.read + 1) % this.buffer.length;
-      this.length -= 1;
-    }
-    this.buffer[this.write] = Number.isFinite(sample) ? sample : 0;
-    this.write = (this.write + 1) % this.buffer.length;
-    this.length += 1;
-  }
-
   readInto(target) {
     if (target.length > this.length) return false;
     for (let index = 0; index < target.length; index += 1) {
@@ -52,17 +37,6 @@ class FloatRing {
       this.length -= 1;
     }
     return true;
-  }
-
-  readPartialInto(target) {
-    const count = Math.min(target.length, this.length);
-    target.fill(0);
-    for (let index = 0; index < count; index += 1) {
-      target[index] = this.buffer[this.read];
-      this.read = (this.read + 1) % this.buffer.length;
-      this.length -= 1;
-    }
-    return count;
   }
 
   clear() {
@@ -96,13 +70,9 @@ class Aec3CaptureProcessor extends AudioWorkletProcessor {
     this._referenceRing = new FloatRing(this._frameSamples * 8);
     this._micFrame = new Float32Array(this._frameSamples);
     this._referenceFrame = new Float32Array(this._frameSamples);
-    this._outputResampler = new StatefulPolyphaseResampler(this._inputRate, AEC3_OUTPUT_RATE);
+    this._resampled = new Float32Array(Math.floor(AEC3_OUTPUT_RATE / 100));
     this._chunk = new Float32Array(this._chunkSamples);
     this._chunkWrite = 0;
-    this._framesPerChunk = Math.max(1, Math.round(chunkMs / AEC3_FRAME_MS));
-    this._framesSinceChunk = 0;
-    this._flushingCapture = false;
-    this._flushedSampleCount = 0;
     this._enabled = true;
     this._requestedMode = "native";
     this._effectiveMode = "native";
@@ -118,8 +88,6 @@ class Aec3CaptureProcessor extends AudioWorkletProcessor {
     this._lastMetrics = null;
     this._lastPlaybackActive = false;
     this._lastSuppressing = false;
-    this._lastCandidateMs = 0;
-    this._strictGate = new StrictEchoGate(AEC3_FRAME_MS);
 
     this._calibration = {
       delayMs: 0,
@@ -177,45 +145,30 @@ class Aec3CaptureProcessor extends AudioWorkletProcessor {
         suppressionStrength: clamp(data.suppressionStrength, 0, 1, this._calibration.suppressionStrength),
         leakageThreshold: clamp(data.leakageThreshold, 0.05, 1, this._calibration.leakageThreshold),
         doubleTalkSensitivity: clamp(data.doubleTalkSensitivity, 0, 1, this._calibration.doubleTalkSensitivity),
-        echoTailMs: clamp(data.echoTailMs, 350, 1000, this._calibration.echoTailMs),
+        echoTailMs: clamp(data.echoTailMs, 0, 1000, this._calibration.echoTailMs),
       };
       this._postStatus();
     } else if (data.kind === "echo_reset") {
-      this._flushCapture();
+      this._micRing.clear();
+      this._referenceRing.clear();
+      this._chunkWrite = 0;
       this._referenceTailSamples = 0;
       this._processedSamples = 0;
-      this._strictGate.reset();
       try {
         this._session?.reset();
       } catch (error) {
         this._disableModule(error);
       }
       this._postStatus();
-    } else if (data.kind === "capture_flush") {
-      const sampleCount = this._flushCapture();
-      this.port.postMessage({ kind: "capture_flushed", sampleCount });
-    } else if (data.kind === "capture_abort") {
-      this._abortCapture();
     }
   }
 
   _resolveMode() {
-    const previousMode = this._effectiveMode;
-    let nextMode;
-    if (this._requestedMode === "native") nextMode = "native";
+    if (this._requestedMode === "native") this._effectiveMode = "native";
     else if (this._requestedMode === "adaptive") {
-      nextMode = this._moduleReady ? "adaptive" : "native";
+      this._effectiveMode = this._moduleReady ? "adaptive" : "native";
     } else {
-      nextMode = this._moduleReady ? "strict" : "strict-fallback";
-    }
-    if (previousMode !== nextMode) {
-      if (previousMode === "strict") {
-        this._flushStrictPending();
-        this._flushResamplerTail();
-      }
-      this._effectiveMode = nextMode;
-      this._strictGate.reset();
-      this._lastCandidateMs = 0;
+      this._effectiveMode = this._moduleReady ? "strict" : "strict-fallback";
     }
   }
 
@@ -243,7 +196,6 @@ class Aec3CaptureProcessor extends AudioWorkletProcessor {
       frameSamples: this._frameSamples,
       delayMs: this._calibration.delayMs,
       outputLatencyMs: this._calibration.outputLatencyMs,
-      echoTailMs: this._calibration.echoTailMs,
       error: this._moduleError,
     });
   }
@@ -263,72 +215,75 @@ class Aec3CaptureProcessor extends AudioWorkletProcessor {
     };
   }
 
-  _appendOutput(frame, levelRms, maximumCenterExclusive = Number.POSITIVE_INFINITY) {
-    for (let index = 0; index < frame.length; index += 1) {
-      this._outputResampler.writeSample(frame[index]);
-      while (this._outputResampler.canDrain(maximumCenterExclusive)) {
-        this._appendResampledSample(this._outputResampler.drainSample(), levelRms);
+  _strictShouldSuppress(playbackActive, metrics) {
+    if (!playbackActive) return false;
+    if (!this._moduleReady) return true;
+    if (metrics?.doubleTalk === true) return false;
+    const residual = metrics?.residualEchoLikelihood;
+    if (!Number.isFinite(residual)) return true;
+    const captureRms = Number(metrics?.captureRms);
+    const outputRms = Number(metrics?.outputRms);
+    const outputRatio = Number.isFinite(captureRms) && captureRms > 1e-6
+      && Number.isFinite(outputRms)
+      ? outputRms / captureRms
+      : 0;
+    const nearEndFloor = 0.65 - (0.5 * this._calibration.doubleTalkSensitivity);
+    if (outputRatio >= nearEndFloor && residual < 0.8) return false;
+    const strength = this._calibration.suppressionStrength;
+    const threshold = this._calibration.leakageThreshold * (1.2 - 0.7 * strength);
+    return residual >= threshold;
+  }
+
+  _resampleTo16k(input) {
+    const output = this._resampled;
+    const ratio = input.length / output.length;
+    if (Math.abs(ratio - 3) < 1e-6) {
+      for (let index = 0; index < output.length; index += 1) {
+        const source = index * 3;
+        output[index] = (input[source] + input[source + 1] + input[source + 2]) / 3;
+      }
+      return output;
+    }
+    for (let index = 0; index < output.length; index += 1) {
+      const sourcePosition = index * ratio;
+      const sourceIndex = Math.floor(sourcePosition);
+      const fraction = sourcePosition - sourceIndex;
+      const a = input[sourceIndex] || 0;
+      const b = input[Math.min(input.length - 1, sourceIndex + 1)] || a;
+      output[index] = a + (b - a) * fraction;
+    }
+    return output;
+  }
+
+  _appendOutput(frame, levelRms) {
+    const samples = this._resampleTo16k(frame);
+    for (let index = 0; index < samples.length; index += 1) {
+      this._chunk[this._chunkWrite] = samples[index];
+      this._chunkWrite += 1;
+      if (this._chunkWrite === this._chunk.length) {
+        this._emitChunk(levelRms);
+        this._chunkWrite = 0;
       }
     }
   }
 
-  _appendResampledSample(sample, levelRms) {
-    this._chunk[this._chunkWrite] = sample;
-    this._chunkWrite += 1;
-    if (this._chunkWrite === this._chunk.length) {
-      // One resampled transport chunk can span four different 10 ms AEC
-      // frames. Gate it from the complete chunk, not only its final frame.
-      this._emitChunk(rms(this._chunk));
-      this._chunkWrite = 0;
-    }
-  }
-
-  _flushResamplerTail(maximumCenterExclusive = this._outputResampler.inputCount) {
-    while (this._outputResampler.sourceIndex < maximumCenterExclusive) {
-      this._appendResampledSample(
-        this._outputResampler.drainFlushedSample(maximumCenterExclusive),
-        0,
-      );
-    }
-    this._outputResampler.reset();
-  }
-
-  _flushStrictPending(maximumCenterExclusive = Number.POSITIVE_INFINITY) {
-    const decision = this._strictGate.flush();
-    for (const retainedFrame of decision.emit) {
-      this._appendOutput(retainedFrame, rms(retainedFrame), maximumCenterExclusive);
-    }
-    this._suppressedMs += decision.suppressedFrames * AEC3_FRAME_MS;
-    this._lastCandidateMs = 0;
-  }
-
-  _flushOutputChunk() {
-    if (this._chunkWrite <= 0) return;
-    const sampleCount = this._chunkWrite;
-    this._emitChunk(rms(this._chunk.subarray(0, sampleCount)), sampleCount);
-    this._chunkWrite = 0;
-  }
-
-  _emitChunk(levelRms, sampleCount = this._chunk.length) {
+  _emitChunk(levelRms) {
     let target = 1;
     if (this._gateEnabled) {
       if (levelRms >= this._thresholdLin) this._holdRemaining = this._holdSamples;
-      else if (this._holdRemaining > 0) this._holdRemaining -= sampleCount;
+      else if (this._holdRemaining > 0) this._holdRemaining -= this._chunk.length;
       else target = 0;
     }
-    const output = new Int16Array(sampleCount);
+    const output = new Int16Array(this._chunk.length);
     let gain = this._gateGain;
-    for (let index = 0; index < sampleCount; index += 1) {
+    for (let index = 0; index < this._chunk.length; index += 1) {
       const coefficient = target > gain ? this._attackCoef : this._releaseCoef;
       gain = target + (gain - target) * coefficient;
       const sample = Math.max(-1, Math.min(1, this._chunk[index] * gain));
       output[index] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
     }
     this._gateGain = gain;
-    if (this._enabled) {
-      this.port.postMessage(output.buffer, [output.buffer]);
-      if (this._flushingCapture) this._flushedSampleCount += sampleCount;
-    }
+    if (this._enabled) this.port.postMessage(output.buffer, [output.buffer]);
   }
 
   _postMetric(captureRms, referenceRms, playbackActive, suppressing, metrics) {
@@ -354,7 +309,7 @@ class Aec3CaptureProcessor extends AudioWorkletProcessor {
       configuredDelayMs: this._calibration.delayMs + this._calibration.outputLatencyMs,
       modelReady: this._moduleReady,
       predictionConfidence: residual === null ? null : Math.max(0, Math.min(1, 1 - residual)),
-      candidateMs: this._lastCandidateMs,
+      candidateMs: 0,
       suppressedMs: this._suppressedMs,
       suppressing,
       doubleTalk: metrics?.doubleTalk ?? null,
@@ -363,7 +318,7 @@ class Aec3CaptureProcessor extends AudioWorkletProcessor {
     });
   }
 
-  _processFrame(maximumCenterExclusive = Number.POSITIVE_INFINITY) {
+  _processFrame() {
     const capture = this._micFrame;
     const reference = this._referenceFrame;
     const captureRms = rms(capture);
@@ -388,106 +343,36 @@ class Aec3CaptureProcessor extends AudioWorkletProcessor {
       }
     }
 
-    let suppressing = false;
-    if (this._effectiveMode === "strict") {
-      const evidence = classifyStrictEcho(playbackActive, metrics, this._calibration);
-      const decision = this._strictGate.consume(output, {
-        playbackActive,
-        ...evidence,
-      });
-      for (const retainedFrame of decision.emit) {
-        this._appendOutput(retainedFrame, rms(retainedFrame), maximumCenterExclusive);
-      }
-      this._suppressedMs += decision.suppressedFrames * AEC3_FRAME_MS;
-      suppressing = decision.suppressing;
-      this._lastCandidateMs = decision.pendingMs;
-    } else if (this._effectiveMode === "strict-fallback" && playbackActive) {
-      // A missing or failed AEC3 module has no trustworthy near-end evidence.
-      // Strict therefore remains fail closed for referenced playback and tail.
-      this._suppressedMs += AEC3_FRAME_MS;
-      suppressing = true;
-      this._lastCandidateMs = 0;
-    } else {
-      this._appendOutput(output, rms(output), maximumCenterExclusive);
-      this._lastCandidateMs = 0;
-    }
+    const suppressing = this._effectiveMode.startsWith("strict")
+      && this._strictShouldSuppress(playbackActive, metrics);
     this._lastMetrics = metrics;
     this._lastPlaybackActive = playbackActive;
     this._lastSuppressing = suppressing;
+    if (suppressing) {
+      // Fail closed by omitting the 10 ms frame. Never substitute zero PCM.
+      this._suppressedMs += AEC3_FRAME_MS;
+    } else {
+      // Adaptive output is the real AEC3-processed capture. Native fallback is
+      // untouched browser-captured PCM. No NLMS/predictor residual is uploaded.
+      this._appendOutput(output, rms(output));
+    }
     this.port.postMessage({ kind: "level", rms: captureRms });
     this._postMetric(captureRms, referenceRms, playbackActive, suppressing, metrics);
-    this._framesSinceChunk += 1;
-    if (this._framesSinceChunk >= this._framesPerChunk) {
-      this._framesSinceChunk = 0;
-      this._flushOutputChunk();
-    }
-  }
-
-  _flushCapture() {
-    this._flushingCapture = true;
-    this._flushedSampleCount = 0;
-    this._flushStrictPending();
-    if (this._micRing.length > 0) {
-      const validSamples = this._micRing.length;
-      this._micRing.readPartialInto(this._micFrame);
-      this._referenceRing.readPartialInto(this._referenceFrame);
-      const before = this._outputResampler.inputCount;
-      const maximumCenterExclusive = before + validSamples;
-      this._processFrame(maximumCenterExclusive);
-      // Strict can retain the final partial frame while it waits for near-end
-      // confirmation. Resolve that frame before draining the endpoint, but keep
-      // the validity bound so zero padding cannot extend the captured duration.
-      this._flushStrictPending(maximumCenterExclusive);
-      this._flushResamplerTail(
-        Math.min(maximumCenterExclusive, this._outputResampler.inputCount),
-      );
-    } else {
-      this._flushResamplerTail();
-    }
-    this._flushOutputChunk();
-    this._micRing.clear();
-    this._referenceRing.clear();
-    this._framesSinceChunk = 0;
-    this._flushingCapture = false;
-    return this._flushedSampleCount;
-  }
-
-  _abortCapture() {
-    this._micRing.clear();
-    this._referenceRing.clear();
-    this._outputResampler.reset();
-    this._chunkWrite = 0;
-    this._framesSinceChunk = 0;
-    this._strictGate.reset();
-    this._referenceTailSamples = 0;
-    this._processedSamples = 0;
-    this._lastCandidateMs = 0;
-    this._lastMetrics = null;
-    this._lastPlaybackActive = false;
-    this._lastSuppressing = false;
-    this._flushingCapture = false;
-    this._flushedSampleCount = 0;
   }
 
   process(inputs) {
-    const microphoneChannels = inputs[0] || [];
-    const referenceChannels = inputs[1] || [];
-    let frameCount = 0;
-    for (let channel = 0; channel < microphoneChannels.length; channel += 1) {
-      frameCount = Math.max(frameCount, microphoneChannels[channel]?.length || 0);
-    }
-    if (!frameCount) return true;
-    for (let index = 0; index < frameCount; index += 1) {
-      this._micRing.pushOne(mixedChannelSample(microphoneChannels, index));
-      this._referenceRing.pushOne(mixedChannelSample(referenceChannels, index));
-      if (
-        this._micRing.length >= this._frameSamples
-        && this._referenceRing.length >= this._frameSamples
-      ) {
-        this._micRing.readInto(this._micFrame);
-        this._referenceRing.readInto(this._referenceFrame);
-        this._processFrame();
-      }
+    const microphone = inputs[0]?.[0];
+    if (!microphone || microphone.length === 0) return true;
+    const reference = inputs[1]?.[0] || null;
+    this._micRing.push(microphone, microphone.length);
+    this._referenceRing.push(reference, microphone.length);
+    while (
+      this._micRing.length >= this._frameSamples
+      && this._referenceRing.length >= this._frameSamples
+    ) {
+      this._micRing.readInto(this._micFrame);
+      this._referenceRing.readInto(this._referenceFrame);
+      this._processFrame();
     }
     return true;
   }

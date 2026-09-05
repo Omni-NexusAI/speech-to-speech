@@ -15,8 +15,10 @@
  *     `session.output_modalities`, ...).
  *   - We stream mic audio as PCM16 16 kHz mono base64 chunks via
  *     `input_audio_buffer.append`.
- *   - The server pushes `response.output_audio.delta` (pipeline-native PCM16
- *     16 kHz mono base64) and transcript deltas.
+ *   - The server pushes `response.output_audio.delta` as PCM16 mono base64.
+ *     The default/Faster/Groxaxo transport remains 16 kHz; the isolated
+ *     audio.cpp candidate acknowledges its model-native 24 kHz clock before
+ *     playback begins.
  *
  * Audio is handled internally via two AudioWorklet processors so the
  * client owns the full mic-in / speaker-out pipeline. The main app only
@@ -67,7 +69,7 @@
  *   before it's sent. Tunable live via `setNoiseGate`.
  * @property {EchoGuardMode} [echoGuard] Playback-reference echo suppression.
  * @property {Record<string, EchoCalibration>} [echoCalibrations] Saved AEC3
- *   calibration indexed only by an opaque microphone/output-route digest.
+ *   calibration indexed by microphone/output-device pair.
  * @property {Record<string, any>} [pipelineConfig] Conversation-scoped model and TTS routing.
  * @property {PlaybackConfig} [playbackConfig] Browser-only snapshot of the
  *   selected provider's validated delivery mode and resolved tuning profile.
@@ -89,14 +91,11 @@
  * @typedef {Object} PlaybackConfig
  * @property {string} [provider]
  * @property {string} [profileId]
- * @property {string | number} [profileRevision]
- * @property {string} [model]
- * @property {string} [clone]
+ * @property {number | null} [profileRevision]
  * @property {boolean} [nativeStreaming]
  * @property {number} [resolvedPrimeMs]
- * @property {number} [firstBlockFrames]
- * @property {number} [steadyBlockFrames]
- * @property {number} [outputRate]
+ * @property {"adaptive" | "fast-start"} [continuityMode]
+ * @property {number} [configToken]
  *
  * @typedef {Object} ToolDef
  * @property {"function"} type
@@ -120,14 +119,7 @@ import { OrbVisualiser, VIS_FFT_SIZE } from "./orb-visualizer.js";
 import {
   aec3ProcessorOptions,
   loadAec3Worklet,
-} from "../worklets/aec3/aec3-loader.js?v=6-stateful-polyphase";
-import {
-  EchoRouteCalibration,
-  fingerprintEchoRoute,
-  normalizeEchoCalibration,
-  sanitizeEchoCalibrations,
-  upsertEchoCalibration,
-} from "../echo-route-calibration.js?v=1-opaque-route";
+} from "../worklets/aec3/aec3-loader.js";
 
 /** Build an Error carrying a `code` (and optional extra fields) so callers can
  *  branch on the failure kind: "limit" | "queue-full" | "queue-expired" | "aborted".
@@ -139,24 +131,21 @@ function _codedError(message, code, extra) {
   return err;
 }
 
-// The s2s pipeline runs internally at 16 kHz mono PCM. The WebRTC transport
-// resamples to 48 kHz for Opus, but the WebSocket transport emits the
-// native pipeline rate. We don't (can't) override it via `audio.output.format`
-// because the server's pydantic validator rejects the whole `session.update`
-// as soon as a sub-field shape it doesn't know about appears.
-const OUTPUT_SAMPLE_RATE = 16000;
+// The server acknowledges the outbound PCM clock as part of its local pipeline
+// configuration.  It is not an OpenAI `audio.output.format` option: adding an
+// unknown shape there would make strict clients reject the whole update.
+// 16 kHz is deliberately the safe initial/default-provider fallback.
+const DEFAULT_OUTPUT_SAMPLE_RATE = 16000;
 const MIC_CHUNK_MS = 40;
 export const PIPELINE_CONFIG_ACK_TIMEOUT_MS = 15_000;
 export const MAX_PLAYBACK_PRIME_MS = 2_000;
+export const PLAYBACK_CONTINUITY_ADAPTIVE = "adaptive";
+export const PLAYBACK_CONTINUITY_FAST_START = "fast-start";
 const MAX_PLAYBACK_RESPONSE_TOMBSTONES = 512;
-export const PLAYBACK_LEARNING_VERSION = 1;
-export const PLAYBACK_LEARNING_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
-export const MAX_PLAYBACK_LEARNING_SIGNATURES = 16;
-export const PLAYBACK_GAP_WINDOW = 8;
-const PLAYBACK_LEARNING_STORAGE_KEY = "s2s.playback.safe-start.v1";
-const AUDIO_CPP_CODEC_FRAME_MS = 80;
-const PLAYBACK_WARM_FIRST_MARGIN_MS = 160;
-const PLAYBACK_WARM_GAP_MARGIN_MS = 64;
+const MAX_TOOL_CALL_TOMBSTONES = 512;
+const TERMINAL_RESPONSE_LIFECYCLE_STATES = new Set([
+  "completed", "cancelled", "canceled", "failed", "incomplete", "error",
+]);
 export const AUDIO_CPP_PLAYBACK_PRIME_MS = Object.freeze({
   "low-latency": 800,
   balanced: 1280,
@@ -168,161 +157,6 @@ function _normalisePlaybackProvider(value) {
   return provider === "audio-cpp" ? "qwen3tts-audiocpp" : provider;
 }
 
-/** @param {unknown} value @returns {value is Record<string, unknown>} */
-function _isPlainObject(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-/**
- * Validate a value against the small JSON-Schema subset used by browser tools.
- * Return only a field path and error class: caller diagnostics must never echo
- * raw argument values.
- * @param {unknown} value
- * @param {Record<string, any>} schema
- * @param {string} path
- * @returns {{ path: string, errorClass: string } | null}
- */
-function _toolSchemaError(value, schema, path = "$") {
-  if (Array.isArray(schema.enum) && !schema.enum.some((candidate) => Object.is(candidate, value))) {
-    return { path, errorClass: "not_in_enum" };
-  }
-  const type = typeof schema.type === "string" ? schema.type : "";
-  if (type === "object") {
-    if (!_isPlainObject(value)) return { path, errorClass: "expected_object" };
-    const properties = _isPlainObject(schema.properties) ? schema.properties : {};
-    const required = Array.isArray(schema.required) ? schema.required : [];
-    for (const field of required) {
-      if (typeof field === "string" && !Object.prototype.hasOwnProperty.call(value, field)) {
-        return { path: `${path}.${field}`, errorClass: "required" };
-      }
-    }
-    if (schema.additionalProperties === false) {
-      for (const field of Object.keys(value)) {
-        if (!Object.prototype.hasOwnProperty.call(properties, field)) {
-          // The field name is untrusted model output. Keep diagnostics on the
-          // declared-schema path instead of copying that name into cards,
-          // metrics, tool output, or console traces.
-          return { path: `${path}.*`, errorClass: "unexpected_property" };
-        }
-      }
-    }
-    for (const [field, childSchema] of Object.entries(properties)) {
-      if (!Object.prototype.hasOwnProperty.call(value, field) || !_isPlainObject(childSchema)) continue;
-      const childError = _toolSchemaError(value[field], childSchema, `${path}.${field}`);
-      if (childError) return childError;
-    }
-    return null;
-  }
-  if (type === "array") {
-    if (!Array.isArray(value)) return { path, errorClass: "expected_array" };
-    if (_isPlainObject(schema.items)) {
-      for (let index = 0; index < value.length; index += 1) {
-        const childError = _toolSchemaError(value[index], schema.items, `${path}[${index}]`);
-        if (childError) return childError;
-      }
-    }
-    return null;
-  }
-  if (type === "string") {
-    if (typeof value !== "string") return { path, errorClass: "expected_string" };
-    if (Number.isFinite(schema.minLength) && value.length < Number(schema.minLength)) {
-      return { path, errorClass: "min_length" };
-    }
-    if (Number.isFinite(schema.maxLength) && value.length > Number(schema.maxLength)) {
-      return { path, errorClass: "max_length" };
-    }
-    if (typeof schema.pattern === "string" && !(new RegExp(schema.pattern)).test(value)) {
-      return { path, errorClass: "pattern_mismatch" };
-    }
-    return null;
-  }
-  if (type === "number" && (typeof value !== "number" || !Number.isFinite(value))) {
-    return { path, errorClass: "expected_number" };
-  }
-  if (type === "integer" && !Number.isInteger(value)) {
-    return { path, errorClass: "expected_integer" };
-  }
-  if (type === "boolean" && typeof value !== "boolean") {
-    return { path, errorClass: "expected_boolean" };
-  }
-  return null;
-}
-
-/**
- * Parse and validate tool arguments without coercion. The raw JSON string stays
- * on the public call event for exact server/history fidelity; only the local
- * browser executor consumes the parsed object returned here.
- * @param {unknown} argsJson
- * @param {Record<string, any>} schema
- * @returns {{ ok: true, args: Record<string, unknown> } | { ok: false, code: string, path: string, errorClass: string }}
- */
-export function validateToolArguments(argsJson, schema) {
-  if (typeof argsJson !== "string") {
-    return { ok: false, code: "malformed_json", path: "$", errorClass: "expected_json_string" };
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(argsJson);
-  } catch {
-    return { ok: false, code: "malformed_json", path: "$", errorClass: "json_parse_error" };
-  }
-  const error = _toolSchemaError(parsed, schema, "$");
-  if (error) return { ok: false, code: "schema_validation_failed", ...error };
-  if (!_isPlainObject(parsed)) {
-    return { ok: false, code: "schema_validation_failed", path: "$", errorClass: "expected_object" };
-  }
-  return { ok: true, args: parsed };
-}
-
-/**
- * Build the function output for invalid arguments. It identifies the tool,
- * field path, and validation class without reproducing user/model-provided
- * argument values.
- * @param {string} tool
- * @param {{ ok: false, code: string, path: string, errorClass: string }} failure
- */
-export function invalidToolArgumentsOutput(tool, failure) {
-  return JSON.stringify({
-    type: "invalid_tool_arguments",
-    tool,
-    code: failure.code,
-    path: failure.path,
-    error_class: failure.errorClass,
-    message: "The tool arguments were invalid. Submit a new call that matches the declared schema.",
-  });
-}
-
-/**
- * Prepare the only tool-argument representation the browser may persist or
- * display. Valid calls expose the schema-validated object; malformed,
- * schema-invalid, and unknown calls expose content-free failure metadata.
- * The original argument string remains available only to the protocol event
- * and validator and must never be handed to a durable UI surface.
- * @param {unknown} tool
- * @param {unknown} argsJson
- * @param {Record<string, any> | null | undefined} schema
- * @returns {{
- *   tool: string,
- *   displayArguments: string,
- *   validation: { ok: true, args: Record<string, unknown> } |
- *     { ok: false, code: string, path: string, errorClass: string }
- * }}
- */
-export function prepareToolArgumentsForBrowser(tool, argsJson, schema) {
-  const hasSchema = _isPlainObject(schema);
-  const safeTool = hasSchema && typeof tool === "string" && tool ? tool : "unknown_tool";
-  const validation = hasSchema
-    ? validateToolArguments(argsJson, schema)
-    : { ok: false, code: "unknown_tool", path: "$", errorClass: "unknown_tool" };
-  return {
-    tool: safeTool,
-    validation,
-    displayArguments: validation.ok
-      ? JSON.stringify(validation.args)
-      : invalidToolArgumentsOutput(safeTool, validation),
-  };
-}
-
 function _normaliseProfileId(value) {
   return String(value || "")
     .trim()
@@ -330,18 +164,29 @@ function _normaliseProfileId(value) {
     .replace(/[_\s]+/g, "-");
 }
 
+/** @param {unknown} value */
+function _normaliseProfileRevision(value) {
+  const revision = Number(value);
+  return Number.isSafeInteger(revision) && revision > 0 ? revision : null;
+}
+
+/** @param {unknown} value */
+function _isTerminalResponseLifecycleState(value) {
+  return TERMINAL_RESPONSE_LIFECYCLE_STATES.has(String(value || "").toLowerCase());
+}
+
 /**
  * Resolve the browser queue target without changing the WebSocket schema.
- * Only a positively validated native audio.cpp stream is primed. Built-ins use
- * fixed acceptance targets; a custom profile uses its locally resolved first
- * block duration and is bounded to two seconds.
+ * Both native and buffered-phrase audio.cpp PCM use the fixed model clock and
+ * benefit from a bounded startup reservoir. Built-ins use fixed acceptance
+ * targets; a custom profile uses its locally resolved first-block duration.
  *
  * @param {Record<string, any>} config Acknowledged pipeline config.
  * @param {PlaybackConfig} [hint] Browser-only validated profile snapshot.
  */
 export function resolvePlaybackPrimeMs(config = {}, hint = {}) {
   const provider = _normalisePlaybackProvider(config.tts_backend || hint.provider);
-  if (provider !== "qwen3tts-audiocpp" || hint.nativeStreaming !== true) return 0;
+  if (provider !== "qwen3tts-audiocpp") return 0;
 
   const profileId = _normaliseProfileId(config.tts_tuning?.profile_id || hint.profileId);
   if (profileId === "low" || profileId === "lowlatency") {
@@ -358,326 +203,94 @@ export function resolvePlaybackPrimeMs(config = {}, hint = {}) {
   return Math.max(0, Math.min(MAX_PLAYBACK_PRIME_MS, resolved));
 }
 
-function _positiveInteger(value) {
-  const number = Number(value);
-  return Number.isSafeInteger(number) && number > 0 ? number : 0;
+function _responseEpoch(event = {}) {
+  const candidate = event.response_epoch ?? event.response?.response_epoch;
+  const epoch = Number(candidate);
+  return Number.isSafeInteger(epoch) && epoch >= 0 ? epoch : null;
 }
 
-function _identityString(value) {
-  return typeof value === "string" ? value.trim() : String(value ?? "").trim();
+function _inputEpoch(event = {}) {
+  const candidate = event.input_epoch ?? event.response?.input_epoch;
+  const epoch = Number(candidate);
+  return Number.isSafeInteger(epoch) && epoch >= 0 ? epoch : null;
 }
 
-function _runtimePlaybackIdentity(runtime) {
-  if (!_isPlainObject(runtime)) return "";
-  const apiVersion = _identityString(runtime.api_version);
-  const startedAt = _identityString(runtime.started_at_utc);
-  const pid = _positiveInteger(runtime.pid);
-  if (!apiVersion || !startedAt || !pid) return "";
-  const build = _identityString(
-    runtime.git_commit || runtime.commit || runtime.build_id || runtime.build || runtime.image,
-  );
-  return JSON.stringify([apiVersion, startedAt, pid, build]);
+/** Return a valid local PCM source clock or null for standard peers. */
+function _responseOutputSampleRate(value) {
+  const rate = Number(value);
+  return Number.isInteger(rate) && rate > 0 ? rate : null;
+}
+
+function _continuityMode(value) {
+  return value === PLAYBACK_CONTINUITY_FAST_START
+    ? PLAYBACK_CONTINUITY_FAST_START
+    : PLAYBACK_CONTINUITY_ADAPTIVE;
 }
 
 /**
- * Build the exact immutable identity used for adaptive safe-start learning.
- * Fields absent from the server acknowledgement remain conservative: the
- * acknowledgement is the commit barrier, while model/clone/runtime/rate come
- * from the already validated browser snapshot.
- *
- * @param {Record<string, any>} config
- * @param {PlaybackConfig} hint
- * @param {string} runtimeIdentity
- * @param {boolean} ackMatched
+ * The local server freezes this complete policy when it claims response
+ * ownership.  A later config acknowledgement is deliberately next-response
+ * only, so the lifecycle copy wins whenever it is available.  Older local
+ * servers sent only `output_sample_rate`; retain that compatibility fallback.
+ * @param {Record<string, any>} event
+ * @param {number | null} lifecycleRate
+ * @returns {{ sourceSampleRate: number, primeMs: number, continuityMode: string, nativeStreaming: boolean, maxPrimeMs: number, provider: string, profileId: string, profileRevision: number | null } | null}
  */
-export function resolveAdaptivePlaybackSignature(
-  config = {},
-  hint = {},
-  runtimeIdentity = "",
-  ackMatched = true,
-) {
-  const provider = _normalisePlaybackProvider(config.tts_backend || hint.provider);
-  const nativeStreaming = hint.nativeStreaming === true;
-  const profileId = _normaliseProfileId(config.tts_tuning?.profile_id || hint.profileId);
-  const hintedProfileId = _normaliseProfileId(hint.profileId);
-  const profileMatches = !profileId || !hintedProfileId || profileId === hintedProfileId;
-  const firstBlockFrames = _positiveInteger(
-    hint.firstBlockFrames ?? config.tts_tuning?.overrides?.first_block_frames,
-  );
-  const steadyBlockFrames = _positiveInteger(
-    hint.steadyBlockFrames ?? config.tts_tuning?.overrides?.steady_block_frames,
-  );
-  const acknowledgedFirst = _positiveInteger(config.tts_tuning?.overrides?.first_block_frames);
-  const acknowledgedSteady = _positiveInteger(config.tts_tuning?.overrides?.steady_block_frames);
-  const overrideMatches = (
-    (!acknowledgedFirst || acknowledgedFirst === firstBlockFrames)
-    && (!acknowledgedSteady || acknowledgedSteady === steadyBlockFrames)
-  );
-  const outputRate = _positiveInteger(hint.outputRate || OUTPUT_SAMPLE_RATE);
-  const model = _identityString(hint.model);
-  const clone = _identityString(hint.clone);
-  const profileRevision = _identityString(hint.profileRevision);
-  const firstMs = firstBlockFrames * AUDIO_CPP_CODEC_FRAME_MS;
-  const eligible = provider === "qwen3tts-audiocpp" && nativeStreaming;
-  const hasCompleteFramePair = firstBlockFrames > 0 && steadyBlockFrames > 0;
-  const framedCeilingMs = hasCompleteFramePair
-    ? (firstBlockFrames + steadyBlockFrames) * AUDIO_CPP_CODEC_FRAME_MS
-    : 0;
-  const valid = eligible
-    && ackMatched
-    && profileMatches
-    && overrideMatches
-    && !!model
-    && !!clone
-    && !!profileId
-    && !!profileRevision
-    && !!runtimeIdentity
-    && hasCompleteFramePair
-    && outputRate > 0;
-  const namedConservativeCeiling = AUDIO_CPP_PLAYBACK_PRIME_MS[profileId];
-  const conservativeCeilingMs = Number.isFinite(namedConservativeCeiling)
-    ? namedConservativeCeiling
+function _lifecyclePlaybackPolicy(event, lifecycleRate) {
+  const raw = event?.playback_policy ?? event?.playbackPolicy;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const sourceSampleRate = _responseOutputSampleRate(
+    raw.source_sample_rate ?? raw.sourceSampleRate,
+  ) ?? lifecycleRate;
+  if (sourceSampleRate === null) return null;
+  const maxCandidate = Number(raw.max_prime_ms ?? raw.maxPrimeMs);
+  const maxPrimeMs = Number.isFinite(maxCandidate)
+    ? Math.max(0, Math.min(MAX_PLAYBACK_PRIME_MS, Math.round(maxCandidate)))
     : MAX_PLAYBACK_PRIME_MS;
-  const ceilingMs = eligible
-    ? Math.max(0, Math.min(
-      MAX_PLAYBACK_PRIME_MS,
-      valid ? framedCeilingMs : conservativeCeilingMs,
-    ))
+  const primeCandidate = Number(raw.prime_target_ms ?? raw.primeMs);
+  const primeMs = Number.isFinite(primeCandidate)
+    ? Math.max(0, Math.min(maxPrimeMs, Math.round(primeCandidate)))
     : 0;
-  const fields = Object.freeze({
-    provider,
-    model,
-    clone,
-    profileId,
-    profileRevision,
-    firstBlockFrames,
-    steadyBlockFrames,
-    nativeStreaming,
-    outputRate,
-    runtimeIdentity,
-  });
-  return Object.freeze({
-    valid,
-    eligible,
-    key: valid ? JSON.stringify(Object.values(fields)) : "",
-    fields,
-    firstMs: Math.min(ceilingMs, firstMs),
-    steadyMs: steadyBlockFrames * AUDIO_CPP_CODEC_FRAME_MS,
-    ceilingMs,
-  });
+  return {
+    sourceSampleRate,
+    primeMs,
+    continuityMode: _continuityMode(raw.continuity_mode ?? raw.continuityMode),
+    nativeStreaming: raw.native_streaming === true || raw.nativeStreaming === true,
+    maxPrimeMs,
+    provider: _normalisePlaybackProvider(raw.provider),
+    profileId: _normaliseProfileId(raw.profile_id ?? raw.profileId),
+    profileRevision: _normaliseProfileRevision(raw.profile_revision ?? raw.profileRevision),
+  };
+}
+const DEFAULT_ECHO_CALIBRATION = Object.freeze({
+  delayMs: 0,
+  suppressionStrength: 0.65,
+  leakageThreshold: 0.65,
+  doubleTalkSensitivity: 0.5,
+  echoTailMs: 350,
+});
+
+/** @param {Partial<EchoCalibration> | null | undefined} value */
+function normalizeEchoCalibration(value) {
+  const clamp = (candidate, minimum, maximum, fallback) => {
+    const number = Number(candidate);
+    return Number.isFinite(number) ? Math.max(minimum, Math.min(maximum, number)) : fallback;
+  };
+  return {
+    delayMs: clamp(value?.delayMs, 0, 500, DEFAULT_ECHO_CALIBRATION.delayMs),
+    suppressionStrength: clamp(
+      value?.suppressionStrength, 0, 1, DEFAULT_ECHO_CALIBRATION.suppressionStrength,
+    ),
+    leakageThreshold: clamp(
+      value?.leakageThreshold, 0.05, 1, DEFAULT_ECHO_CALIBRATION.leakageThreshold,
+    ),
+    doubleTalkSensitivity: clamp(
+      value?.doubleTalkSensitivity, 0, 1, DEFAULT_ECHO_CALIBRATION.doubleTalkSensitivity,
+    ),
+    echoTailMs: clamp(value?.echoTailMs, 0, 1000, DEFAULT_ECHO_CALIBRATION.echoTailMs),
+  };
 }
 
-function _nearestRankP95(values) {
-  if (!values.length) return 0;
-  const ordered = [...values].sort((left, right) => left - right);
-  return ordered[Math.max(0, Math.ceil(ordered.length * 0.95) - 1)];
-}
-
-function _safeLocalStorage() {
-  try {
-    return globalThis.localStorage || null;
-  } catch {
-    return null;
-  }
-}
-
-/** Versioned, bounded, content-free adaptive safe-start learning. */
-export class AdaptivePlaybackPolicyStore {
-  /** @param {{ storage?: Storage | null, now?: () => number }} [options] */
-  constructor(options = {}) {
-    this._storage = options.storage === undefined ? _safeLocalStorage() : options.storage;
-    this._now = typeof options.now === "function" ? options.now : () => Date.now();
-    /** @type {Map<string, Record<string, any>>} */
-    this._records = new Map();
-    this._load();
-  }
-
-  _load() {
-    let payload;
-    try {
-      payload = JSON.parse(this._storage?.getItem(PLAYBACK_LEARNING_STORAGE_KEY) || "null");
-    } catch {
-      return;
-    }
-    if (!_isPlainObject(payload)
-        || payload.version !== PLAYBACK_LEARNING_VERSION
-        || !Array.isArray(payload.entries)) return;
-    const now = this._now();
-    for (const entry of payload.entries.slice(0, MAX_PLAYBACK_LEARNING_SIGNATURES)) {
-      if (!_isPlainObject(entry)
-          || typeof entry.key !== "string"
-          || !entry.key
-          || entry.key.length > 4096
-          || !Number.isFinite(entry.expiresAt)
-          || entry.expiresAt <= now) continue;
-      const gaps = Array.isArray(entry.gaps)
-        ? entry.gaps
-          .filter((gap) => Number.isFinite(gap) && gap > 0)
-          .slice(-PLAYBACK_GAP_WINDOW)
-        : [];
-      const fullPrimeCleanCount = Math.max(
-        0,
-        Math.min(2, Number(entry.fullPrimeCleanCount) || 0),
-      );
-      const disabled = entry.disabled === true;
-      this._records.set(entry.key, {
-        key: entry.key,
-        gaps,
-        fullPrimeCleanCount,
-        // Treat storage as untrusted input. Warm eligibility is derived from
-        // the two clean-response evidence counter, never from a persisted flag.
-        warmEligible: !disabled && fullPrimeCleanCount >= 2,
-        disabled,
-        recoveryCleanCount: Math.max(0, Math.min(3, Number(entry.recoveryCleanCount) || 0)),
-        lastUsed: Number.isFinite(entry.lastUsed) ? entry.lastUsed : now,
-        expiresAt: entry.expiresAt,
-      });
-    }
-    this._prune(now);
-  }
-
-  _prune(now = this._now()) {
-    for (const [key, record] of this._records) {
-      if (!Number.isFinite(record.expiresAt) || record.expiresAt <= now) this._records.delete(key);
-    }
-    const ordered = [...this._records.values()].sort((left, right) => right.lastUsed - left.lastUsed);
-    for (const record of ordered.slice(MAX_PLAYBACK_LEARNING_SIGNATURES)) {
-      this._records.delete(record.key);
-    }
-  }
-
-  _persist() {
-    this._prune();
-    try {
-      this._storage?.setItem(PLAYBACK_LEARNING_STORAGE_KEY, JSON.stringify({
-        version: PLAYBACK_LEARNING_VERSION,
-        entries: [...this._records.values()].sort((left, right) => right.lastUsed - left.lastUsed),
-      }));
-    } catch {
-      // Storage is an optimization only; private/blocked modes stay conservative.
-    }
-  }
-
-  _record(signatureKey) {
-    const now = this._now();
-    let record = this._records.get(signatureKey);
-    if (!record) {
-      record = {
-        key: signatureKey,
-        gaps: [],
-        fullPrimeCleanCount: 0,
-        warmEligible: false,
-        disabled: false,
-        recoveryCleanCount: 0,
-        lastUsed: now,
-        expiresAt: now + PLAYBACK_LEARNING_TTL_MS,
-      };
-      this._records.set(signatureKey, record);
-    }
-    record.lastUsed = now;
-    record.expiresAt = now + PLAYBACK_LEARNING_TTL_MS;
-    return record;
-  }
-
-  /** @param {ReturnType<typeof resolveAdaptivePlaybackSignature>} signature */
-  policy(signature) {
-    if (!signature.eligible) {
-      return Object.freeze({
-        learning: false,
-        signatureKey: "",
-        mode: "immediate",
-        targetMs: 0,
-        ceilingMs: 0,
-        firstMs: 0,
-        gapP95Ms: 0,
-        firstBlockSamples: 0,
-        steadyBlockSamples: 0,
-        jitterMarginMs: PLAYBACK_WARM_GAP_MARGIN_MS,
-        fallbackReason: "non_native_or_buffered",
-      });
-    }
-    if (!signature.valid) {
-      return Object.freeze({
-        learning: false,
-        signatureKey: "",
-        mode: "conservative",
-        targetMs: signature.ceilingMs,
-        ceilingMs: signature.ceilingMs,
-        firstMs: signature.firstMs,
-        gapP95Ms: 0,
-        firstBlockSamples: 0,
-        steadyBlockSamples: 0,
-        jitterMarginMs: PLAYBACK_WARM_GAP_MARGIN_MS,
-        fallbackReason: "signature_incomplete_or_unordered",
-      });
-    }
-    const record = this._record(signature.key);
-    const warm = record.warmEligible && !record.disabled;
-    const gapP95Ms = _nearestRankP95(record.gaps);
-    const warmTarget = Math.max(
-      signature.firstMs + PLAYBACK_WARM_FIRST_MARGIN_MS,
-      gapP95Ms + PLAYBACK_WARM_GAP_MARGIN_MS,
-    );
-    const policy = Object.freeze({
-      learning: true,
-      signatureKey: signature.key,
-      mode: warm ? "warm" : (record.disabled ? "recovery" : "cold"),
-      targetMs: warm ? Math.min(signature.ceilingMs, warmTarget) : signature.ceilingMs,
-      ceilingMs: signature.ceilingMs,
-      firstMs: signature.firstMs,
-      gapP95Ms,
-      firstBlockSamples: Math.ceil(
-        (signature.fields.firstBlockFrames * AUDIO_CPP_CODEC_FRAME_MS
-          * signature.fields.outputRate) / 1_000,
-      ),
-      steadyBlockSamples: Math.ceil(
-        (signature.fields.steadyBlockFrames * AUDIO_CPP_CODEC_FRAME_MS
-          * signature.fields.outputRate) / 1_000,
-      ),
-      jitterMarginMs: PLAYBACK_WARM_GAP_MARGIN_MS,
-      fallbackReason: warm
-        ? "learned_block_cadence"
-        : (record.disabled ? "underrun_recovery" : "cold_evidence"),
-    });
-    this._persist();
-    return policy;
-  }
-
-  /**
-   * @param {ReturnType<AdaptivePlaybackPolicyStore["policy"]>} policy
-   * @param {{ gaps?: number[], underrun?: boolean, cleanFullPrime?: boolean }} observation
-   */
-  record(policy, observation = {}) {
-    if (!policy.learning || !policy.signatureKey) return;
-    const record = this._record(policy.signatureKey);
-    const gaps = Array.isArray(observation.gaps)
-      ? observation.gaps.filter((gap) => Number.isFinite(gap) && gap > 0)
-      : [];
-    record.gaps = [...record.gaps, ...gaps].slice(-PLAYBACK_GAP_WINDOW);
-    if (observation.underrun) {
-      record.disabled = true;
-      record.warmEligible = false;
-      record.fullPrimeCleanCount = 0;
-      record.recoveryCleanCount = 0;
-      this._persist();
-      return;
-    }
-    const cleanFullPrime = observation.cleanFullPrime === true;
-    if (record.disabled) {
-      record.recoveryCleanCount = cleanFullPrime ? record.recoveryCleanCount + 1 : 0;
-      if (record.recoveryCleanCount >= 3) {
-        record.disabled = false;
-        record.warmEligible = true;
-        record.fullPrimeCleanCount = 2;
-        record.recoveryCleanCount = 0;
-      }
-    } else if (!record.warmEligible) {
-      record.fullPrimeCleanCount = cleanFullPrime ? record.fullPrimeCleanCount + 1 : 0;
-      if (record.fullPrimeCleanCount >= 2) record.warmEligible = true;
-    }
-    this._persist();
-  }
-}
 export class S2sWsRealtimeClient extends EventTarget {
   /** @param {WsClientOptions} options */
   constructor(options) {
@@ -718,20 +331,12 @@ export class S2sWsRealtimeClient extends EventTarget {
     /** @type {NoiseGate} Mic noise gate; off by default. */
     this._noiseGate = options.noiseGate ?? { enabled: false, thresholdDb: -45 };
     /** @type {EchoGuardMode} */
-    this._echoGuard = options.echoGuard ?? "adaptive";
+    this._echoGuard = options.echoGuard ?? "native";
     /** @type {Record<string, EchoCalibration>} */
-    this._echoCalibrations = sanitizeEchoCalibrations(options.echoCalibrations);
-    this._echoRouteKey = "";
-    this._echoRouteEpoch = 0;
-    this._echoRouteSerial = 0;
-    this._echoRouteState = "pending";
-    this._echoCalibrationCollector = new EchoRouteCalibration();
-    this._echoCalibrationResult = this._echoCalibrationCollector.result();
-    /** @type {EchoCalibration} */
-    this._echoCalibration = normalizeEchoCalibration(null);
-    this._echoOutputLatencyMs = 0;
-    this._echoDeviceChangeListener = null;
-    this._echoSinkChangeListener = null;
+    this._echoCalibrations = options.echoCalibrations ?? {};
+    this._echoDevicePair = "";
+    /** @type {EchoCalibration | null} */
+    this._echoCalibration = null;
     this._aec3Status = null;
     /** @type {WebSocket | null} */
     this._ws = null;
@@ -745,40 +350,61 @@ export class S2sWsRealtimeClient extends EventTarget {
     this._playbackNode = null;
     this._playbackGeneration = 0;
     this._playbackGenerationInvalidated = false;
+    // The browser only changes this after the server commits a local-pipeline
+    // update.  Mic/VAD capture remains independently fixed at 16 kHz.
+    this._playbackSampleRate = DEFAULT_OUTPUT_SAMPLE_RATE;
     this._playbackPrimeMs = 0;
-    this._playbackCeilingMs = 0;
-    this._playbackRuntimeIdentity = "";
-    this._playbackLearning = new AdaptivePlaybackPolicyStore();
-    this._playbackClock = () => performance.now();
-    this._playbackTurnSerial = 0;
-    this._activePlaybackTurn = null;
-    this._anonymousPlaybackResponseId = "";
-    this._anonymousPlaybackSerial = 0;
-    this._acknowledgedPlaybackSignature = resolveAdaptivePlaybackSignature({}, {}, "", false);
-    this._lastAcknowledgedPipelineConfig = {};
+    this._adaptivePlaybackPrimeMs = 0;
+    this._playbackContinuityMode = PLAYBACK_CONTINUITY_ADAPTIVE;
+    this._playbackUnsustainable = false;
+    this._healthyPlaybackResponses = 0;
+    // Monotonic browser-side identity for one acknowledged playback policy.
+    // Profile revision alone is insufficient because unsaved session overrides
+    // may alter first-block priming without changing the persisted revision.
+    this._playbackConfigToken = 0;
+    this._latestInputEpoch = -1;
+    this._latestResponseEpoch = -1;
+    /** @type {{ inputEpoch: number | null, effectiveInterrupt: boolean, reason: string } | null} */
+    this._pendingSpeechStartDecision = null;
     /** @type {PlaybackConfig} */
     this._acknowledgedPlaybackConfig = {
       provider: "",
       profileId: "",
-      profileRevision: "",
-      model: "",
-      clone: "",
+      profileRevision: null,
       nativeStreaming: false,
       resolvedPrimeMs: 0,
-      firstBlockFrames: 0,
-      steadyBlockFrames: 0,
-      outputRate: OUTPUT_SAMPLE_RATE,
     };
-    /** @type {{ expectedProvider: string, expectedProfile: string, hint: PlaybackConfig }[]} */
+    /** @type {{ expectedProvider: string, expectedProfile: string, expectedRevision: number | null, hint: PlaybackConfig }[]} */
     this._pendingPlaybackConfigs = [];
-    /** @type {Map<string, Record<string, any>>} */
+    /** @type {Map<string, { generation: number, primeMs: number, reprimeMs: number, continuityMode: string, nativeStreaming: boolean, maxPrimeMs: number, provider: string, profileId: string, profileRevision: number | null, responseEpoch: number | null, sourceSampleRate: number, audioStarted: boolean, ended: boolean, playbackAcked: boolean, playbackDrained: boolean, playbackCleared: boolean, clearReason: string, drainAudible: boolean, playbackUnsustainable: boolean, hadUnderrun: boolean, terminal: boolean, terminalSettled: boolean, pendingTerminalDetail: Record<string, any> | null }>} */
     this._playbackByResponse = new Map();
-    /** @type {Map<string, Record<string, any>>} Completed network responses awaiting worklet drain. */
-    this._completedPlaybackResponses = new Map();
-    /** @type {Set<string>} Response IDs observed through response.created and not yet terminal. */
-    this._openPlaybackResponseIds = new Set();
+    /**
+     * Frozen lifecycle playback policy awaiting a response ID. Ownership is
+     * claimed before `response.created`, so a live config acknowledgement in
+     * that gap must not retime or re-prime an already-owned response.
+      * @type {Map<number, { sourceSampleRate: number, primeMs: number, continuityMode: string, nativeStreaming: boolean, maxPrimeMs: number, provider: string, profileId: string }>}
+     */
+    this._playbackPolicyByResponseEpoch = new Map();
     /** @type {Set<string>} Bounded completed/cancelled response IDs. */
     this._stalePlaybackResponses = new Set();
+    /** @type {Set<string>} Response terminal IDs already delivered to the UI.
+     * A repeated response.done must not settle or roll back a later user turn. */
+    this._terminalResponseIds = new Set();
+    /** @type {Set<string>} Per-connection call IDs already dispatched to the UI.
+     * Realtime peers may replay a completed function-call event after its output
+     * acknowledgement; never run an external browser tool twice for that ID. */
+    this._toolCallTombstones = new Set();
+    /** @type {Set<string>} Response IDs that committed a tool transaction.
+     * Their origin user history is durable even when the response produced no PCM. */
+    this._toolCommittedResponses = new Set();
+    /** @type {Set<string>} Epoch-only terminal lifecycle events already settled.
+     * A response can fail before OpenAI allocates an ID; do not repeatedly roll
+     * back the same provisional user row if transport cleanup repeats it. */
+    this._terminalResponseEpochs = new Set();
+    /** @type {Set<number>} Epoch tombstones reject stale PCM even before a
+     * successor response is claimed. Response IDs are absent on one early
+     * cancellation path, so an ID-only tombstone is insufficient. */
+    this._cancelledResponseEpochs = new Set();
     /** @type {GainNode | null} */
     this._captureSink = null;
     /** @type {AnalyserNode | null} */
@@ -889,10 +515,16 @@ export class S2sWsRealtimeClient extends EventTarget {
           || hint?.profileId
           || (sameProvider ? this._acknowledgedPlaybackConfig.profileId : ""),
       ),
+      profileRevision: _normaliseProfileRevision(
+        config.tts_tuning?.profile_revision
+          ?? hint?.profileRevision
+          ?? (sameProvider ? this._acknowledgedPlaybackConfig.profileRevision : null),
+      ),
     };
     this._pendingPlaybackConfigs.push({
       expectedProvider: requestedProvider,
       expectedProfile: _normaliseProfileId(effectiveHint.profileId),
+      expectedRevision: _normaliseProfileRevision(effectiveHint.profileRevision),
       hint: effectiveHint,
     });
     // A page should have at most one update awaiting acknowledgement. Keep a
@@ -900,39 +532,86 @@ export class S2sWsRealtimeClient extends EventTarget {
     if (this._pendingPlaybackConfigs.length > 16) this._pendingPlaybackConfigs.shift();
   }
 
+  /**
+   * Build the bounded local extension that the server freezes at response
+   * admission. This is deliberately part of pipeline.config.update, never an
+   * OpenAI session audio-format field. The server validates and echoes it.
+   * @param {Record<string, any>} config
+   * @param {PlaybackConfig | null | undefined} hint
+   */
+  _requestedPlaybackPolicy(config, hint) {
+    const provider = _normalisePlaybackProvider(
+      config.tts_backend || hint?.provider || this._acknowledgedPlaybackConfig.provider,
+    );
+    const nativeStreaming = provider === "qwen3tts-audiocpp" && hint?.nativeStreaming === true;
+    const sourceSampleRate = provider === "qwen3tts-audiocpp" ? 24_000 : DEFAULT_OUTPUT_SAMPLE_RATE;
+    const continuityMode = _continuityMode(hint?.continuityMode);
+    const primeMs = provider === "qwen3tts-audiocpp"
+      ? resolvePlaybackPrimeMs(
+        { ...config, tts_backend: provider, audio_output_sample_rate: sourceSampleRate },
+        { ...hint, provider, nativeStreaming, continuityMode },
+      )
+      : 0;
+    return {
+      prime_target_ms: Math.max(0, Math.min(MAX_PLAYBACK_PRIME_MS, Math.round(primeMs))),
+      continuity_mode: continuityMode,
+      native_streaming: nativeStreaming,
+      max_prime_ms: MAX_PLAYBACK_PRIME_MS,
+    };
+  }
+
   /** Apply browser playback policy only after the backend committed the config. */
   /** @param {Record<string, any>} config */
   _applyAcknowledgedPlaybackConfig(config) {
     const provider = _normalisePlaybackProvider(config.tts_backend);
     const profileId = _normaliseProfileId(config.tts_tuning?.profile_id);
-    const pendingIndex = this._pendingPlaybackConfigs.findIndex((pending) => (
+    const profileRevision = _normaliseProfileRevision(config.tts_tuning?.profile_revision);
+    let pendingIndex = this._pendingPlaybackConfigs.findIndex((pending) => (
       pending.expectedProvider === provider
       && (!pending.expectedProfile || pending.expectedProfile === profileId)
+      && (pending.expectedRevision === null || pending.expectedRevision === profileRevision)
     ));
-    const orderedAck = pendingIndex === 0;
+    if (pendingIndex < 0 && this._pendingPlaybackConfigs.length === 1) pendingIndex = 0;
     const pending = pendingIndex >= 0
-      ? this._pendingPlaybackConfigs.splice(0, pendingIndex + 1).at(-1)
-      : this._pendingPlaybackConfigs.shift() || null;
+      ? this._pendingPlaybackConfigs.splice(pendingIndex, 1)[0]
+      : null;
     const canReuseAcknowledged = provider === this._acknowledgedPlaybackConfig.provider;
     const hint = {
       ...(canReuseAcknowledged ? this._acknowledgedPlaybackConfig : {}),
       ...(pending?.hint || {}),
       provider,
       profileId: profileId || pending?.hint?.profileId || "",
+      profileRevision: profileRevision ?? pending?.hint?.profileRevision ?? null,
     };
-    const previousKey = this._acknowledgedPlaybackSignature.key;
-    const signature = resolveAdaptivePlaybackSignature(
-      config,
-      hint,
-      this._playbackRuntimeIdentity,
-      orderedAck,
+    const configuredRate = Number(config.audio_output_sample_rate);
+    const acknowledgedRate = Number.isInteger(configuredRate) && configuredRate > 0
+      ? configuredRate
+      : DEFAULT_OUTPUT_SAMPLE_RATE;
+    const serverPolicy = _lifecyclePlaybackPolicy(
+      { playback_policy: config.playback_policy ?? config.playbackPolicy },
+      acknowledgedRate,
     );
-    const policy = this._playbackLearning.policy(signature);
-    this._acknowledgedPlaybackConfig = hint;
-    this._acknowledgedPlaybackSignature = signature;
-    this._lastAcknowledgedPipelineConfig = { ...config };
-    this._playbackPrimeMs = policy.targetMs;
-    this._playbackCeilingMs = policy.ceilingMs;
+    const primeMs = serverPolicy?.primeMs ?? resolvePlaybackPrimeMs(config, hint);
+    this._playbackConfigToken += 1;
+    this._acknowledgedPlaybackConfig = {
+      ...hint,
+      nativeStreaming: serverPolicy?.nativeStreaming ?? hint.nativeStreaming,
+      configToken: this._playbackConfigToken,
+    };
+    this._playbackSampleRate = serverPolicy?.sourceSampleRate ?? acknowledgedRate;
+    // Reconfigure in place so an already-created worklet always uses the
+    // server-acknowledged source clock. This changes only interpolation into
+    // the AudioContext; it never time-stretches, pitches, or rewrites PCM.
+    this._playbackNode?.port.postMessage({
+      kind: "config",
+      inputRate: this._playbackSampleRate,
+      generation: this._playbackGeneration,
+    });
+    this._playbackPrimeMs = primeMs;
+    this._playbackContinuityMode = serverPolicy?.continuityMode ?? _continuityMode(hint.continuityMode);
+    this._adaptivePlaybackPrimeMs = primeMs;
+    this._playbackUnsustainable = false;
+    this._healthyPlaybackResponses = 0;
     this.dispatchEvent(new CustomEvent("pipeline-metric", {
       detail: {
         stage: "playback",
@@ -941,169 +620,325 @@ export class S2sWsRealtimeClient extends EventTarget {
         detail: {
           provider,
           profile_id: hint.profileId || null,
+          profile_revision: hint.profileRevision ?? null,
           native_streaming: hint.nativeStreaming === true,
-          prime_target_ms: policy.targetMs,
-          prime_ceiling_ms: policy.ceilingMs,
-          cold_ceiling_ms: policy.ceilingMs,
-          effective_target_ms: policy.targetMs,
-          safe_start_mode: policy.mode,
-          latest_logical_block_gap_ms: null,
-          logical_block_gap_p95_ms: policy.gapP95Ms,
-          jitter_margin_ms: policy.jitterMarginMs,
-          fallback_reason: policy.fallbackReason,
-          signature_valid: signature.valid,
-          signature_reset: !!previousKey && previousKey !== signature.key,
+          source_sample_rate: this._playbackSampleRate,
+          continuity_mode: this._playbackContinuityMode,
+          prime_target_ms: primeMs,
           acknowledged: true,
         },
       },
     }));
   }
 
-  _freezePlaybackTurnPolicy() {
-    this._playbackTurnSerial += 1;
-    const policy = this._playbackLearning.policy(this._acknowledgedPlaybackSignature);
-    this._activePlaybackTurn = Object.freeze({
-      id: this._playbackTurnSerial,
-      generation: this._playbackGeneration,
-      policy,
-    });
-    this._anonymousPlaybackResponseId = "";
-    return this._activePlaybackTurn;
+  /** @param {number | null} lifecycleRate */
+  _capturePlaybackPolicy(lifecycleRate = null) {
+    const sourceSampleRate = lifecycleRate ?? this._playbackSampleRate;
+    const continuityMode = this._playbackContinuityMode;
+    return {
+      sourceSampleRate,
+      primeMs: continuityMode === PLAYBACK_CONTINUITY_ADAPTIVE
+        ? Math.max(this._playbackPrimeMs, this._adaptivePlaybackPrimeMs)
+        : this._playbackPrimeMs,
+      continuityMode,
+      nativeStreaming: this._acknowledgedPlaybackConfig.nativeStreaming === true,
+      maxPrimeMs: MAX_PLAYBACK_PRIME_MS,
+      provider: _normalisePlaybackProvider(this._acknowledgedPlaybackConfig.provider),
+      profileId: _normaliseProfileId(this._acknowledgedPlaybackConfig.profileId),
+      profileRevision: _normaliseProfileRevision(this._acknowledgedPlaybackConfig.profileRevision),
+      configPrimeMs: this._playbackPrimeMs,
+      configToken: this._playbackConfigToken,
+    };
   }
 
-  _conservativePlaybackPolicy() {
-    const signature = this._acknowledgedPlaybackSignature;
-    if (!signature.eligible) {
-      return Object.freeze({
-        learning: false,
-        signatureKey: "",
-        mode: "immediate",
-        targetMs: 0,
-        ceilingMs: 0,
-        firstMs: 0,
-        gapP95Ms: 0,
-        firstBlockSamples: 0,
-        steadyBlockSamples: 0,
-        jitterMarginMs: PLAYBACK_WARM_GAP_MARGIN_MS,
-        fallbackReason: "non_native_or_buffered",
-      });
+  /**
+   * Capture policy once at response ownership, before a response ID exists.
+   * A later provider/profile acknowledgement is next-response-only; it cannot
+   * change the old response's source clock or startup reservoir.
+   * @param {number | null} responseEpoch
+   * @param {number | null} lifecycleRate
+   * @param {string} responseId
+   */
+  _captureLifecyclePlaybackPolicy(responseEpoch, lifecycleRate, responseId = "", serverPolicy = null) {
+    if (responseEpoch === null) return null;
+    let policy = this._playbackPolicyByResponseEpoch.get(responseEpoch);
+    if (!policy) {
+      // The server's admission snapshot is the authoritative ordering boundary.
+      // The browser-local default is only a compatibility fallback for older
+      // servers that did not yet include playback_policy in pipeline.response.
+      const fallbackPolicy = this._capturePlaybackPolicy(lifecycleRate);
+      if (serverPolicy) {
+        const provider = serverPolicy.provider || fallbackPolicy.provider;
+        const profileId = serverPolicy.profileId || fallbackPolicy.profileId;
+        const profileRevision = serverPolicy.profileRevision ?? fallbackPolicy.profileRevision;
+        const sameAcknowledgedConfig = (
+          _normalisePlaybackProvider(provider) === _normalisePlaybackProvider(fallbackPolicy.provider)
+          && _normaliseProfileId(profileId) === _normaliseProfileId(fallbackPolicy.profileId)
+          && _normaliseProfileRevision(profileRevision)
+            === _normaliseProfileRevision(fallbackPolicy.profileRevision)
+          && serverPolicy.continuityMode === fallbackPolicy.continuityMode
+          && serverPolicy.nativeStreaming === fallbackPolicy.nativeStreaming
+          && Number(serverPolicy.primeMs) === Number(fallbackPolicy.configPrimeMs)
+        );
+        policy = {
+          ...fallbackPolicy,
+          ...serverPolicy,
+          // Older lifecycle payloads froze the transport fields but did not
+          // name their provider/profile. Preserve the admission-time browser
+          // identity rather than leaving late feedback unscoped.
+          provider,
+          profileId,
+          profileRevision,
+          // The server owns the immutable base policy. Browser learning may
+          // raise only the response reservoir, and only for the exact same
+          // acknowledged configuration. A provider/profile/session-override
+          // switch must start from its own target.
+          primeMs: sameAcknowledgedConfig
+            && serverPolicy.continuityMode === PLAYBACK_CONTINUITY_ADAPTIVE
+            ? Math.max(serverPolicy.primeMs, this._adaptivePlaybackPrimeMs)
+            : serverPolicy.primeMs,
+          configPrimeMs: serverPolicy.primeMs,
+          configToken: sameAcknowledgedConfig ? fallbackPolicy.configToken : -1,
+        };
+      } else {
+        policy = fallbackPolicy;
+      }
+      this._playbackPolicyByResponseEpoch.set(responseEpoch, policy);
     }
-    return Object.freeze({
-      learning: false,
-      signatureKey: "",
-      mode: "conservative",
-      targetMs: signature.ceilingMs,
-      ceilingMs: signature.ceilingMs,
-      firstMs: signature.firstMs,
-      gapP95Ms: 0,
-      firstBlockSamples: 0,
-      steadyBlockSamples: 0,
-      jitterMarginMs: PLAYBACK_WARM_GAP_MARGIN_MS,
-      fallbackReason: "response_identity_unordered",
-    });
+    const snapshot = responseId ? this._playbackByResponse.get(responseId) : null;
+    // A delayed lifecycle event may repair an unstarted fallback snapshot, but
+    // never mutate PCM already handed to the worklet.
+    if (snapshot && !snapshot.audioStarted) {
+      snapshot.sourceSampleRate = policy.sourceSampleRate;
+      snapshot.primeMs = policy.primeMs;
+      snapshot.reprimeMs = policy.continuityMode === PLAYBACK_CONTINUITY_ADAPTIVE && policy.primeMs > 0
+        ? Math.min(policy.maxPrimeMs, Math.max(80, Math.min(policy.primeMs, 240)))
+        : policy.primeMs;
+      snapshot.continuityMode = policy.continuityMode;
+      snapshot.nativeStreaming = policy.nativeStreaming;
+      snapshot.maxPrimeMs = policy.maxPrimeMs;
+      snapshot.provider = policy.provider;
+      snapshot.profileId = policy.profileId;
+      snapshot.profileRevision = policy.profileRevision;
+      snapshot.configPrimeMs = policy.configPrimeMs;
+      snapshot.configToken = policy.configToken;
+    }
+    return policy;
   }
 
-  /** @param {string} responseId @param {boolean} [ordered] */
-  _playbackSnapshot(responseId, ordered = true) {
+  /** @param {string} responseId @param {number | null} [responseEpoch] */
+  _playbackSnapshot(responseId, responseEpoch = null) {
     if (responseId) {
-      const existing = this._playbackByResponse.get(responseId)
-        || this._completedPlaybackResponses.get(responseId);
-      if (existing) return existing;
+      const existing = this._playbackByResponse.get(responseId);
+      if (existing) {
+        if (existing.responseEpoch === null && responseEpoch !== null) existing.responseEpoch = responseEpoch;
+        return existing;
+      }
     }
-    const turn = this._activePlaybackTurn;
-    const identityOrdered = ordered
-      && !!turn
-      && turn.generation === this._playbackGeneration;
-    const policy = identityOrdered ? turn.policy : this._conservativePlaybackPolicy();
-    const targetSamples = Math.ceil((policy.targetMs * OUTPUT_SAMPLE_RATE) / 1_000);
-    const ceilingSamples = Math.ceil((policy.ceilingMs * OUTPUT_SAMPLE_RATE) / 1_000);
+    const frozenPolicy = responseEpoch === null
+      ? null
+      : this._playbackPolicyByResponseEpoch.get(responseEpoch) ?? null;
+    if (responseEpoch !== null) this._playbackPolicyByResponseEpoch.delete(responseEpoch);
+    const policy = frozenPolicy ?? this._capturePlaybackPolicy();
     const snapshot = {
       generation: this._playbackGeneration,
-      turnId: turn?.id || 0,
-      policy,
-      primeMs: policy.targetMs,
-      ceilingMs: policy.ceilingMs,
-      targetSamples,
-      ceilingSamples,
+      primeMs: policy.primeMs,
+      // Cold startup may require a larger reservoir. A genuine underrun
+      // recovers from this bounded steady-state target instead of replaying
+      // the first-response delay.
+      reprimeMs: policy.continuityMode === PLAYBACK_CONTINUITY_ADAPTIVE && policy.primeMs > 0
+        ? Math.min(policy.maxPrimeMs, Math.max(80, Math.min(policy.primeMs, 240)))
+        : policy.primeMs,
+      continuityMode: policy.continuityMode,
+      nativeStreaming: policy.nativeStreaming,
+      maxPrimeMs: policy.maxPrimeMs,
+      provider: policy.provider,
+      profileId: policy.profileId,
+      profileRevision: policy.profileRevision,
+      configPrimeMs: policy.configPrimeMs,
+      configToken: policy.configToken,
+      responseEpoch,
+      // Clock and reservoir are immutable for this response. A live provider
+      // switch may acknowledge different defaults while this response remains
+      // queued, but must never change its pitch, duration, or priming policy.
+      sourceSampleRate: policy.sourceSampleRate,
+      // Once PCM has been queued, an out-of-order lifecycle event may not
+      // change the source clock underneath audio already in the worklet FIFO.
+      audioStarted: false,
       ended: false,
-      inputSamples: 0,
-      chunkCount: 0,
-      gaps: [],
-      logicalBlockCount: 0,
-      nextLogicalBoundarySamples: policy.firstBlockSamples,
-      lastLogicalBlockAt: null,
-      latestLogicalBlockGapMs: null,
-      ordered: identityOrdered,
-      networkDone: false,
-      responseStatus: "",
-      workletDrained: false,
-      forcedShort: false,
-      underrun: false,
-      cancelled: false,
-      learningRecorded: false,
+      playbackAcked: false,
+      playbackDrained: false,
+      playbackCleared: false,
+      clearReason: "",
+      drainAudible: false,
+      playbackUnsustainable: false,
+      hadUnderrun: false,
+      // A completed protocol response can still be priming in the worklet.
+      // Keep it addressable until `started`/`drained`; network completion is
+      // deliberately not evidence of audible playback.
+      terminal: false,
+      // `response.done` can race the worklet's first rendered sample. Keep the
+      // terminal transaction here until a concrete started/drained/cleared
+      // result decides whether it was actually heard.
+      terminalSettled: false,
+      pendingTerminalDetail: null,
     };
+    snapshot.playbackUnsustainable = this._playbackUnsustainable
+      && this._playbackFeedbackMatches(snapshot);
     if (responseId) this._playbackByResponse.set(responseId, snapshot);
     return snapshot;
   }
 
-  /** @param {string} responseId */
-  _resolvePlaybackResponseId(responseId) {
-    if (typeof responseId === "string" && responseId) return responseId;
-    if (!this._anonymousPlaybackResponseId) {
-      this._anonymousPlaybackSerial += 1;
-      this._anonymousPlaybackResponseId = (
-        `anonymous-${this._playbackGeneration}-${this._playbackTurnSerial}-${this._anonymousPlaybackSerial}`
-      );
-    }
-    return this._anonymousPlaybackResponseId;
+  /** Bind the local lifecycle event emitted after response.created. */
+  _bindPlaybackResponseEpoch(responseId, responseEpoch) {
+    if (!responseId || !this._acceptResponseEpoch(responseEpoch)) return false;
+    const snapshot = this._playbackSnapshot(responseId, responseEpoch);
+    if (snapshot.responseEpoch !== null && responseEpoch !== null && snapshot.responseEpoch !== responseEpoch) return false;
+    snapshot.responseEpoch = responseEpoch;
+    return true;
   }
 
-  /** @param {string} responseId */
-  _markPlaybackResponseUnordered(responseId) {
-    const resolvedId = this._resolvePlaybackResponseId(responseId);
-    const snapshot = this._playbackSnapshot(resolvedId, false);
-    snapshot.ordered = false;
-    snapshot.policy = this._conservativePlaybackPolicy();
-    snapshot.primeMs = snapshot.policy.targetMs;
-    snapshot.ceilingMs = snapshot.policy.ceilingMs;
-    snapshot.targetSamples = Math.ceil((snapshot.primeMs * OUTPUT_SAMPLE_RATE) / 1_000);
-    snapshot.ceilingSamples = Math.ceil((snapshot.ceilingMs * OUTPUT_SAMPLE_RATE) / 1_000);
-    snapshot.gaps = [];
-    snapshot.logicalBlockCount = 0;
-    snapshot.nextLogicalBoundarySamples = 0;
-    snapshot.lastLogicalBlockAt = null;
-    snapshot.latestLogicalBlockGapMs = null;
-    return { responseId: resolvedId, snapshot };
+  /** @param {number | null} epoch */
+  _isStaleResponseEpoch(epoch) {
+    return epoch !== null && (epoch < this._latestResponseEpoch || this._cancelledResponseEpochs.has(epoch));
   }
 
-  /** @param {string} responseId */
-  _finalizePlaybackLearning(responseId) {
-    const snapshot = this._playbackByResponse.get(responseId)
-      || this._completedPlaybackResponses.get(responseId);
-    if (!snapshot || !snapshot.networkDone || !snapshot.workletDrained) return;
-    if (!snapshot.learningRecorded) {
-      snapshot.learningRecorded = true;
-      const cleanFullPrime = (
-        snapshot.ordered
-        && snapshot.responseStatus === "completed"
-        && !snapshot.cancelled
-        && !snapshot.underrun
-        && !snapshot.forcedShort
-        && snapshot.policy.targetMs >= snapshot.policy.ceilingMs
-        && snapshot.inputSamples >= snapshot.ceilingSamples
-      );
-      if (snapshot.ordered
-          && snapshot.responseStatus === "completed"
-          && !snapshot.cancelled
-          && !snapshot.underrun
-          && !snapshot.forcedShort) {
-        this._playbackLearning.record(snapshot.policy, {
-          gaps: snapshot.gaps,
-          cleanFullPrime,
-        });
-      }
+  /**
+   * A newer response may be promoted after the old response is protocol
+   * complete while its already-admitted PCM is still draining from the browser
+   * FIFO. Accept lifecycle messages only for that exact surviving snapshot;
+   * network/model output continues to use the stricter monotonic epoch gate.
+   * @param {string} responseId
+   * @param {number | null} responseEpoch
+   * @param {number} generation
+   * @param {string} [kind]
+   */
+  _acceptQueuedPlaybackLifecycle(responseId, responseEpoch, generation, kind = "") {
+    if (!responseId || this._stalePlaybackResponses.has(responseId)) return false;
+    const snapshot = this._playbackByResponse.get(responseId);
+    if (!snapshot || Number(snapshot.generation) !== generation) return false;
+    if (snapshot.responseEpoch !== null && responseEpoch !== null
+        && snapshot.responseEpoch !== responseEpoch) return false;
+    // A worklet can render the first sample and post `started` immediately
+    // before a cross-thread barge-in clear, while the WebSocket cancellation
+    // reaches this task first. The exact surviving snapshot is proof of that
+    // already-rendered sample until a clear/drain says otherwise. This never
+    // admits more network PCM for the cancelled epoch.
+    if (kind === "started") {
+      return !snapshot.playbackCleared && !snapshot.playbackDrained;
     }
-    this._completedPlaybackResponses.delete(responseId);
+    if (kind === "drained") return true;
+    return responseEpoch === null || !this._cancelledResponseEpochs.has(responseEpoch);
+  }
+
+  /** @param {number | null} epoch */
+  _tombstoneResponseEpoch(epoch) {
+    if (epoch === null) return;
+    this._cancelledResponseEpochs.add(epoch);
+    while (this._cancelledResponseEpochs.size > MAX_PLAYBACK_RESPONSE_TOMBSTONES) {
+      const oldest = this._cancelledResponseEpochs.values().next().value;
+      if (oldest === undefined) break;
+      this._cancelledResponseEpochs.delete(oldest);
+    }
+  }
+
+  /** @param {number | null} epoch */
+  _acceptResponseEpoch(epoch) {
+    if (epoch === null) return true; // Compatibility for non-local peers.
+    if (this._isStaleResponseEpoch(epoch)) return false;
+    this._latestResponseEpoch = Math.max(this._latestResponseEpoch, epoch);
+    return true;
+  }
+
+  /**
+   * Resolve a response-bound event through its immutable playback snapshot.
+   * Compatible peers may omit response_epoch from late transcript frames, but
+   * a cleared older generation must never be rebound to the current response.
+   * @param {string} responseId
+   * @param {number | null} eventEpoch
+   */
+  _acceptResponseBoundEvent(responseId, eventEpoch) {
+    if (responseId && this._stalePlaybackResponses.has(responseId)) return false;
+    const snapshot = responseId ? this._playbackByResponse.get(responseId) ?? null : null;
+    if (snapshot && Number(snapshot.generation) < this._playbackGeneration) return false;
+    if (snapshot && snapshot.responseEpoch !== null && eventEpoch !== null
+        && snapshot.responseEpoch !== eventEpoch) return false;
+    return this._acceptResponseEpoch(eventEpoch ?? snapshot?.responseEpoch ?? null);
+  }
+
+  /** @param {number | null} epoch */
+  _acceptInputEpoch(epoch) {
+    if (epoch === null) return true;
+    if (epoch < this._latestInputEpoch) return false;
+    this._latestInputEpoch = Math.max(this._latestInputEpoch, epoch);
+    return true;
+  }
+
+  _playbackFeedbackMatches(snapshot) {
+    if (!snapshot || snapshot.continuityMode !== PLAYBACK_CONTINUITY_ADAPTIVE) return false;
+    return this._playbackContinuityMode === PLAYBACK_CONTINUITY_ADAPTIVE
+      && _normalisePlaybackProvider(snapshot.provider) === "qwen3tts-audiocpp"
+      && _normalisePlaybackProvider(snapshot.provider)
+        === _normalisePlaybackProvider(this._acknowledgedPlaybackConfig.provider)
+      && _normaliseProfileId(snapshot.profileId)
+        === _normaliseProfileId(this._acknowledgedPlaybackConfig.profileId)
+      && _normaliseProfileRevision(snapshot.profileRevision)
+        === _normaliseProfileRevision(this._acknowledgedPlaybackConfig.profileRevision)
+      && Number(snapshot.configPrimeMs) === Number(this._playbackPrimeMs)
+      && Number(snapshot.configToken) === Number(this._playbackConfigToken)
+      && (snapshot.nativeStreaming === true)
+        === (this._acknowledgedPlaybackConfig.nativeStreaming === true);
+  }
+
+  _raiseAdaptiveReserve(workletDetail = null, snapshot = null) {
+    if (!this._playbackFeedbackMatches(snapshot)) return;
+    const previous = this._adaptivePlaybackPrimeMs;
+    const observedGap = Number(workletDetail?.maxObservedChunkGapMs ?? workletDetail?.observedChunkGapMs);
+    const measuredReserve = Number.isFinite(observedGap) && observedGap > 0
+      ? Math.ceil(observedGap + 120)
+      : 0;
+    // Preserve the unclamped demand for the failure contract.  A first large
+    // gap may require more than the two-second safety ceiling; waiting for a
+    // second underrun before reporting that fact makes the diagnostics lie
+    // about the provider's realtime viability.
+    const requiredReserveMs = Math.max(
+      this._playbackPrimeMs,
+      previous + 160,
+      measuredReserve,
+    );
+    this._adaptivePlaybackPrimeMs = Math.min(
+      MAX_PLAYBACK_PRIME_MS,
+      requiredReserveMs,
+    );
+    if (requiredReserveMs > MAX_PLAYBACK_PRIME_MS) {
+      this._markPlaybackUnsustainable("reservoir_cap", snapshot);
+    }
+  }
+
+  /** @param {string} reason */
+  _markPlaybackUnsustainable(reason, snapshot = null) {
+    if (snapshot) snapshot.playbackUnsustainable = true;
+    if (snapshot && !this._playbackFeedbackMatches(snapshot)) return;
+    if (this._playbackUnsustainable) return;
+    this._playbackUnsustainable = true;
+    const provider = snapshot?.provider || this._acknowledgedPlaybackConfig.provider;
+    const nativeStreaming = snapshot?.nativeStreaming
+      ?? (this._acknowledgedPlaybackConfig.nativeStreaming === true);
+    this.dispatchEvent(new CustomEvent("pipeline-metric", {
+      detail: {
+        stage: "playback", status: "provider_unsustainable", source: "browser",
+        detail: {
+          reason, provider,
+          profile_id: snapshot?.profileId || this._acknowledgedPlaybackConfig.profileId || null,
+          continuity_mode: snapshot?.continuityMode || this._playbackContinuityMode,
+          adaptive_prime_target_ms: this._adaptivePlaybackPrimeMs,
+          max_prime_ms: MAX_PLAYBACK_PRIME_MS,
+          message: nativeStreaming
+            ? "Provider cannot sustain realtime; choose buffered phrase mode for reliable completion."
+            : "Provider cannot sustain progressive phrase playback within the two-second reservoir; use the explicit full-buffer fallback for reliable completion.",
+        },
+      },
+    }));
   }
 
   /** Retain a bounded tombstone so late PCM cannot recreate a current snapshot. */
@@ -1111,16 +946,18 @@ export class S2sWsRealtimeClient extends EventTarget {
   _retirePlaybackResponse(responseId) {
     if (!responseId) return;
     const snapshot = this._playbackByResponse.get(responseId);
-    if (snapshot) {
-      this._completedPlaybackResponses.delete(responseId);
-      this._completedPlaybackResponses.set(responseId, snapshot);
-      while (this._completedPlaybackResponses.size > MAX_PLAYBACK_RESPONSE_TOMBSTONES) {
-        const oldest = this._completedPlaybackResponses.keys().next().value;
-        if (!oldest) break;
-        this._completedPlaybackResponses.delete(oldest);
-      }
-    }
+    // A terminal response that never reached the worklet's first sample is
+    // unheard only once a drain/clear/retirement boundary is final.  Do this
+    // before dropping the snapshot so a late started event cannot revive it.
+    this._settleDeferredPlaybackTerminal(
+      responseId,
+      this._heardResponses.has(responseId),
+    );
     this._playbackByResponse.delete(responseId);
+    if (snapshot && snapshot.responseEpoch !== null) {
+      this._playbackPolicyByResponseEpoch.delete(snapshot.responseEpoch);
+      this._tombstoneResponseEpoch(snapshot.responseEpoch);
+    }
     this._stalePlaybackResponses.delete(responseId);
     this._stalePlaybackResponses.add(responseId);
     while (this._stalePlaybackResponses.size > MAX_PLAYBACK_RESPONSE_TOMBSTONES) {
@@ -1128,6 +965,69 @@ export class S2sWsRealtimeClient extends EventTarget {
       if (!oldest) break;
       this._stalePlaybackResponses.delete(oldest);
     }
+  }
+
+  /**
+   * Mark every response invalidated by one generation clear. A worklet clear
+   * may beat response.done during barge-in. Keep the exact cleared outcome
+   * until the protocol terminal settles the provisional ChatView transaction;
+   * otherwise the later cancellation appears stale and its row never closes.
+   */
+  /** @param {number} clearedGeneration */
+  /** @param {string} [reason] */
+  _retireClearedPlaybackGenerations(clearedGeneration, reason = "clear") {
+    if (!Number.isSafeInteger(clearedGeneration)) return;
+    for (const [responseId, snapshot] of [...this._playbackByResponse.entries()]) {
+      if (Number(snapshot?.generation) < clearedGeneration) {
+        snapshot.playbackDrained = true;
+        snapshot.playbackCleared = true;
+        snapshot.clearReason = reason;
+        snapshot.drainAudible = this._heardResponses.has(responseId);
+        const settled = this._settleDeferredPlaybackTerminal(
+          responseId,
+          snapshot.drainAudible,
+        );
+        if (snapshot.terminal || settled) this._retirePlaybackResponse(responseId);
+      }
+    }
+  }
+
+  /** @param {Set<string>} set @param {string} value @param {number} limit */
+  _rememberBounded(set, value, limit) {
+    if (!value || set.has(value)) return false;
+    set.add(value);
+    while (set.size > limit) {
+      const oldest = set.values().next().value;
+      if (!oldest) break;
+      set.delete(oldest);
+    }
+    return true;
+  }
+
+  /**
+   * Dispatch a response terminal exactly once after local playback has a
+   * definitive outcome.  `response.done` itself is protocol completion, not
+   * evidence that primed PCM was heard.
+   * @param {string} responseId
+   * @param {boolean} audible
+   * @returns {boolean}
+   */
+  _settleDeferredPlaybackTerminal(responseId, audible) {
+    if (!responseId) return false;
+    const snapshot = this._playbackByResponse.get(responseId);
+    const detail = snapshot?.pendingTerminalDetail;
+    if (!snapshot || !detail || snapshot.terminalSettled) return false;
+    snapshot.terminalSettled = true;
+    snapshot.pendingTerminalDetail = null;
+    this.dispatchEvent(new CustomEvent("response-finished", {
+      detail: { ...detail, audible: audible === true },
+    }));
+    return true;
+  }
+
+  /** @param {Record<string, any>} detail */
+  _dispatchResponseFinished(detail) {
+    this.dispatchEvent(new CustomEvent("response-finished", { detail }));
   }
 
   /** @param {string} responseId */
@@ -1140,7 +1040,8 @@ export class S2sWsRealtimeClient extends EventTarget {
       kind: "end",
       generation: snapshot.generation,
       streamId: responseId,
-      inputSamples: snapshot.inputSamples,
+      responseEpoch: snapshot.responseEpoch,
+      sourceSampleRate: snapshot.sourceSampleRate,
     });
   }
 
@@ -1150,11 +1051,6 @@ export class S2sWsRealtimeClient extends EventTarget {
     if (this._playbackGenerationInvalidated) return;
     this._playbackGeneration += 1;
     this._playbackGenerationInvalidated = true;
-    this._activePlaybackTurn = null;
-    this._anonymousPlaybackResponseId = "";
-    for (const snapshot of [...this._playbackByResponse.values(), ...this._completedPlaybackResponses.values()]) {
-      if (snapshot.generation < this._playbackGeneration) snapshot.cancelled = true;
-    }
     this._playbackNode?.port.postMessage({
       kind: "clear",
       generation: this._playbackGeneration,
@@ -1429,169 +1325,6 @@ export class S2sWsRealtimeClient extends EventTarget {
     };
   }
 
-  _currentOutputLatencyMs() {
-    const seconds = Number(this._ctx?.outputLatency);
-    return Number.isFinite(seconds) ? Math.max(0, Math.min(500, seconds * 1000)) : 0;
-  }
-
-  /**
-   * Resolve the current physical route and immediately reduce its identifiers
-   * to one domain-separated digest. Device IDs, group IDs, and labels never
-   * leave this stack frame or become object state.
-   * @param {AudioContext} ctx
-   * @param {MediaStreamTrack | undefined} micTrack
-   */
-  async _fingerprintCurrentEchoRoute(ctx, micTrack) {
-    const mediaDevices = globalThis.navigator?.mediaDevices;
-    let devices = [];
-    if (mediaDevices && typeof mediaDevices.enumerateDevices === "function") {
-      try {
-        devices = await mediaDevices.enumerateDevices();
-      } catch {
-        devices = [];
-      }
-    }
-    if (!devices.length) return "";
-    const micSettings = micTrack?.getSettings?.() || {};
-    const requestedMic = typeof micSettings.deviceId === "string" ? micSettings.deviceId : "";
-    if (!requestedMic) return "";
-    const micDevice = devices.find((device) => (
-      device.kind === "audioinput" && device.deviceId === requestedMic
-    ));
-    if (!micDevice) return "";
-
-    const requestedOutput = typeof ctx.sinkId === "string" && ctx.sinkId
-      ? ctx.sinkId
-      : "default";
-    const outputDevice = requestedOutput !== "default"
-      ? devices.find((device) => (
-        device.kind === "audiooutput" && device.deviceId === requestedOutput
-      ))
-      : devices.find((device) => (
-        device.kind === "audiooutput" && device.deviceId === "default"
-      ));
-    if (!outputDevice) return "";
-
-    const microphoneMaterial = [
-      requestedMic,
-      micDevice?.deviceId || "",
-      micDevice?.groupId || "",
-      micDevice?.label || "",
-    ].join("\u0000");
-    const outputMaterial = [
-      requestedOutput,
-      outputDevice?.deviceId || "",
-      outputDevice?.groupId || "",
-      outputDevice?.label || "",
-    ].join("\u0000");
-    return fingerprintEchoRoute(microphoneMaterial, outputMaterial);
-  }
-
-  _dispatchEchoStatus(extra = {}) {
-    const detail = {
-      ...(this._aec3Status || {}),
-      routeKey: this._echoRouteKey,
-      routeEpoch: this._echoRouteEpoch,
-      routeState: this._echoRouteState,
-      outputLatencyMs: this._currentOutputLatencyMs(),
-      calibration: this._echoCalibration,
-      calibrationResult: this._echoCalibrationResult,
-      ...extra,
-    };
-    this.dispatchEvent(new CustomEvent("echo-status", { detail }));
-  }
-
-  _postEchoCalibration() {
-    const outputLatencyMs = this._currentOutputLatencyMs();
-    this._echoOutputLatencyMs = outputLatencyMs;
-    this._captureNode?.port.postMessage({
-      kind: "echo_calibration",
-      ...this._echoCalibration,
-      outputLatencyMs,
-    });
-  }
-
-  /** @param {"initial"|"devicechange"|"sinkchange"} source */
-  async _refreshEchoRoute(source) {
-    const ctx = this._ctx;
-    if (!ctx || this._closed) return false;
-    const serial = ++this._echoRouteSerial;
-    const micTrack = this.options.micStream?.getAudioTracks?.()[0];
-    let routeKey = "";
-    try {
-      routeKey = await this._fingerprintCurrentEchoRoute(ctx, micTrack);
-    } catch {
-      routeKey = "";
-    }
-    if (this._closed || this._ctx !== ctx || serial !== this._echoRouteSerial) return false;
-
-    if (routeKey === this._echoRouteKey && this._echoRouteState !== "pending") {
-      this._echoRouteState = routeKey ? "ready" : "unavailable";
-      this._postEchoCalibration();
-      this._dispatchEchoStatus({ routeChange: `${source}_unchanged` });
-      return true;
-    }
-
-    this._echoRouteKey = routeKey;
-    this._echoRouteEpoch += 1;
-    this._echoRouteState = routeKey ? "ready" : "unavailable";
-    this._echoCalibrationCollector.reset();
-    this._echoCalibrationResult = this._echoCalibrationCollector.result({
-      outputLatencyMs: this._currentOutputLatencyMs(),
-    });
-    this._echoCalibration = normalizeEchoCalibration(
-      routeKey ? this._echoCalibrations[routeKey] : null,
-    );
-    this._captureNode?.port.postMessage({ kind: "echo_reset" });
-    this._postEchoCalibration();
-    this._dispatchEchoStatus({ routeChange: source });
-    return true;
-  }
-
-  _installEchoRouteListeners(ctx) {
-    const mediaDevices = globalThis.navigator?.mediaDevices;
-    this._echoDeviceChangeListener = () => {
-      void this._refreshEchoRoute("devicechange");
-    };
-    if (mediaDevices && typeof mediaDevices.addEventListener === "function") {
-      try {
-        mediaDevices.addEventListener("devicechange", this._echoDeviceChangeListener);
-      } catch {
-        // Sandboxed browsers may deny device notifications; initial routing remains valid.
-      }
-    }
-    this._echoSinkChangeListener = () => {
-      void this._refreshEchoRoute("sinkchange");
-    };
-    if (typeof ctx.addEventListener === "function") {
-      try {
-        ctx.addEventListener("sinkchange", this._echoSinkChangeListener);
-      } catch {
-        // AudioContext sink events are optional and can be blocked by the sandbox.
-      }
-    }
-  }
-
-  _removeEchoRouteListeners() {
-    const mediaDevices = globalThis.navigator?.mediaDevices;
-    if (this._echoDeviceChangeListener && mediaDevices?.removeEventListener) {
-      try {
-        mediaDevices.removeEventListener("devicechange", this._echoDeviceChangeListener);
-      } catch {
-        // ignored
-      }
-    }
-    if (this._echoSinkChangeListener && this._ctx?.removeEventListener) {
-      try {
-        this._ctx.removeEventListener("sinkchange", this._echoSinkChangeListener);
-      } catch {
-        // ignored
-      }
-    }
-    this._echoDeviceChangeListener = null;
-    this._echoSinkChangeListener = null;
-  }
-
   async _setupAudio() {
     // Prefer a context the caller already created + resumed inside the tap
     // gesture (required on iOS). Fall back to creating one here for callers
@@ -1613,14 +1346,25 @@ export class S2sWsRealtimeClient extends EventTarget {
 
     // The worklets live at the repo root, one level up from this module.
     const base = new URL("../worklets/", import.meta.url);
-    await ctx.audioWorklet.addModule(new URL("audio-playback.js?v=16-adaptive-safe-start", base).href);
+    await ctx.audioWorklet.addModule(new URL("audio-playback.js?v=16-epoch-continuity", base).href);
     const aec3 = await loadAec3Worklet(ctx);
     if (!aec3.available) {
-      await ctx.audioWorklet.addModule(new URL("mic-capture.js?v=14-stateful-polyphase", base).href);
+      await ctx.audioWorklet.addModule(new URL("mic-capture.js?v=12-aec3-fallback", base).href);
     }
 
     const micTrack = this.options.micStream?.getAudioTracks?.()[0];
-    await this._refreshEchoRoute("initial");
+    const micSettings = micTrack?.getSettings?.() || {};
+    const microphoneId = micSettings.deviceId || micTrack?.label || "default-microphone";
+    const outputId = typeof ctx.sinkId === "string" && ctx.sinkId
+      ? ctx.sinkId
+      : "default-output";
+    this._echoDevicePair = `${microphoneId}::${outputId}`;
+    this._echoCalibration = normalizeEchoCalibration(
+      this._echoCalibrations[this._echoDevicePair],
+    );
+    const outputLatencyMs = Number.isFinite(ctx.outputLatency)
+      ? Math.max(0, ctx.outputLatency * 1000)
+      : 0;
 
     const captureNode = new AudioWorkletNode(ctx, aec3.processorName, {
       numberOfInputs: 2,
@@ -1636,18 +1380,6 @@ export class S2sWsRealtimeClient extends EventTarget {
         // Raw pre-gate mic RMS for the Settings meter.
         this.dispatchEvent(new CustomEvent("input-level", { detail: { rms: data.rms } }));
       } else if (data?.kind === "echo_metric") {
-        const outputLatencyMs = this._currentOutputLatencyMs();
-        if (Math.abs(outputLatencyMs - this._echoOutputLatencyMs) >= 0.5) {
-          this._postEchoCalibration();
-        }
-        const doubleTalk = data.doubleTalk == null ? null : !!data.doubleTalk;
-        this._echoCalibrationCollector.add({
-          lagMs: data.lagMs,
-          timestampMs: performance.now(),
-          playbackActive: data.playbackActive === true,
-          doubleTalk,
-        });
-        this._echoCalibrationResult = this._echoCalibrationCollector.result({ outputLatencyMs });
         this.dispatchEvent(new CustomEvent("pipeline-metric", {
           detail: {
             stage: "echo_guard",
@@ -1666,50 +1398,53 @@ export class S2sWsRealtimeClient extends EventTarget {
               erle_db: Number.isFinite(data.erleDb) ? Number(data.erleDb) : null,
               lag_ms: Number.isFinite(data.lagMs) ? Number(data.lagMs) : null,
               output_latency_ms: outputLatencyMs,
-              route_epoch: this._echoRouteEpoch,
-              calibration_accepted: this._echoCalibrationResult.accepted,
-              calibration_reason: this._echoCalibrationResult.reason,
-              calibration_samples: this._echoCalibrationResult.sampleCount,
-              calibration_span_ms: this._echoCalibrationResult.spanMs,
-              calibration_median_ms: this._echoCalibrationResult.medianMs,
-              calibration_p95_ms: this._echoCalibrationResult.p95Ms,
-              calibration_jitter_ms: this._echoCalibrationResult.jitterMs,
+              device_pair: this._echoDevicePair,
               model_ready: !!data.modelReady,
               prediction_confidence: Number.isFinite(data.predictionConfidence)
                 ? Number(data.predictionConfidence)
                 : null,
               candidate_ms: Number(data.candidateMs || 0),
               suppressed_ms: Number(data.suppressedMs || 0),
-              double_talk: doubleTalk,
+              double_talk: data.doubleTalk == null ? null : !!data.doubleTalk,
               double_talk_source: data.doubleTalkSource || null,
               playback_active: !!data.playbackActive,
             },
           },
         }));
-        this._dispatchEchoStatus();
       } else if (data?.kind === "aec3_status") {
         this._aec3Status = {
           ...data,
+          devicePair: this._echoDevicePair,
+          outputLatencyMs,
+          calibration: this._echoCalibration,
           loaderAvailable: aec3.available,
           loaderReason: aec3.reason || "",
         };
-        this._dispatchEchoStatus();
+        this.dispatchEvent(new CustomEvent("echo-status", { detail: this._aec3Status }));
       } else if (data?.kind === "aec3_error") {
-        this._dispatchEchoStatus({
-          available: false,
-          requestedMode: this._echoGuard,
-          effectiveMode: this._echoGuard === "strict" ? "strict-fallback" : "native",
-          error: "AEC3 worklet failed",
-        });
+        this.dispatchEvent(new CustomEvent("echo-status", {
+          detail: {
+            available: false,
+            requestedMode: this._echoGuard,
+            effectiveMode: this._echoGuard === "strict" ? "strict-fallback" : "native",
+            devicePair: this._echoDevicePair,
+            outputLatencyMs,
+            calibration: this._echoCalibration,
+            error: data.error || "AEC3 worklet failed",
+          },
+        }));
       }
     };
-    this._captureNode = captureNode;
     // Push the initial gate config now that the worklet exists.
     captureNode.port.postMessage({ kind: "gate", ...this._noiseGate });
     const nativeAec = !!micTrack?.getSettings?.().echoCancellation;
     captureNode.port.postMessage({ kind: "echo_guard", mode: this._echoGuard, nativeAec });
-    this._postEchoCalibration();
-    this._installEchoRouteListeners(ctx);
+    captureNode.port.postMessage({
+      kind: "echo_calibration",
+      ...this._echoCalibration,
+      outputLatencyMs,
+    });
+    this._captureNode = captureNode;
 
     const micSrc = ctx.createMediaStreamSource(this.options.micStream);
     micSrc.connect(captureNode);
@@ -1730,7 +1465,7 @@ export class S2sWsRealtimeClient extends EventTarget {
     });
     playbackNode.port.postMessage({
       kind: "config",
-      inputRate: OUTPUT_SAMPLE_RATE,
+      inputRate: this._playbackSampleRate,
       generation: this._playbackGeneration,
     });
     playbackNode.port.onmessage = (e) => this._onPlaybackMessage(e.data);
@@ -1781,42 +1516,84 @@ export class S2sWsRealtimeClient extends EventTarget {
   _onPlaybackMessage(data) {
     if (this._closed) return;
     const generation = Number(data?.generation);
+    const streamId = typeof data?.streamId === "string" ? data.streamId : "";
+    const playbackSnapshot = streamId ? this._playbackByResponse.get(streamId) : null;
+    const queuedLifecycleAccepted = Number.isSafeInteger(generation)
+      && this._acceptQueuedPlaybackLifecycle(
+        streamId,
+        _responseEpoch({ response_epoch: data?.responseEpoch }),
+        generation,
+        data?.kind,
+      );
     if (Number.isSafeInteger(generation)
         && generation !== this._playbackGeneration
-        && data?.kind !== "stale_chunk_rejected") return;
+        && data?.kind !== "stale_chunk_rejected"
+        && !queuedLifecycleAccepted) return;
     const queueDetail = {
       queued_ms: Number(data?.queuedMs || 0),
-      queued_samples: Number(data?.queuedSamples || 0),
       prime_target_ms: Number(data?.primeTargetMs || 0),
-      prime_ceiling_ms: Number(data?.primeCeilingMs || 0),
-      target_samples: Number(data?.targetSamples || 0),
-      ceiling_samples: Number(data?.ceilingSamples || 0),
-      input_samples: Number(data?.inputSamples || 0),
       generation: Number.isSafeInteger(generation) ? generation : this._playbackGeneration,
       state: data?.state || "unknown",
       underruns: Number(data?.underruns || 0),
       reprimes: Number(data?.reprimes || 0),
+      reprime_target_ms: Number(data?.reprimeTargetMs || 0),
+      observed_chunk_gap_ms: Number(data?.observedChunkGapMs || 0),
+      max_observed_chunk_gap_ms: Number(data?.maxObservedChunkGapMs || 0),
       stale_chunks: Number(data?.staleChunks || 0),
       clears: Number(data?.clears || 0),
+      // `Number(null)` is zero. Treat a worklet clear/drain without a single
+      // response owner as unscoped instead of incorrectly rejecting it as an
+      // obsolete epoch after any real response has played.
+      response_epoch: _responseEpoch({ response_epoch: data?.responseEpoch }),
+      continuity_mode: playbackSnapshot?.continuityMode || this._playbackContinuityMode,
+      provider: playbackSnapshot?.provider || this._acknowledgedPlaybackConfig.provider || null,
+      profile_id: playbackSnapshot?.profileId || this._acknowledgedPlaybackConfig.profileId || null,
+      adaptive_prime_target_ms: (
+        data?.reprimeTargetMs !== null
+        && data?.reprimeTargetMs !== undefined
+        && Number.isFinite(Number(data.reprimeTargetMs))
+      )
+        ? Number(data.reprimeTargetMs)
+        : playbackSnapshot && Number.isFinite(Number(playbackSnapshot.reprimeMs))
+          ? Number(playbackSnapshot.reprimeMs)
+          : streamId
+            ? null
+            : this._adaptivePlaybackPrimeMs,
+      // Do not attach the newly selected backend/profile's global health to a
+      // late metric from an older response snapshot.
+      provider_unsustainable: playbackSnapshot
+        ? playbackSnapshot.playbackUnsustainable === true
+        : null,
+      queue_empty: data?.queueEmpty !== false,
     };
-    const streamId = typeof data?.streamId === "string" ? data.streamId : "";
-    const snapshot = streamId
-      ? this._playbackByResponse.get(streamId) || this._completedPlaybackResponses.get(streamId)
-      : null;
-    queueDetail.safe_start_mode = snapshot?.policy?.mode || null;
-    queueDetail.turn_id = snapshot?.turnId || null;
-    queueDetail.cold_ceiling_ms = snapshot?.policy?.ceilingMs ?? Number(data?.primeCeilingMs || 0);
-    queueDetail.effective_target_ms = snapshot?.policy?.targetMs ?? Number(data?.primeTargetMs || 0);
-    queueDetail.latest_logical_block_gap_ms = snapshot?.latestLogicalBlockGapMs ?? null;
-    queueDetail.logical_block_gap_p95_ms = snapshot?.gaps?.length
-      ? _nearestRankP95(snapshot.gaps)
-      : (snapshot?.policy?.gapP95Ms ?? 0);
-    queueDetail.jitter_margin_ms = snapshot?.policy?.jitterMarginMs ?? PLAYBACK_WARM_GAP_MARGIN_MS;
-    queueDetail.fallback_reason = snapshot?.policy?.fallbackReason || "playback_snapshot_unavailable";
+    if (this._isStaleResponseEpoch(queueDetail.response_epoch)
+        && !queuedLifecycleAccepted
+        && !(data?.kind === "cleared" && queueDetail.generation === this._playbackGeneration)) return;
     if (data?.kind === "started") {
-      if (streamId && !this._stalePlaybackResponses.has(streamId)) {
-        this._heardResponses.add(streamId);
+      const snapshot = streamId ? this._playbackByResponse.get(streamId) : null;
+      // A completion may precede first rendered PCM. It remains valid only if
+      // the snapshot survives; cancelled/stale responses were retired and must
+      // never be revived by a delayed worklet message.
+      if (!streamId || this._stalePlaybackResponses.has(streamId) || !snapshot) return;
+      this._heardResponses.add(streamId);
+      if (!snapshot.playbackAcked) {
+        snapshot.playbackAcked = true;
+        this._send({
+          type: "pipeline.playback.started",
+          response_id: streamId,
+          response_epoch: snapshot.responseEpoch,
+        });
       }
+      // response.done may have arrived while this PCM was still primed. The
+      // first rendered sample is the only browser proof that its provisional
+      // chat transaction should be retained.
+      this._settleDeferredPlaybackTerminal(streamId, true);
+      // A worklet message can cross a barge-in on the main-thread queue. Its
+      // exact old response still needs an acknowledgement/history settlement,
+      // but it must not overwrite the successor's user-speaking state or
+      // first-playback metrics. Only the current playback generation owns
+      // global presentation state.
+      if (queueDetail.generation !== this._playbackGeneration) return;
       this._aiSpeaking = true;
       this._markPlaybackStarted();
       if (!this._firstPlaybackReported) {
@@ -1851,39 +1628,80 @@ export class S2sWsRealtimeClient extends EventTarget {
       return;
     }
     if (data?.kind === "underrun") {
-      if (snapshot) {
-        snapshot.underrun = true;
-        if (!snapshot.learningRecorded) {
-          this._playbackLearning.record(snapshot.policy, {
-            gaps: snapshot.gaps,
-            underrun: true,
-          });
-          snapshot.learningRecorded = true;
-        }
+      if (playbackSnapshot) playbackSnapshot.hadUnderrun = true;
+      if (this._playbackFeedbackMatches(playbackSnapshot)) {
+        this._healthyPlaybackResponses = 0;
       }
+      this._raiseAdaptiveReserve(data, playbackSnapshot);
       this.dispatchEvent(new CustomEvent("pipeline-metric", {
         detail: { stage: "playback", status: "underrun", source: "browser", detail: queueDetail },
       }));
       return;
     }
-    if ((data?.kind === "primed" || data?.kind === "reprimed") && snapshot && data.forced) {
-      snapshot.forcedShort = true;
+    if ((data?.kind === "primed" || data?.kind === "reprimed")
+        && playbackSnapshot?.hadUnderrun) {
+      // The cadence that caused an underrun is known only when a later chunk
+      // arrives. Re-evaluate on the re-prime diagnostic so a first gap beyond
+      // the two-second ceiling is reported without waiting for another loss.
+      this._raiseAdaptiveReserve(data, playbackSnapshot);
+      queueDetail.provider_unsustainable = playbackSnapshot.playbackUnsustainable === true;
     }
-    if ((data?.kind === "stream_drained" || data?.kind === "drained") && snapshot) {
-      snapshot.workletDrained = true;
-      if (data.cleared) snapshot.cancelled = true;
-      this._finalizePlaybackLearning(streamId);
-    }
-    if (data?.kind === "drained") {
+    if (data?.kind === "cleared") {
+      // A shared FIFO can contain multiple completed-but-unheard response
+      // streams. One generation clear invalidates all of them, even though the
+      // worklet's diagnostic can name only one active stream.
+      this._retireClearedPlaybackGenerations(
+        queueDetail.generation,
+        typeof data.reason === "string" && data.reason ? data.reason : "clear",
+      );
       this._aiSpeaking = false;
-      // A barge-in sets user-speaking before the clear reaches the worklet. Do
-      // not let the resulting drained event overwrite that newer microphone
-      // state; only retire an active playback status here.
       if (this._status === "ai-speaking") {
         this._setStatus(this._responseActive() ? "processing" : "connected");
       }
     }
-    if (["primed", "reprimed", "stream_drained", "drained", "cleared", "stale_chunk_rejected"].includes(data?.kind)) {
+    if (data?.kind === "drained") {
+      if (!data?.cleared && !playbackSnapshot?.hadUnderrun
+          && this._playbackFeedbackMatches(playbackSnapshot)) {
+        this._healthyPlaybackResponses += 1;
+        if (this._healthyPlaybackResponses >= 3 && this._adaptivePlaybackPrimeMs > this._playbackPrimeMs) {
+          this._adaptivePlaybackPrimeMs = Math.max(this._playbackPrimeMs, this._adaptivePlaybackPrimeMs - 80);
+          this._healthyPlaybackResponses = 0;
+        }
+      }
+      if (data?.queueEmpty !== false) {
+        this._aiSpeaking = false;
+        // A barge-in sets user-speaking before the clear reaches the worklet. Do
+        // not let the resulting drained event overwrite that newer microphone
+        // state; only retire an active playback status here.
+        if (this._status === "ai-speaking") {
+          this._setStatus(this._responseActive() ? "processing" : "connected");
+        }
+      }
+      // A terminal response stays retained through the final `started` event
+      // above. Draining is the definitive local playback boundary; late worklet
+      // messages after it must not create a second acknowledgement.
+      if (streamId) {
+        // Drained and cleared are the definitive negative outcome when no
+        // `started` message was seen. A later worklet start from this retired
+        // stream is rejected by the response tombstone.
+        const snapshot = this._playbackByResponse.get(streamId);
+        if (snapshot) {
+          snapshot.playbackDrained = true;
+          snapshot.drainAudible = this._heardResponses.has(streamId);
+        }
+        const settled = this._settleDeferredPlaybackTerminal(
+          streamId,
+          this._heardResponses.has(streamId),
+        );
+        // Audio can drain before response.done arrives. Keep that exact
+        // snapshot until the protocol terminal settles the provisional chat;
+        // otherwise tombstoning now would make the later terminal look stale.
+        if (!snapshot || snapshot.terminal || settled) {
+          this._retirePlaybackResponse(streamId);
+        }
+      }
+    }
+    if (["primed", "reprimed", "drained", "cleared", "stale_chunk_rejected"].includes(data?.kind)) {
       this.dispatchEvent(new CustomEvent("pipeline-metric", {
         detail: {
           stage: "playback",
@@ -1945,13 +1763,13 @@ export class S2sWsRealtimeClient extends EventTarget {
 
     const type = event?.type;
     if (typeof type !== "string") return;
-    // Opt-in content-free event tracing for diagnosing turn/transcript issues. Enable with
+    // Opt-in event tracing for diagnosing turn/transcript issues. Enable with
     // `localStorage.setItem("s2s.debug", "1")` in the browser console.
     if (this._debug) {
       const extra = type.startsWith("conversation.item.input_audio_transcription")
-        ? ` item=${event.item_id} ci=${event.content_index} chars=${String(event.delta ?? event.transcript ?? "").length}`
+        ? ` item=${event.item_id} ci=${event.content_index} ${event.delta ?? event.transcript ?? ""}`
         : type.startsWith("response.")
-          ? ` resp=${event.response_id ?? event.response?.id ?? ""} status=${event.response?.status ?? ""} chars=${String(event.transcript ?? "").length}`
+          ? ` resp=${event.response_id ?? event.response?.id ?? ""} status=${event.response?.status ?? ""} ${event.transcript ?? ""}`
           : "";
       console.debug(`[ws] ${type}${extra}`);
     }
@@ -1959,6 +1777,10 @@ export class S2sWsRealtimeClient extends EventTarget {
     switch (type) {
       case "session.created":
         // Endpoint validation must finish before session.update enables mic audio.
+        // Browser clients can prove that `started` means a sample reached the
+        // local playback worklet. Nonbrowser peers retain first-delivered-PCM
+        // settlement on the server for backward compatibility.
+        this._send({ type: "pipeline.playback.capability", rendered_playback_ack: true });
         this.updateLocalPipeline(
           this.options.pipelineConfig || {},
           this.options.playbackConfig || null,
@@ -1970,83 +1792,155 @@ export class S2sWsRealtimeClient extends EventTarget {
         break;
 
       case "pipeline.runtime":
-        {
-          const runtimeIdentity = _runtimePlaybackIdentity(event.runtime);
-          if (this._playbackRuntimeIdentity && runtimeIdentity !== this._playbackRuntimeIdentity) {
-            this._acknowledgedPlaybackSignature = resolveAdaptivePlaybackSignature(
-              this._lastAcknowledgedPipelineConfig,
-              this._acknowledgedPlaybackConfig,
-              runtimeIdentity,
-              false,
-            );
-            const conservative = this._playbackLearning.policy(this._acknowledgedPlaybackSignature);
-            this._playbackPrimeMs = conservative.targetMs;
-            this._playbackCeilingMs = conservative.ceilingMs;
-          }
-          this._playbackRuntimeIdentity = runtimeIdentity;
-        }
         this.dispatchEvent(new CustomEvent("backend-runtime", { detail: event.runtime || {} }));
         break;
 
-      case "input_audio_buffer.speech_started":
-        // Stop every playing or queued sample. The worklet's resulting drained
-        // event owns `_aiSpeaking`; user-speaking takes status precedence while
-        // that asynchronous clear acknowledgement is in flight.
-        this._invalidatePlayback("barge-in");
-        this._setStatus("user-speaking");
-        this.dispatchEvent(new CustomEvent("turn-state", {
+      case "pipeline.input_audio.speech_started": {
+        const inputEpoch = _inputEpoch(event);
+        if (!this._acceptInputEpoch(inputEpoch)) break;
+        this._pendingSpeechStartDecision = {
+          inputEpoch,
+          effectiveInterrupt: event.effective_interrupt === true,
+          reason: typeof event.reason === "string" ? event.reason : "speech_started",
+        };
+        this.dispatchEvent(new CustomEvent("pipeline-metric", {
           detail: {
-            status: "speech_started",
-            itemId: typeof event.item_id === "string" ? event.item_id : "",
+            stage: "playback",
+            status: event.effective_interrupt === true ? "barge_in" : "retained",
+            source: "backend",
+            detail: {
+              input_epoch: inputEpoch,
+              response_epoch: _responseEpoch(event),
+              effective_interrupt: event.effective_interrupt === true,
+              reason: event.reason || null,
+            },
           },
         }));
+        break;
+      }
+
+      case "pipeline.response": {
+        // The local server emits this immediately after OpenAI-compatible
+        // response.created. Only it carries the durable response/input epochs.
+        const responseId = typeof event.response_id === "string" ? event.response_id : "";
+        const responseEpoch = _responseEpoch(event);
+        const frozenRate = _responseOutputSampleRate(event.output_sample_rate);
+        this._captureLifecyclePlaybackPolicy(
+          responseEpoch,
+          frozenRate,
+          responseId,
+          _lifecyclePlaybackPolicy(event, frozenRate),
+        );
+        // Pending ownership is intentionally emitted before an OpenAI response
+        // ID exists. Track its epoch for diagnostics and stale filtering first;
+        // bind playback only once a response ID is actually available.
+        if (responseId) {
+          if (!this._bindPlaybackResponseEpoch(responseId, responseEpoch)) break;
+        } else if (!this._acceptResponseEpoch(responseEpoch)) {
+          break;
+        }
+        const inputEpoch = _inputEpoch(event);
+        this._acceptInputEpoch(inputEpoch);
+        const lifecycleState = event.lifecycle_state || event.state || "pending";
+        this.dispatchEvent(new CustomEvent("pipeline-metric", {
+          detail: {
+            stage: "response", status: "lifecycle", source: "backend",
+            detail: {
+              response_id: responseId, response_epoch: responseEpoch,
+              input_epoch: inputEpoch,
+              lifecycle_state: lifecycleState,
+              output_sample_rate: frozenRate,
+              supersession_reason: event.reason || null,
+            },
+          },
+        }));
+        // A direct-audio generation can terminate before it ever reaches
+        // response.created. There is then no stock response.done to free the
+        // browser's create guard or settle the provisional user row. The local
+        // lifecycle epoch is authoritative for that exceptional path only.
+        if (!responseId && responseEpoch !== null && _isTerminalResponseLifecycleState(lifecycleState)) {
+          this._playbackPolicyByResponseEpoch.delete(responseEpoch);
+          this._tombstoneResponseEpoch(responseEpoch);
+          const terminalKey = String(responseEpoch);
+          if (!this._rememberBounded(
+            this._terminalResponseEpochs,
+            terminalKey,
+            MAX_PLAYBACK_RESPONSE_TOMBSTONES,
+          )) {
+            break;
+          }
+          this._createInFlight = false;
+          if (this._status === "processing" && !this._aiSpeaking) {
+            this._setStatus("connected");
+          }
+          this.dispatchEvent(new CustomEvent("response-finished", {
+            detail: {
+              responseId: "",
+              status: lifecycleState,
+              audible: false,
+              transcript: "",
+              responseEpoch,
+              committed: false,
+            },
+          }));
+          if (!this._responseActive()) this._resolveResponseIdleWaiters();
+          this._flushQueuedCreate();
+        }
+        break;
+      }
+
+      case "input_audio_buffer.speech_started":
+        {
+          const inputEpoch = _inputEpoch(event);
+          if (!this._acceptInputEpoch(inputEpoch)) break;
+          const decision = this._pendingSpeechStartDecision;
+          const hasDecision = decision !== null
+            && (decision.inputEpoch === null || inputEpoch === null || decision.inputEpoch === inputEpoch);
+          this._pendingSpeechStartDecision = null;
+          // New local servers send the authoritative decision immediately
+          // before this stock event. With interruption disabled, capture may
+          // continue while the old audible response keeps its generation.
+          // Older compatible peers omit the extension and retain the previous
+          // unconditional barge-in behavior.
+          if (!hasDecision || decision.effectiveInterrupt) {
+            this._invalidatePlayback(hasDecision ? decision.reason : "barge-in");
+          }
+        }
+        this._setStatus("user-speaking");
+        this.dispatchEvent(new CustomEvent("turn-state", { detail: { status: "speech_started" } }));
         this.dispatchEvent(new CustomEvent("pipeline-metric", {
           detail: { stage: "mic", status: "speaking", source: "browser", detail: {} },
         }));
         break;
 
       case "input_audio_buffer.speech_stopped":
+        if (!this._acceptInputEpoch(_inputEpoch(event))) break;
         this._playbackGenerationInvalidated = false;
-        this._freezePlaybackTurnPolicy();
         if (this._status === "user-speaking") this._setStatus("processing");
         this._speechStoppedAtMs = performance.now();
         this._firstPlaybackReported = false;
-        this.dispatchEvent(new CustomEvent("turn-state", {
-          detail: {
-            status: "speech_stopped",
-            itemId: typeof event.item_id === "string" ? event.item_id : "",
-          },
-        }));
+        this.dispatchEvent(new CustomEvent("turn-state", { detail: { status: "speech_stopped" } }));
         this.dispatchEvent(new CustomEvent("pipeline-metric", {
           detail: { stage: "mic", status: "captured", source: "browser", detail: {} },
         }));
         break;
 
-      case "response.created":
+      case "response.created": {
+        const responseEpoch = _responseEpoch(event);
+        if (!this._acceptResponseEpoch(responseEpoch)) break;
         // A response now owns the slot — count it and clear our create guard
         // (this confirms either our create or a server-initiated one).
         this._openResponses++;
         this._createInFlight = false;
-        {
-          const rawResponseId = typeof event.response?.id === "string" ? event.response.id : "";
-          if (!rawResponseId) this._anonymousPlaybackResponseId = "";
-          const responseId = this._resolvePlaybackResponseId(rawResponseId);
-          const ordered = !!rawResponseId
-            && !this._openPlaybackResponseIds.has(responseId)
-            && !this._stalePlaybackResponses.has(responseId)
-            && this._openPlaybackResponseIds.size === 0;
-          if (ordered) {
-            this._openPlaybackResponseIds.add(responseId);
-            this._playbackSnapshot(responseId, true);
-          } else {
-            this._openPlaybackResponseIds.add(responseId);
-            this._markPlaybackResponseUnordered(responseId);
-          }
-        }
+        this._playbackSnapshot(
+          typeof event.response?.id === "string" ? event.response.id : "",
+          responseEpoch,
+        );
         if (this._status === "connected" || this._status === "user-speaking") {
           this._setStatus("processing");
         }
         break;
+      }
 
       case "response.output_item.added":
         if (this._status === "connected" || this._status === "user-speaking") {
@@ -2059,20 +1953,17 @@ export class S2sWsRealtimeClient extends EventTarget {
         const rid = typeof (event.response_id ?? event.response?.id) === "string"
           ? (event.response_id ?? event.response?.id)
           : "";
-        this._pushAudioDelta(event.delta, rid);
+        const responseEpoch = _responseEpoch(event) ?? this._playbackByResponse.get(rid)?.responseEpoch ?? null;
+        this._pushAudioDelta(event.delta, rid, responseEpoch);
         break;
       }
 
       case "response.audio.done":
       case "response.output_audio.done": {
-        const rawRid = typeof (event.response_id ?? event.response?.id) === "string"
+        const rid = typeof (event.response_id ?? event.response?.id) === "string"
           ? (event.response_id ?? event.response?.id)
           : "";
-        const rid = this._resolvePlaybackResponseId(rawRid);
-        if (!rawRid || !this._openPlaybackResponseIds.has(rid)) {
-          this._markPlaybackResponseUnordered(rid);
-        }
-        this._finishPlaybackResponse(rid);
+        if (!this._isStaleResponseEpoch(_responseEpoch(event))) this._finishPlaybackResponse(rid);
         break;
       }
 
@@ -2082,6 +1973,19 @@ export class S2sWsRealtimeClient extends EventTarget {
       }
 
       case "response.done": {
+        const status = event.response?.status ?? "completed";
+        const responseId = typeof event.response?.id === "string" ? event.response.id : "";
+        const responsePlayback = responseId
+          ? this._playbackByResponse.get(responseId)
+          : null;
+        const responseEpoch = _responseEpoch(event) ?? responsePlayback?.responseEpoch ?? null;
+        if (responseId && !this._rememberBounded(
+          this._terminalResponseIds,
+          responseId,
+          MAX_PLAYBACK_RESPONSE_TOMBSTONES,
+        )) {
+          break;
+        }
         // This response freed the slot (completion OR cancellation both arrive
         // as response.done). Decrement and, if a create was waiting, replay it.
         this._openResponses = Math.max(0, this._openResponses - 1);
@@ -2093,54 +1997,75 @@ export class S2sWsRealtimeClient extends EventTarget {
         // `response.done` with status "cancelled" — there is no separate
         // `response.cancelled` event). Surface the id + status so the UI can
         // drop a cancelled response's transcript and commit a completed one.
-        const status = event.response?.status ?? "completed";
-        const responseId = event.response?.id ?? "";
-        const playbackResponseId = this._resolvePlaybackResponseId(responseId);
-        if (!responseId || !this._openPlaybackResponseIds.has(playbackResponseId)) {
-          this._markPlaybackResponseUnordered(playbackResponseId);
-        }
-        this._openPlaybackResponseIds.delete(playbackResponseId);
-        const responsePlayback = playbackResponseId
-          ? this._playbackByResponse.get(playbackResponseId)
-          : null;
-        const responseRetired = playbackResponseId
-          ? this._stalePlaybackResponses.has(playbackResponseId)
+        const staleEpoch = this._isStaleResponseEpoch(responseEpoch);
+        const responseRetired = responseId
+          ? this._stalePlaybackResponses.has(responseId)
           : false;
-        if (status === "cancelled" || status === "canceled") {
+        const committed = responseId
+          ? this._toolCommittedResponses.has(responseId)
+          : false;
+        const clearedBeforeTerminal = responsePlayback?.playbackCleared === true;
+        // A local generation advance is already a definitive invalidation even
+        // if the asynchronous worklet `cleared` callback has not arrived yet.
+        // Let the old terminal settle its provisional ChatView transaction;
+        // otherwise retiring the snapshot here leaves no owner for the later
+        // clear acknowledgement and the row remains stuck forever.
+        const invalidatedBeforeTerminal = !!responsePlayback
+          && Number(responsePlayback.generation) < this._playbackGeneration;
+        if (staleEpoch && !clearedBeforeTerminal && !invalidatedBeforeTerminal) {
+          this._retirePlaybackResponse(responseId);
+          this._asstTranscriptByResp.delete(responseId);
+          this._asstFullByResp.delete(responseId);
+          if (!this._responseActive()) this._resolveResponseIdleWaiters();
+          this._flushQueuedCreate();
+          break;
+        }
+        if (status === "cancelled" || status === "canceled" || status === "failed") {
+          this._tombstoneResponseEpoch(responseEpoch);
           // Barge-in already advanced the generation. Do not clear the new turn
           // a second time when the cancelled old response closes afterward.
           if (!responseRetired
-              && (!responsePlayback || responsePlayback.generation === this._playbackGeneration)) {
-            this._invalidatePlayback("response-cancelled");
+              && ((status !== "failed" && !responsePlayback)
+                || responsePlayback?.generation === this._playbackGeneration)) {
+            this._invalidatePlayback(status === "failed" ? "response-failed" : "response-cancelled");
           }
         } else if (!responseRetired) {
           // Some compatible peers omit output_audio.done. Keep the end flush
           // idempotent and use response.done as the terminal fallback.
-          this._finishPlaybackResponse(playbackResponseId);
+          this._finishPlaybackResponse(responseId);
         }
-        if (responsePlayback) {
-          responsePlayback.networkDone = true;
-          responsePlayback.responseStatus = status;
-          responsePlayback.cancelled = status === "cancelled" || status === "canceled";
-          responsePlayback.forcedShort = responsePlayback.inputSamples < responsePlayback.targetSamples;
-        }
+        // response.done(cancelled) may itself be the first operation that
+        // advances the playback generation. Preserve that just-performed
+        // invalidation as a valid cross-thread ordering boundary: a `started`
+        // message already posted by the old worklet generation can still prove
+        // the response became audible before the clear took effect.
+        const invalidatedForTerminal = invalidatedBeforeTerminal || (
+          !!responsePlayback
+          && Number(responsePlayback.generation) < this._playbackGeneration
+        );
         const endToEndMs = this._speechStoppedAtMs == null
           ? null
           : Math.max(0, performance.now() - this._speechStoppedAtMs);
-        this.dispatchEvent(new CustomEvent("pipeline-metric", {
-          detail: {
-            stage: "response",
-            status: "done",
-            source: "browser",
-            elapsed_ms: endToEndMs,
-            detail: { end_to_end_ms: endToEndMs, response_status: status },
-          },
-        }));
+        // A clear-before-terminal cancellation is admitted only to settle its
+        // provisional UI transaction. It remains stale for current-response
+        // diagnostics and cannot contribute a terminal metric to the new turn.
+        if (!staleEpoch) {
+          this.dispatchEvent(new CustomEvent("pipeline-metric", {
+            detail: {
+              stage: "response",
+              status: "done",
+              source: "browser",
+              elapsed_ms: endToEndMs,
+              detail: { end_to_end_ms: endToEndMs, response_status: status, response_epoch: responseEpoch },
+            },
+          }));
+        }
         // Did the worklet actually render this response's first sample? This
         // remains false when response.done beats startup priming; network PCM
         // receipt alone must not make a speculative response look heard.
         const audible = responseId ? this._heardResponses.has(responseId) : false;
-        this._heardResponses.delete(responseId);
+        // Keep the heard marker together with the retained snapshot if audio
+        // has ended at the protocol layer but remains primed in the worklet.
         // Pull whatever transcript the response carries, falling back to the
         // segments we concatenated from the `*.transcript.done` events (plus any
         // in-progress delta). For an interrupted reply the response payload may
@@ -2152,11 +2077,45 @@ export class S2sWsRealtimeClient extends EventTarget {
         // Response finished — clear both transcript accumulators for it.
         this._asstTranscriptByResp.delete(responseId);
         this._asstFullByResp.delete(responseId);
-        this.dispatchEvent(new CustomEvent("response-finished", {
-          detail: { responseId, status, audible, transcript },
-        }));
-        this._retirePlaybackResponse(playbackResponseId);
-        this._finalizePlaybackLearning(playbackResponseId);
+        const terminalDetail = { responseId, status, audible, transcript, responseEpoch, committed };
+        const playbackAlreadyDrained = responsePlayback?.playbackDrained === true;
+        const cancelled = status === "cancelled" || status === "canceled";
+        const delayedRenderedProofPending = cancelled
+          && !responseRetired
+          && !!responsePlayback?.audioStarted
+          && !playbackAlreadyDrained
+          && !clearedBeforeTerminal
+          && invalidatedForTerminal
+          && audible === false;
+        const mayStillStart = (
+          !cancelled
+          && !responseRetired
+          && !!responsePlayback?.audioStarted
+          && audible === false
+        ) || delayedRenderedProofPending;
+        if (mayStillStart) {
+          // Leave the provisional chat transaction intact until the worklet
+          // confirms first render or a later drain/clear proves it never did.
+          responsePlayback.terminal = true;
+          responsePlayback.pendingTerminalDetail = terminalDetail;
+        } else {
+          this._dispatchResponseFinished(terminalDetail);
+        }
+        if ((cancelled && !delayedRenderedProofPending) || responseRetired) {
+          this._retirePlaybackResponse(responseId);
+        } else if (playbackAlreadyDrained) {
+          // The worklet's drain won the race with response.done. The terminal
+          // has now been dispatched, so the retained snapshot can be retired.
+          this._retirePlaybackResponse(responseId);
+        } else if (!mayStillStart && !audible && !committed) {
+          // The ChatView rolls this completed-but-unheard transaction back
+          // immediately.  Tombstone it at the same boundary: compatible peers
+          // sometimes send a late transcript frame without response_epoch, and
+          // that frame must not recreate the discarded assistant row.
+          this._retirePlaybackResponse(responseId);
+        } else if (responsePlayback) {
+          responsePlayback.terminal = true;
+        }
         if (!this._responseActive()) this._resolveResponseIdleWaiters();
         // The slot is free now — replay a queued create (e.g. a tool follow-up
         // that arrived while this response was still running).
@@ -2165,6 +2124,36 @@ export class S2sWsRealtimeClient extends EventTarget {
       }
 
       case "pipeline.metric": {
+        const responseEpoch = _responseEpoch(event) ?? _responseEpoch(event.detail || {});
+        if (this._isStaleResponseEpoch(responseEpoch)) break;
+        if (event.stage === "tts" && ["failed", "runaway_aborted"].includes(event.status)
+            && responseEpoch !== null) {
+          const responseId = event.response_id ?? event.detail?.response_id;
+          const failedSnapshot = responseId
+            ? this._playbackByResponse.get(responseId)
+            : [...this._playbackByResponse.values()].find(snapshot => snapshot.responseEpoch === responseEpoch);
+          if (failedSnapshot?.responseEpoch === responseEpoch
+              && failedSnapshot.generation === this._playbackGeneration) {
+            // The owned failure metric precedes output_audio.done. Clear now,
+            // before that ordinary end event could release a primed bad tail.
+            this._tombstoneResponseEpoch(responseEpoch);
+            this._invalidatePlayback("response-failed");
+          }
+        }
+        const rtf = Number(event.detail?.rtf);
+        if (event.stage === "tts" && event.status === "done" && Number.isFinite(rtf) && rtf > 1) {
+          const responseId = typeof (event.response_id ?? event.detail?.response_id) === "string"
+            ? (event.response_id ?? event.detail?.response_id)
+            : "";
+          const metricSnapshot = responseId
+            ? this._playbackByResponse.get(responseId) ?? null
+            : [...this._playbackByResponse.values()].find(
+              (snapshot) => snapshot.responseEpoch === responseEpoch,
+            ) ?? null;
+          // A backend metric without exact response ownership cannot tune the
+          // mutable browser reservoir safely.
+          if (metricSnapshot) this._markPlaybackUnsustainable("backend_rtf", metricSnapshot);
+        }
         this.dispatchEvent(new CustomEvent("pipeline-metric", { detail: { ...event, source: "backend" } }));
         break;
       }
@@ -2199,29 +2188,37 @@ export class S2sWsRealtimeClient extends EventTarget {
 
       case "response.function_call_arguments.done": {
         const name = typeof event.name === "string" ? event.name : "";
-        // Preserve the public argument string exactly. A non-string value is a
-        // malformed call, not an implicit empty object; the browser executor
-        // will return invalid_tool_arguments through the normal result path.
-        const args = typeof event.arguments === "string" ? event.arguments : null;
+        const args = typeof event.arguments === "string" ? event.arguments : "{}";
         const callId = typeof event.call_id === "string" ? event.call_id : "";
-        if (name && callId.trim()) {
+        const responseId = typeof (event.response_id ?? event.response?.id) === "string"
+          ? (event.response_id ?? event.response?.id)
+          : "";
+        const responsePlayback = responseId
+          ? this._playbackByResponse.get(responseId)
+          : null;
+        const eventResponseEpoch = _responseEpoch(event);
+        if (responseId && this._stalePlaybackResponses.has(responseId)) break;
+        if (responsePlayback && responsePlayback.responseEpoch !== null
+            && eventResponseEpoch !== null
+            && responsePlayback.responseEpoch !== eventResponseEpoch) {
+          break;
+        }
+        const responseEpoch = eventResponseEpoch ?? responsePlayback?.responseEpoch ?? null;
+        if (!this._acceptResponseEpoch(responseEpoch)) break;
+        if (responseId) this._rememberBounded(this._toolCommittedResponses, responseId, MAX_TOOL_CALL_TOMBSTONES);
+        if (callId && !this._rememberBounded(this._toolCallTombstones, callId, MAX_TOOL_CALL_TOMBSTONES)) {
+          if (this._debug) console.debug(`[ws] duplicate function call ignored (${callId})`);
+          break;
+        }
+        if (name) {
           this.dispatchEvent(new CustomEvent("toolcall", {
-            detail: {
-              name,
-              arguments: args,
-              callId,
-              responseId: typeof event.response_id === "string" ? event.response_id : "",
-              itemId: typeof event.item_id === "string" ? event.item_id : "",
-            },
+            detail: { name, arguments: args, callId },
           }));
         } else {
-          // Without both fields there is no safe call/result transaction. Do
-          // not dispatch `toolcall`: that would execute a side effect which
-          // cannot be paired with function_call_output. The UI renders this
-          // fixed, content-free protocol failure instead.
-          const code = name ? "missing_call_id" : "missing_tool_name";
-          this.dispatchEvent(new CustomEvent("tool-protocol-error", { detail: { code } }));
-          console.warn(`[ws] rejected invalid function_call_arguments.done (${code})`);
+          // A nameless call can't be executed, so no function_call_output is
+          // ever sent and the model would wait forever for a result. The
+          // backend shouldn't emit these; warn loudly rather than stall silently.
+          console.warn(`[ws] function_call_arguments.done with no name (call_id=${callId}); cannot run tool — turn may stall`);
         }
         break;
       }
@@ -2270,6 +2267,10 @@ export class S2sWsRealtimeClient extends EventTarget {
         // receive reaches the conversation, so an interrupted reply already has
         // its partial text even if the `.done` never fires.
         const rid = typeof event.response_id === "string" ? event.response_id : "";
+        // Some compatible peers omit epochs on late transcript frames. A
+        // response ID retired by cancellation/barge-in is still authoritative
+        // in that legacy shape; never let it resurrect an unheard row.
+        if (!this._acceptResponseBoundEvent(rid, _responseEpoch(event))) break;
         const delta = typeof event.delta === "string" ? event.delta : "";
         if (delta) {
           this._asstTranscriptByResp.set(rid, (this._asstTranscriptByResp.get(rid) || "") + delta);
@@ -2286,6 +2287,7 @@ export class S2sWsRealtimeClient extends EventTarget {
       case "response.audio_transcript.done":
       case "response.output_audio_transcript.done": {
         const rid = typeof event.response_id === "string" ? event.response_id : "";
+        if (!this._acceptResponseBoundEvent(rid, _responseEpoch(event))) break;
         // This is ONE completed segment. A response can emit several; concatenate
         // them, space-separated, until response.done clears the accumulator.
         const segment =
@@ -2348,13 +2350,12 @@ export class S2sWsRealtimeClient extends EventTarget {
     }
   }
 
-  /** @param {string} b64 @param {string} responseId */
-  _pushAudioDelta(b64, responseId = "") {
+  /** @param {string} b64 @param {string} responseId @param {number | null} responseEpoch */
+  _pushAudioDelta(b64, responseId = "", responseEpoch = null) {
     if (!this._playbackNode) return;
     if (!b64) return;
-    const rawResponseId = responseId;
-    const resolvedResponseId = this._resolvePlaybackResponseId(rawResponseId);
-    if (resolvedResponseId && this._stalePlaybackResponses.has(resolvedResponseId)) {
+    if (this._isStaleResponseEpoch(responseEpoch)) return;
+    if (responseId && this._stalePlaybackResponses.has(responseId)) {
       this.dispatchEvent(new CustomEvent("pipeline-metric", {
         detail: {
           stage: "playback",
@@ -2365,10 +2366,8 @@ export class S2sWsRealtimeClient extends EventTarget {
       }));
       return;
     }
-    const knownOrderedResponse = !!rawResponseId && this._openPlaybackResponseIds.has(resolvedResponseId);
-    const snapshot = knownOrderedResponse
-      ? this._playbackSnapshot(resolvedResponseId, true)
-      : this._markPlaybackResponseUnordered(resolvedResponseId).snapshot;
+    const snapshot = this._playbackSnapshot(responseId, responseEpoch);
+    if (snapshot.responseEpoch !== null && responseEpoch !== null && snapshot.responseEpoch !== responseEpoch) return;
     if (snapshot.ended) {
       this.dispatchEvent(new CustomEvent("pipeline-metric", {
         detail: {
@@ -2384,83 +2383,26 @@ export class S2sWsRealtimeClient extends EventTarget {
       }));
       return;
     }
-    if (snapshot.generation !== this._playbackGeneration) {
-      this.dispatchEvent(new CustomEvent("pipeline-metric", {
-        detail: {
-          stage: "playback",
-          status: "stale_chunk_rejected",
-          source: "browser",
-          detail: {
-            reason: "generation_mismatch",
-            generation: snapshot.generation,
-            current_generation: this._playbackGeneration,
-          },
-        },
-      }));
-      return;
-    }
     const bytes = base64ToBytes(b64);
-    if (bytes.byteLength === 0 || bytes.byteLength % 2 !== 0) {
-      snapshot.ordered = false;
-      this.dispatchEvent(new CustomEvent("pipeline-metric", {
-        detail: {
-          stage: "playback",
-          status: "stale_chunk_rejected",
-          source: "browser",
-          detail: { reason: "invalid_pcm_length", current_generation: this._playbackGeneration },
-        },
-      }));
-      return;
-    }
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     const samples = new Float32Array(bytes.byteLength / 2);
     for (let i = 0; i < samples.length; i++) {
       const s = view.getInt16(i * 2, true);
       samples[i] = s < 0 ? s / 0x8000 : s / 0x7fff;
     }
-    const inputSampleOffset = snapshot.inputSamples;
-    snapshot.inputSamples += samples.length;
-    snapshot.chunkCount += 1;
-    const nextBoundary = snapshot.nextLogicalBoundarySamples;
-    const steadyBlockSamples = snapshot.policy.steadyBlockSamples;
-    if (snapshot.policy.learning
-        && nextBoundary > 0
-        && steadyBlockSamples > 0
-        && snapshot.inputSamples >= nextBoundary) {
-      const boundariesCrossed = 1 + Math.floor(
-        (snapshot.inputSamples - nextBoundary) / steadyBlockSamples,
-      );
-      snapshot.logicalBlockCount += boundariesCrossed;
-      snapshot.nextLogicalBoundarySamples += boundariesCrossed * steadyBlockSamples;
-      // A coalesced transport chunk can contain several complete decoder
-      // blocks. It contributes one arrival timestamp, never artificial zero or
-      // packet-sized gaps between those boundaries.
-      const now = this._playbackClock();
-      if (Number.isFinite(snapshot.lastLogicalBlockAt)) {
-        const gap = now - snapshot.lastLogicalBlockAt;
-        if (Number.isFinite(gap) && gap > 0) {
-          snapshot.gaps = [...snapshot.gaps, gap].slice(-PLAYBACK_GAP_WINDOW);
-          snapshot.latestLogicalBlockGapMs = gap;
-        }
-      }
-      snapshot.lastLogicalBlockAt = now;
-    }
+    snapshot.audioStarted = true;
     this._playbackNode.port.postMessage({
       kind: "audio",
       samples,
       generation: snapshot.generation,
       primeMs: snapshot.primeMs,
-      ceilingMs: snapshot.ceilingMs,
-      targetSamples: snapshot.targetSamples,
-      ceilingSamples: snapshot.ceilingSamples,
-      inputSampleOffset,
-      inputSampleCount: samples.length,
-      streamId: resolvedResponseId,
+      reprimeMs: snapshot.reprimeMs,
+      maxPrimeMs: snapshot.maxPrimeMs,
+      continuityMode: snapshot.continuityMode,
+      responseEpoch: snapshot.responseEpoch,
+      sourceSampleRate: snapshot.sourceSampleRate,
+      streamId: responseId,
     }, [samples.buffer]);
-    // A clear is idempotent only until a genuinely new current-generation
-    // stream is accepted. Non-mic replacements must re-arm Stop/barge-in so
-    // their queued samples can be cleared independently of the prior response.
-    this._playbackGenerationInvalidated = false;
   }
 
   /** @param {CloseEvent} ev */
@@ -2529,8 +2471,12 @@ export class S2sWsRealtimeClient extends EventTarget {
    * @param {PlaybackConfig | null} [playbackConfig]
    */
   updateLocalPipeline(config, playbackConfig = null) {
-    this._queuePlaybackConfig(config, playbackConfig);
-    this._send({ type: "pipeline.config.update", config });
+    const requested = {
+      ...config,
+      playback_policy: this._requestedPlaybackPolicy(config, playbackConfig),
+    };
+    this._queuePlaybackConfig(requested, playbackConfig);
+    this._send({ type: "pipeline.config.update", config: requested });
   }
 
   /**
@@ -2618,8 +2564,7 @@ export class S2sWsRealtimeClient extends EventTarget {
    * replay it once the active response finishes, so we never trip the
    * backend's `conversation_already_has_active_response` guard.
    *
-   * @param {{ image?: string, toolChoice?: "auto"|"none", tools?: object[] }} [opts] Optional
-   *   response-scoped overrides. `image` is a data URL sent as a
+   * @param {{ image?: string }} [opts] Optional `image` (a data URL) sent as a
    *   user `input_image` immediately before this response.create — so the frame
    *   travels with the create (and is deferred together with it if queued),
    *   rather than being added to the conversation eagerly. Used by the camera
@@ -2636,20 +2581,12 @@ export class S2sWsRealtimeClient extends EventTarget {
 
   /** Send a tool follow-up immediately. The backend binds it to the active
    *  call ID transaction and starts it after the originating response closes.
-   *  @param {{ image?: string, toolChoice?: "auto"|"none", tools?: object[] }} [opts] */
+   *  @param {{ image?: string }} [opts] */
   requestToolResponse(opts = {}) {
     if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
     if (opts.image) this.sendUserImage(opts.image);
     this._createInFlight = true;
-    this._send({
-      type: "response.create",
-      ...((opts.toolChoice || opts.tools) ? {
-        response: {
-          ...(opts.tools ? { tools: opts.tools } : {}),
-          ...(opts.toolChoice ? { tool_choice: opts.toolChoice } : {}),
-        },
-      } : {}),
-    });
+    this._send({ type: "response.create" });
   }
 
   /** True while a response occupies the single backend slot. */
@@ -2659,20 +2596,12 @@ export class S2sWsRealtimeClient extends EventTarget {
 
   /** Send a response.create immediately and arm the in-flight guard. Any image
    *  on the payload is added as user content right before the create.
-   *  @param {{ image?: string, toolChoice?: "auto"|"none", tools?: object[] }} [opts] */
+   *  @param {{ image?: string }} [opts] */
   _createResponseNow(opts = {}) {
     if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
     if (opts.image) this.sendUserImage(opts.image);
     this._createInFlight = true;
-    this._send({
-      type: "response.create",
-      ...((opts.toolChoice || opts.tools) ? {
-        response: {
-          ...(opts.tools ? { tools: opts.tools } : {}),
-          ...(opts.toolChoice ? { tool_choice: opts.toolChoice } : {}),
-        },
-      } : {}),
-    });
+    this._send({ type: "response.create" });
   }
 
   /** Replay one queued response.create if the slot is now free. Called on every
@@ -2701,31 +2630,26 @@ export class S2sWsRealtimeClient extends EventTarget {
 
   /** @param {EchoGuardMode} mode */
   setEchoGuard(mode) {
-    this._echoGuard = ["native", "adaptive", "strict"].includes(mode) ? mode : "adaptive";
+    this._echoGuard = ["native", "adaptive", "strict"].includes(mode) ? mode : "native";
     const micTrack = this.options.micStream?.getAudioTracks?.()[0];
     const nativeAec = !!micTrack?.getSettings?.().echoCancellation;
     this._captureNode?.port.postMessage({ kind: "echo_guard", mode: this._echoGuard, nativeAec });
   }
 
-  /**
-   * Apply calibration only to the exact opaque route generation presented to
-   * the UI. An async device or sink change makes a stale save harmless.
-   * @param {Record<string, unknown>} calibration
-   * @param {string} routeKey
-   * @param {number} routeEpoch
-   * @returns {boolean}
-   */
-  setEchoCalibration(calibration, routeKey, routeEpoch) {
-    if (!routeKey || routeKey !== this._echoRouteKey || routeEpoch !== this._echoRouteEpoch) {
-      return false;
-    }
+  /** Persisted by the UI under the current microphone/output-device pair. */
+  setEchoCalibration(calibration) {
     this._echoCalibration = normalizeEchoCalibration(calibration);
-    this._echoCalibrations = upsertEchoCalibration(
-      this._echoCalibrations, routeKey, this._echoCalibration,
-    );
-    this._postEchoCalibration();
-    this._dispatchEchoStatus();
-    return true;
+    if (this._echoDevicePair) {
+      this._echoCalibrations[this._echoDevicePair] = this._echoCalibration;
+    }
+    const outputLatencyMs = Number.isFinite(this._ctx?.outputLatency)
+      ? Math.max(0, this._ctx.outputLatency * 1000)
+      : 0;
+    this._captureNode?.port.postMessage({
+      kind: "echo_calibration",
+      ...this._echoCalibration,
+      outputLatencyMs,
+    });
   }
 
   /** @param {Record<string, unknown>} event */
@@ -2739,12 +2663,10 @@ export class S2sWsRealtimeClient extends EventTarget {
     // `_pollQueue` throws "aborted" and connect() unwinds cleanly.
     if (!this._closed) this._invalidatePlayback("stop");
     this._closed = true;
-    this._echoRouteSerial += 1;
-    this._removeEchoRouteListeners();
     this._sessionConfigured = false;
     this._rejectInitialConfig(new Error("Connection closed before pipeline configuration completed"));
     this._muted = true;
-    this._captureNode?.port.postMessage({ kind: "capture_abort" });
+    this._captureNode?.port.postMessage({ kind: "echo_reset" });
     this._captureNode?.port.postMessage({ kind: "enable", value: false });
     for (const track of this.options.micStream?.getTracks?.() ?? []) {
       track.stop();
@@ -2828,17 +2750,16 @@ export class S2sWsRealtimeClient extends EventTarget {
     this._micSrc = null;
     this._micAnalyser = null;
     this._outAnalyser = null;
-    this._echoRouteKey = "";
-    this._echoRouteState = "closed";
-    this._echoCalibrationCollector.reset();
     this._pendingPlaybackConfigs.length = 0;
-    this._activePlaybackTurn = null;
-    this._anonymousPlaybackResponseId = "";
     this._playbackByResponse.clear();
-    this._completedPlaybackResponses.clear();
-    this._openPlaybackResponseIds.clear();
+    this._playbackPolicyByResponseEpoch.clear();
     this._stalePlaybackResponses.clear();
+    this._terminalResponseIds.clear();
     this._heardResponses.clear();
+    this._toolCallTombstones.clear();
+    this._toolCommittedResponses.clear();
+    this._terminalResponseEpochs.clear();
+    this._cancelledResponseEpochs.clear();
     this._setStatus("closed");
   }
 }

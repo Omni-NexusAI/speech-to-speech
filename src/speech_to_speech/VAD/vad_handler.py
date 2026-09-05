@@ -173,6 +173,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
         self._turn_counter = 0
         self._current_turn_id: str | None = None
         self._current_turn_revision: int | None = None
+        self._current_input_epoch: int | None = None
         self._speculative_audio_prefix: np.ndarray | None = None
         self._last_final_wall_time: float | None = None
         self._last_final_audio_ms: int | None = None
@@ -536,6 +537,11 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
             active_speech_min_ms = self._active_speech_min_ms(effective_start_ms)
             if effective_active_speech_duration_ms >= active_speech_min_ms:
                 turn_id, turn_revision, reopened = self._ensure_turn_for_speech_start(effective_start_ms)
+                input_epoch = self._observe_speech_identity(
+                    runtime_config,
+                    reason="speculative_reopen" if reopened else "new_speech",
+                )
+                self._current_input_epoch = input_epoch
                 self._speech_started_emitted = True
                 self._log_speech_starts += 1
                 logger.info(
@@ -553,6 +559,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                             turn_id=turn_id,
                             turn_revision=turn_revision,
                             reopened=reopened,
+                            input_epoch=input_epoch,
                         )
                     )
                 self._emit_metric(
@@ -594,6 +601,50 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
     def _emit_metric(self, stage: str, status: str, *, turn_id: str | None = None, turn_revision: int | None = None, elapsed_ms: float | None = None, detail: dict[str, Any] | None = None) -> None:
         if self.text_output_queue:
             self.text_output_queue.put(PipelineMetricEvent(stage=stage, status=status, at_s=time.time(), elapsed_ms=elapsed_ms, turn_id=turn_id, turn_revision=turn_revision, detail=detail or {}))
+
+    @staticmethod
+    def _observe_speech_identity(
+        runtime_config: RuntimeConfig | None,
+        *,
+        reason: str,
+        interrupt_response: bool | None = None,
+    ) -> int | None:
+        """Advance ownership synchronously when VAD confirms newer speech.
+
+        Speech-start and final audio use different queues.  Advancing here
+        prevents a synthetic final from claiming a response and then being
+        invalidated when its earlier queued start is dispatched.
+        """
+        local = getattr(runtime_config, "local_pipeline", None)
+        if not isinstance(local, dict):
+            return None
+        observe = local.get("_observe_speech_started")
+        if interrupt_response is None:
+            interrupt_response = bool(getattr(runtime_config, "interrupt_response_enabled", True))
+        supersession = (
+            observe(reason, interrupt_response=interrupt_response)
+            if callable(observe)
+            else None
+        )
+        return getattr(supersession, "input_epoch", local.get("_input_epoch"))
+
+    @staticmethod
+    def _claim_response_identity(
+        runtime_config: RuntimeConfig | None,
+        turn_id: str | None,
+        turn_revision: int | None,
+    ) -> tuple[int | None, int | None, str | None]:
+        """Claim accepted-turn ownership before final audio reaches Gemma."""
+        local = getattr(runtime_config, "local_pipeline", None)
+        if not isinstance(local, dict):
+            return None, None, None
+        claim = local.get("_claim_response_owner")
+        owner = claim(turn_id, turn_revision) if callable(claim) else None
+        return (
+            getattr(owner, "input_epoch", local.get("_input_epoch")),
+            getattr(owner, "response_epoch", local.get("_response_epoch")),
+            getattr(owner, "response_id", local.get("_response_id")),
+        )
 
     def _process_realtime(self, vad_output: list[torch.Tensor] | None, runtime_config: RuntimeConfig | None = None) -> Iterator[VADOut]:
         """Process with real-time progressive audio release."""
@@ -639,9 +690,11 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                             audio_end_ms=self._audio_ms,
                             turn_id=turn_id,
                             turn_revision=turn_revision,
+                            input_epoch=self._current_input_epoch,
                         )
                     )
                 self._speech_started_emitted = False
+                self._current_input_epoch = None
                 self._discard_expired_pending_short_segment()
                 return
 
@@ -686,9 +739,11 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                             audio_end_ms=self._audio_ms,
                             turn_id=turn_id,
                             turn_revision=turn_revision,
+                            input_epoch=self._current_input_epoch,
                         )
                     )
                 self._speech_started_emitted = False
+                self._current_input_epoch = None
             else:
                 if stitched_short_segment:
                     logger.info(
@@ -699,6 +754,12 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                 synthetic_start = not self._speech_started_emitted
                 if synthetic_start:
                     turn_id, turn_revision, reopened = self._ensure_turn_for_speech_start(start_ms)
+                    input_epoch = self._observe_speech_identity(
+                        runtime_config,
+                        reason="speculative_reopen" if reopened else "synthetic_final",
+                        interrupt_response=False,
+                    )
+                    self._current_input_epoch = input_epoch
                     if self.text_output_queue:
                         self.text_output_queue.put(
                             SpeechStartedEvent(
@@ -707,6 +768,7 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                                 turn_revision=turn_revision,
                                 reopened=reopened,
                                 interrupt_response=False,
+                                input_epoch=input_epoch,
                             )
                         )
                 else:
@@ -723,6 +785,11 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                     array = self._apply_audio_enhancement(array)
                 output_array = self._combined_turn_audio(array)
                 combined_duration_s = len(output_array) / self.sample_rate
+                input_epoch, response_epoch, response_id = self._claim_response_identity(
+                    runtime_config,
+                    turn_id,
+                    turn_revision,
+                )
                 if self.text_output_queue:
                     self.text_output_queue.put(
                         SpeechStoppedEvent(
@@ -730,6 +797,9 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                             audio_end_ms=end_ms,
                             turn_id=turn_id,
                             turn_revision=turn_revision,
+                            input_epoch=input_epoch,
+                            response_epoch=response_epoch,
+                            response_id=response_id,
                         )
                     )
                 if synthetic_start:
@@ -775,9 +845,19 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                     )
                 else:
                     self.should_listen.clear()
-                yield VADAudio(audio=output_array, mode="final", turn_id=turn_id, turn_revision=turn_revision, runtime_config=runtime_config)
+                yield VADAudio(
+                    audio=output_array,
+                    mode="final",
+                    turn_id=turn_id,
+                    turn_revision=turn_revision,
+                    runtime_config=runtime_config,
+                    input_epoch=input_epoch,
+                    response_epoch=response_epoch,
+                    response_id=response_id,
+                )
                 self.last_process_time = 0.0
                 self._speech_started_emitted = False
+                self._current_input_epoch = None
 
     def _progressive_processing_pause(self, duration_ms: float) -> float:
         base_pause = max(0.0, self.realtime_processing_pause)
@@ -846,21 +926,47 @@ class VADHandler(BaseHandler[VADIn, VADOut]):
                         duration_ms,
                         active_speech_duration_ms,
                     )
-                if not self._speech_started_emitted and self.text_output_queue:
-                    self.text_output_queue.put(
-                        SpeechStartedEvent(
-                            audio_start_ms=start_ms,
-                            interrupt_response=False,
-                        )
+                if not self._speech_started_emitted:
+                    input_epoch = self._observe_speech_identity(
+                        runtime_config,
+                        reason="synthetic_final",
+                        interrupt_response=False,
                     )
+                    if self.text_output_queue:
+                        self.text_output_queue.put(
+                            SpeechStartedEvent(
+                                audio_start_ms=start_ms,
+                                interrupt_response=False,
+                                input_epoch=input_epoch,
+                            )
+                        )
                 self._log_speech_ends += 1
                 self.should_listen.clear()
                 logger.info(f"Speech ended ({duration_ms:.0f}ms), stop listening")
+                input_epoch, response_epoch, response_id = self._claim_response_identity(
+                    runtime_config,
+                    None,
+                    None,
+                )
                 if self.text_output_queue:
-                    self.text_output_queue.put(SpeechStoppedEvent(duration_s=duration_ms / 1000.0, audio_end_ms=end_ms))
+                    self.text_output_queue.put(
+                        SpeechStoppedEvent(
+                            duration_s=duration_ms / 1000.0,
+                            audio_end_ms=end_ms,
+                            input_epoch=input_epoch,
+                            response_epoch=response_epoch,
+                            response_id=response_id,
+                        )
+                    )
                 if self.audio_enhancement:
                     array = self._apply_audio_enhancement(array)
-                yield VADAudio(audio=array, runtime_config=runtime_config)
+                yield VADAudio(
+                    audio=array,
+                    runtime_config=runtime_config,
+                    input_epoch=input_epoch,
+                    response_epoch=response_epoch,
+                    response_id=response_id,
+                )
                 self._speech_started_emitted = False
 
     def _apply_audio_enhancement(self, array: np.ndarray) -> np.ndarray:

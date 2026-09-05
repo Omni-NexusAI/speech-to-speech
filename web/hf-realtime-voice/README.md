@@ -6,227 +6,193 @@ colorTo: purple
 sdk: docker
 app_port: 7860
 pinned: false
-short_description: Local direct-audio voice chat over an OpenAI-compatible Realtime WebSocket
+short_description: Voice chat over WebSocket against a HF speech-to-speech
 hf_oauth: true
 ---
 
-# HF Realtime Voice
+# Minimal Conversation App (S2S backend, **WebSocket** transport)
 
-This browser client is the local testing surface for the repository's Realtime
-speech pipeline. It captures microphone audio, waits for the server to accept a
-complete conversation configuration, sends each VAD-accepted turn directly to
-Gemma, and plays the selected Qwen3-TTS provider through one continuous PCM
-queue. It also keeps the original hosted Hugging Face session-handshake mode for
-Space deployments.
+Drop-in alternative to [`amir-tfrere/minimal-conversation-app-s2s-backend`](https://huggingface.co/spaces/amir-tfrere/minimal-conversation-app-s2s-backend)
+that uses the **WebSocket** route of the Hugging Face speech-to-speech
+backend instead of the WebRTC SDP proxy. Same load balancer, same
+`/session` handshake, same UI, same orb. Just a different wire.
 
-For the complete local stack and model configuration, see
-[`../../docs/local-gemma-fasterqwen3tts.md`](../../docs/local-gemma-fasterqwen3tts.md).
+## How it works
 
-## Current local pipeline
+1. App POSTs `<lb_url>/session` (empty JSON body).
+2. The LB picks a ready compute (round-robin) and returns:
+   ```json
+   {
+     "session_id": "...",
+     "websocket_url": "wss://<compute>/v1/realtime",
+     "connect_url": "wss://<compute>/v1/realtime?session_token=<JWT>",
+     "session_token": "<JWT>",
+     "pending_timeout_s": 60
+   }
+   ```
+3. App opens a WebSocket **directly** on `connect_url` (no rewrite to
+   `https://`; unlike the WebRTC client which POSTs an SDP offer).
+4. Server pushes `session.created` on connect. Client replies with
+   `session.update` (OpenAI Realtime **GA** schema: `session.audio.input`,
+   `session.audio.output`, `session.output_modalities`).
+5. Client streams mic audio as PCM16 16 kHz mono base64 chunks
+   (`input_audio_buffer.append`, one frame every ~40 ms).
+6. Server pushes `response.output_audio.delta` (PCM16 24 kHz mono base64)
+   and transcript deltas.
 
-```text
-microphone
-  → browser capture, Native AEC or verified AEC3
-  → server VAD admission
-  → local or explicitly selected remote Gemma direct audio
-  → optional browser tools and tool-result continuation
-  → selected Faster, Groxaxo, or audio.cpp Qwen3-TTS provider
-  → generation-safe AudioWorklet PCM queue
-```
+The backend exposes one concurrent session per compute (same as WebRTC
+mode); the LB pins the session via a signed `session_token`.
 
-The local direct-audio path deliberately does not require an STT transcript to
-answer or call tools. Every accepted user turn gets one semantic history anchor.
-A validated transcript may upgrade it; if no transcript exists, a validated
-same-response semantic memory may upgrade it; otherwise the session retains the
-historical input audio. The UI's `[User audio]` label is display-only.
+## Why WebSocket instead of WebRTC
 
-## Start locally
+| | WebRTC (original) | WebSocket (this) |
+|---|---|---|
+| Transport | UDP + Opus 48 kHz + ICE/STUN | TCP + raw PCM16 |
+| NAT traversal | needs STUN, can fail on corporate / cellular | none, works everywhere TCP is allowed |
+| Audio quality | excellent (Opus, jitter buffer, FEC) | good (raw PCM, simple ring buffer) |
+| Latency | lowest (~50-150 ms) | low (~150-300 ms typical) |
+| Echo cancellation | browser AEC active on the WebRTC track | browser AEC plus playback-reference Adaptive/Strict guard |
+| Debuggability | needs `chrome://webrtc-internals` | `wscat` / DevTools network tab |
+| Mobile data | sometimes blocked (UDP) | always works (HTTPS+WSS) |
 
-From the repository root:
+## Backend requirement
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File scripts\local_realtime.ps1 -Action start -Open
-```
+This app talks to the WebSocket route `@app.websocket("/v1/realtime")`
+defined in
+[`websocket_router.py`](https://github.com/huggingface/speech-to-speech/blob/feat/webrtc-transport/src/speech_to_speech/api/openai_realtime/websocket_router.py)
+on the **`feat/webrtc-transport`** branch. The same compute serves both
+the WebRTC POST and the WebSocket upgrade on the same path; no backend
+change required.
 
-The managed launcher starts only this repository's backend and frontend:
-
-- UI: <http://127.0.0.1:7862>
-- Realtime WebSocket: `ws://127.0.0.1:8765/v1/realtime`
-
-Gemma and every TTS service remain external dependencies. The launcher reports
-their status but never starts, stops, loads, switches, or rebuilds them.
-
-For a foreground frontend alone:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass `
-  -File scripts\start_hf_realtime_frontend.ps1
-```
-
-Or run this directory as a standalone Docker/FastAPI app:
+Smoke-test from the shell:
 
 ```bash
-pip install -r requirements.txt
-uvicorn server:app --host 0.0.0.0 --port 7860
+LB="https://kaa1l6rplzb1gg3y.us-east-1.aws.endpoints.huggingface.cloud"
+curl -X POST "$LB/session" -H "Content-Type: application/json" -d '{}'
+# -> { "connect_url": "wss://<compute>/v1/realtime?session_token=..." }
+# Feed connect_url into a wscat / websocat and you should get a
+# session.created event back immediately.
 ```
-
-Browsers require HTTPS or a loopback host for microphone and camera access.
-
-## Startup contract
-
-The client opens `/v1/realtime`, receives `session.created`, sends the
-conversation-scoped pipeline configuration, and waits for the matching
-`pipeline.config.updated` acknowledgement. Microphone PCM is not sent before
-that acknowledgement. A rejected configuration or a missing acknowledgement
-within 15 seconds closes the session visibly instead of leaving the UI in a
-permanent Connecting state.
-
-Standard voice, instructions, and tools use `session.update`. Local/remote model
-routing, TTS provider, clone, and candidate tuning use
-`pipeline.config.update`. Updates are transactional: queued speech keeps its
-acknowledged settings, while a confirmed update applies to the next turn.
-
-## Model routing
-
-Model inference is conversation-scoped:
-
-- **Local** uses the configured llama.cpp/Gemma audio endpoint.
-- **Remote** uses one explicitly configured OpenAI-compatible endpoint and
-  bearer. It replaces Local for that conversation and never silently falls
-  back.
-
-API keys stay only in this browser/device's `localStorage`. They are excluded
-from UI-server persistence payloads and are never returned by the UI server.
-The About and Diagnostics surfaces report the effective provider, model,
-context window, and runtime identity without logging prompt or response text.
-
-## TTS providers and voices
-
-- **FasterQwen3TTS** on `8881` is the stable default and exposes clone-only
-  native PCM streaming. It has no model lifecycle API, so load/switch controls
-  remain unavailable.
-- **Groxaxo** on `8882` is user-managed and selectable only while it advertises
-  a compatible loaded Base model.
-- **Qwen3-TTS audio.cpp** on `8890` is an isolated experimental candidate. It
-  requires live health, resident-model, clone, profile-resolution, and speech
-  validation. Native incremental PCM is used only when the response proves it;
-  otherwise the UI labels and keeps buffered fallback.
-
-Voice inventory is backend-scoped and authoritative for the selected provider.
-Only live Base clone profiles are selectable. Faster's shared library is read
-from `VOICE_LIBRARY_DIR`; if unset, both the pipeline and UI use
-`~/.speech-to-speech/qwen3-tts-voices`. The expected layout is
-`profiles/<profile-id>/meta.json` plus that profile's reference WAV.
-
-Realtime and Voice Studio profile selections remain independent. Candidate
-profile updates may be applied during a conversation after acknowledgement,
-but they do not change Voice Studio's selection.
-
-## Playback and latency
-
-All providers deliver PCM16 to the browser's 16 kHz playback graph. Faster,
-Groxaxo, and audio.cpp buffered fallback start on their existing ready queue.
-Validated native audio.cpp uses adaptive safe-start:
-
-- a cold or changed signature primes the acknowledged first plus steady decoder
-  blocks;
-- two clean full-prime responses establish warm evidence;
-- warm startup uses the logical decoder-block p95 gap plus a fixed 64 ms margin,
-  never less than the first block plus 160 ms;
-- an underrun immediately restores the full cold ceiling and requires three
-  clean recoveries.
-
-The worklet preserves every input sample, flushes short final responses, keeps
-one queue across phrase and tool continuations, and rejects stale generations
-after Stop, barge-in, replacement, disconnect, or cancellation. Network
-`response.done` releases protocol ownership; only worklet `started` and
-`drained` events control the audible speaking state.
-
-## Echo control
-
-- **Native** uses the browser's built-in echo cancellation, noise suppression,
-  and automatic gain control.
-- **Adaptive** is the default and uses the bundled Sonora/WebRTC AEC3 worklet only after manifest,
-  SHA-256, ABI, compile, and worklet loading succeed. Failure resolves
-  truthfully to Native.
-- **Strict** uses the reference-aware path more aggressively and withholds
-  uncertain microphone upload through the echo tail rather than inserting
-  silence.
-
-The capture path receives the exact PCM scheduled for playback, never the static
-voice-clone reference. Calibration is stored under an opaque microphone/output
-route fingerprint; raw device identifiers are never persisted or shown. Route
-changes reset the AEC measurement cohort and load that route's settings. The
-measured-delay action becomes available only after at least 20 quiet,
-playback-active samples over at least two seconds pass the median/p95/jitter
-stability checks. Echo tail is adjustable from 350–1000 ms, while suppression,
-leakage, and double-talk controls apply only to Strict. AEC3 and physical
-speaker-loopback behavior remain experimental across device pairs and
-remote-audio routing.
 
 ## Tools
 
-The browser executes enabled tools and returns each result through the normal
-Realtime function-call protocol:
+The assistant can call two tools mid-conversation (toggle them from the **Tools**
+button, top-right):
 
-- **Web search** uses the same-origin `/api/search` proxy when `SERPER_API_KEY` is
-  configured. The key never reaches browser JavaScript. Calls select general web
-  or news search and may request day/week/month/year recency. Results return as
-  versioned structured data with retrieval time plus each available publication
-  date and source; retrieval time is never presented as a publication date. One
-  accepted turn may make one initial search and at most one narrower refinement.
-  Auto-selected news may use one same-filter web fallback when news is empty;
-  explicit news returns zero results without changing mode.
-- **Camera snapshot** captures a fresh frame only when the model calls the tool.
-  Every real call gets a distinct visible card, including unavailable captures.
+- **Web search** — Google results via Serper.dev, proxied server-side so the key
+  never reaches the browser. Set `SERPER_API_KEY` as a Space secret. Without it,
+  the tool is disabled unless the user pastes their own key in the Tools panel.
+- **Camera** — while enabled, a live self-view shows bottom-left; when the model
+  calls the tool, the current frame is sent to the vision-language model so it can
+  see what you're showing it.
 
-Malformed or schema-invalid arguments are rejected before execution without
-displaying their values. Function output, an optional camera image, and exactly
-one post-tool `response.create` retain that order. Tool-result continuation stays
-in the same semantic turn and playback policy. Only a first successful search
-follow-up exposes `web_search`; terminal search and non-search follow-ups disable
-tools for their response.
+## Connecting to a backend
 
-## Hosted Space mode
+The app connects **directly** to a speech-to-speech server's realtime WebSocket —
+no load balancer, no `/session` step. Set the URL in two ways:
 
-When `LOAD_BALANCER_URL` is configured, `/api/session` can proxy the hosted
-Hugging Face load-balancer handshake without exposing the upstream URL. The
-returned signed `connect_url` is then used for the Realtime WebSocket. Usage
-metering is enabled only when both `LOAD_BALANCER_URL` and `SPACE_ID` are set;
-local development remains unmetered.
+- **`LOAD_BALANCER_URL` env** (served via `/api/config`) provides the default URL
+  shown in Settings — handy for the deployed Space.
+- **Settings → Speech-to-speech server URL** lets you override it: paste a full
+  `connect_url` (`wss://host/v1/realtime?...`) or a bare host like `localhost:8080`
+  (the app adds `/v1/realtime`).
 
-Hosted authentication and limits live in `auth.py` and `limiter.py`. Search
-proxying and hosted session routing live in `server.py`; neither changes the
-local direct WebSocket contract.
+**Settings → Restart** reconnects with the current voice, instructions and URL.
 
-## Main files
+## Usage limits
+
+Conversation time is metered per UTC day by sign-in tier (see `limiter.py` /
+`auth.py`), but **only on the deployed Space** — metering turns on only when BOTH
+`LOAD_BALANCER_URL` and `SPACE_ID` (injected automatically by the HF Space
+runtime) are present. Running locally — even with `LOAD_BALANCER_URL` exported —
+leaves the app unmetered. Tunable via env:
+
+| Env | Default | What |
+|-----|---------|------|
+| `LIMIT_ANON_SEC` | `300` | Daily seconds for anonymous visitors (5 min) |
+| `LIMIT_FREE_SEC` | `600` | Daily seconds for signed-in non-PRO users (10 min) |
+| `UNLIMITED_ORGS` | _(adds to defaults)_ | Extra HF org names whose members get **unlimited** usage, like PRO |
+| `USAGE_HASH_SECRET` | _(random)_ | HMAC secret for hashing identity keys + signing the anon cookie |
+
+PRO members are always unlimited. Members of `cerebras`, `HuggingFaceM4`,
+`smolagents`, and `pollen-robotics` are unlimited out of the box (shown as
+"Team", not "PRO"); set `UNLIMITED_ORGS=my-team` to add more. Matched
+case-insensitively against the user's organisations from HF OAuth.
+
+## Run locally
+
+The app is now a small FastAPI server (it serves the front-end *and* the search
+proxy from one container).
+
+```bash
+pip install -r requirements.txt
+export SERPER_API_KEY=...        # optional; web search is disabled without it
+export LOAD_BALANCER_URL=...     # optional; default s2s server URL (set it in Settings otherwise)
+uvicorn server:app --reload --port 7860
+# or, matching production: docker build -t s2s . && docker run -p 7860:7860 -e SERPER_API_KEY=... -e LOAD_BALANCER_URL=... s2s
+```
+
+Then open <http://localhost:7860/>, click the orb, allow the mic, talk.
+
+> Browsers require **HTTPS or `localhost`** for `getUserMedia()` (mic + camera).
+> `127.0.0.1` and `localhost` both work; plain `http://192.168.x.y` does NOT.
+
+## Settings (stored in `localStorage`)
+
+| Key | What |
+|-----|------|
+| Load balancer URL | Base URL of your S2S deployment. App POSTs `<lb>/session`. |
+| Voice | Qwen3-TTS speaker name (Aiden, Ryan, Dylan, Eric, Ono_Anna, Serena, Sohee, Uncle_Fu, Vivian) |
+| Instructions | System prompt sent in `session.update` once the WS opens |
+
+LocalStorage keys are namespaced `s2s.ws.*` so this app's settings do
+NOT collide with the WebRTC variant.
+
+## Files
 
 | File | Role |
-|---|---|
-| `server.py` | Static app, settings, provider inventory/validation, hosted session and search proxies |
-| `main.js` | UI state, configuration acknowledgement, tools, diagnostics, and provider selection |
-| `ws/s2s-ws-client.js` | Realtime protocol, tool ordering, cancellation, and adaptive playback policy |
-| `worklets/mic-capture.js` | Capture, resampling, gate, Native/Strict fallback behavior |
-| `worklets/aec3/` | Pinned AEC3 WASM, authenticated loader, source recipe, smoke test, and license |
-| `worklets/audio-playback.js` | Continuous generation-tagged PCM FIFO and safe-start state machine |
-| `ui/chat.js` | Durable conversation and per-call tool/camera cards |
+|------|------|
+| `index.html` | Single page, orb + settings modal (identical UI to the WebRTC app) |
+| `main.js` | State machine, settings, tools, camera, noise-gate UI wiring |
+| `ui/chat.js` | `ChatView`: history panel, ephemeral bubbles, transcript/tool streaming |
+| `ui/account.js` | `Account`: HF login chip + popover, daily-limit modal |
+| `ui/dom.js` | Shared helpers: `$`, `escHtml`, `truncateError`, `DEBUG` |
+| `auth.py` | HF OAuth + per-request identity (tier, hashed keys) |
+| `limiter.py` | SQLite per-day talk-time budget (chunked server-clock reservation) |
+| `ws/s2s-ws-client.js` | WebSocket handshake + OpenAI Realtime GA protocol |
+| `ws/codec.js` | base64 <-> PCM helpers + transcript extraction (pure) |
+| `ws/orb-visualizer.js` | `OrbVisualiser`: FFT bands -> orb CSS custom properties |
+| `worklets/mic-capture.js` | Native-AEC/Strict fallback worklet: resamples capture to 16 kHz PCM16 without a custom predictor |
+| `worklets/aec3/` | SHA-verified pinned Sonora/WebRTC AEC3 WASM, loader, reference-aware capture worklet, build recipe, and license |
+| `worklets/audio-playback.js` | AudioWorklet: 24 kHz Float32 ring buffer -> 48 kHz, linear interp, fade in/out |
+| `style.css` | Orb animations, layout, dark theme (verbatim from the WebRTC app) |
 
-## Limits
+## Audio pipeline notes
 
-- Native audio.cpp streaming and adaptive playback learning are experimental.
-- AEC3 still needs route-specific speaker-loopback and double-talk
-  validation.
-- Provider `Auto` language support is reported from the explicit provider
-  capability policy, not inferred from the general speech-validation request.
-  Only audio.cpp is currently allowlisted; Faster and Groxaxo remain
-  unsupported or unverified. Clone-reference language never substitutes for
-  conversational response language.
-- The managed launcher does not own Gemma, FasterQwen3TTS, Groxaxo, or
-  audio.cpp model lifecycle.
+- **Input**: `getUserMedia({ echoCancellation, noiseSuppression, autoGainControl })`
+  feeds the `mic-capture` worklet at the `AudioContext` rate. The worklet
+  resamples to 16 kHz (boxcar lowpass + decimation on the 48 -> 16 fast
+  path, linear interpolation fallback for odd rates) and packs Int16 LE.
+- **Echo guard**: Native browser AEC is the safe default. Adaptive loads the
+  pinned Sonora/WebRTC AEC3 WASM only after its manifest ABI and SHA-256 pass,
+  then processes aligned 10 ms render-before-capture frames using the exact PCM
+  sent to the playback graph. Any module failure resolves truthfully to Native.
+  Strict applies stronger reference-aware suppression and fails closed by
+  omitting uncertain frames through the playback tail; it never inserts zero
+  PCM. Delay, suppression, leakage, and double-talk sensitivity are saved per
+  microphone/output-device pair. The static voice-clone recording is never used
+  as the echo reference, and Native remains the default until physical
+  speaker-loopback and real human barge-in tests pass.
+- **Output**: `response.output_audio.delta` decodes to Int16 -> Float32
+  and is posted to the `audio-playback` worklet. The worklet maintains a
+  per-context ring buffer, linearly interpolates 24 -> 48, and applies
+  short 32-frame fades on entry/exit to suppress clicks.
+- **Barge-in**: when the server VAD detects user speech mid-response
+  (`input_audio_buffer.speech_started` while `ai-speaking`), the client
+  posts `{ kind: "clear" }` to the playback worklet to wipe the queue
+  immediately. The server itself cancels the in-flight response.
 
 ## Credits
 
-- Backend: [huggingface/speech-to-speech](https://github.com/huggingface/speech-to-speech)
-- Original browser experience: `amir-tfrere/minimal-conversation-app-s2s-backend`
-- Local direct-audio and provider integration: [Omni-NexusAI](https://github.com/Omni-NexusAI)
+- Backend: [huggingface/speech-to-speech](https://github.com/huggingface/speech-to-speech) on `feat/webrtc-transport`
+- UI verbatim from `amir-tfrere/minimal-conversation-app-s2s-backend` (Pollen Robotics × Hugging Face)

@@ -10,37 +10,36 @@
 
 ## Local Voice-Agent Testing Contract
 
-- Local realtime defaults retain 30 complete turns with compaction disabled; context is session-scoped and resets with the WebSocket/backend.
+- Managed direct-audio realtime uses context-budget compaction at 70% usage, targeting 50% and preserving up to six recent settled exchanges verbatim subject to capacity. Ordinary and doubled turn-count eviction are disabled on this path; context remains session-scoped and resets with the WebSocket/backend.
 - VAD is the only direct-audio admission boundary. A completed accepted turn always reaches Gemma once; transcript metadata is optional and must never gate assistant text, tools, or response completion. The live-transcription toggle controls only the temporary speaking bubble.
-- Each accepted direct-audio turn creates exactly one semantic user anchor
-  before assistant or tool state. Upgrade that anchor in place to validated
-  transcript text when available. When the primary response has no transcript,
-  a bounded validated `USER_MEMORY` paraphrase may upgrade the same anchor;
-  otherwise retain its session-only historical `input_audio`. Semantic memory
-  is hidden from the UI, never starts another request, and never gates or
-  replaces assistant text, tools, or the visual `[User audio]` fallback.
-- Context diagnostics report retained history tokens against the live llama.cpp context window; turn retention remains a separate 30-turn policy.
-- Model-level clarification-rate evidence uses the privacy-safe 100-turn direct-audio gate in `scripts/probe_clarification_rate.py`. It is separate from deterministic unit coverage and the managed WebSocket/tool gate, and may emit only aggregate counts, rates, booleans, timings, and error classes.
+- Context diagnostics distinguish estimated and measured usage against the selected model's usable context budget, including instruction, tool, response and multimodal reserves. Compaction protects current/provisional input and unresolved tools, applies atomically only to valid source history, and preserves original history on failure; insufficient capacity is an explicit maintenance state, never silent eviction.
+- Genuine assistant output remains eligible for audible-playback history commitment when the optional user transcript is absent. Keep explicit internal provenance without inventing user words, and preserve provisional rollback, interrupted responses and exact-once tool behavior.
 - `scripts/local_realtime.ps1` is the managed background entry point; foreground launchers remain available for raw-console debugging.
 - Model provider selection is conversation-scoped. Remote completely replaces local Gemma operations without fallback; TTS selection remains independent.
 - One conversation may own only one model HTTP operation at a time. Barge-in cancels or detaches that generation within two seconds without ending the WebSocket session or clearing context.
-- Browser echo protection defaults to Adaptive with exact playback PCM as its reference tap; it resolves truthfully to Native until the bundled AEC3 module is loaded and validated, while Strict may fail closed by pausing upload through the echo tail.
-- Browser web search uses explicit web/news mode and optional day/week/month/year recency. Search results preserve available publication dates and sources, never equate retrieval time with publication time, and permit at most one distinct narrower refinement in the same accepted turn before a response-scoped tool cutoff.
+- Accepted speech and assistant responses use monotonic input/response epochs. Claim a response as pending before Gemma starts; newer confirmed speech invalidates the old epoch before cancellation so stale text, TTS, PCM, history, metrics, and terminal events cannot escape. Browser history commits only after an idempotent first-rendered-sample acknowledgement; clients without that capability commit after the first PCM frame is successfully delivered.
+- An explicit output-admissible response epoch is authoritative through Gemma, both LLM paths, the output processor, and every TTS backend. A completed owner may remain current only for its late rendered-playback acknowledgement; it cannot emit further model, TTS, PCM, metric, or terminal output. Speculative turn identity is a legacy/pre-ownership fallback only; a queued non-interrupt successor waits for promotion before either LLM is called and refreshes its rollback checkpoint when promoted so it cannot erase the audible owner's trailing history.
+- Freeze provider/model lifecycle, clone fingerprint, tuning profile/revision, language, and one response-scoped seed at the first stable assistant phrase. Every later phrase in that answer reuses the snapshot; realtime setting changes apply to the next response.
+- audio.cpp Adaptive playback may change only the bounded startup/re-prime PCM reservoir at the native 24 kHz clock. It must not time-stretch, pitch-shift, duplicate, or silently switch to full buffering; report a provider that cannot sustain realtime and retain the explicit buffered-phrase fallback.
+- Browser echo protection defaults to Native browser AEC. Exact playback PCM remains available as a reference tap; Adaptive resolves to Native until an actual AEC3 module is loaded and validated, while Strict may fail closed by pausing upload through the echo tail.
 
 - This fork is used for local speech-to-speech testing with the OpenAI Realtime-compatible server preserved.
 - Keep upstream pipeline behavior intact unless a change is required for the local direct-audio Gemma path.
 - The local fast-test path intentionally skips Parakeet/transcription with `--stt gemma-audio` and sends completed audio turns directly to the local Gemma audio model.
 - Speech output defaults to the existing Dockerized FasterQwen3TTS-compatible OpenAI API on `8881`; the optional Groxaxo candidate on `8882` is user-managed and must never be started, stopped, or switched by this repo.
 - The custom path defaults to local inference. Explicit private-LAN remote endpoints are allowed, but no automatic cloud or local fallback should be introduced.
-- For Gemma 4 12B tests, use `scripts\launch_gemma_4_12b_16k.ps1` with a 16k context and pass the local llama.cpp installation, main model, draft model, and mmproj through explicit path parameters or environment variables; never publish workstation-specific path defaults.
+- Future laptop Gemma tests must use only the user's existing normal configuration launcher. Do not substitute context or other settings, prescribe an ad-hoc launcher, or infer which normal launcher the user selected.
 - The target TTS service is the stable Docker container name `qwen3-tts-faster` on `http://127.0.0.1:8881/v1`; container IDs are transient after authorized rebuilds and must not be used by lifecycle scripts.
 - Qwen3 clone output must use the `1.7B-Base` backend model by default; the `qwen3-tts-faster` API exposes native incremental PCM16 clone streaming while preserving buffered formats for non-streaming requests.
-- The isolated audio.cpp Qwen3-TTS candidate remains opt-in at `8890`/`8891`: its `qwen3tts-audiocpp` provider is selected only after explicit health, resident-model, private Base-profile, and speech validation. Use native incremental PCM only when the running engine advertises it and a direct chunk probe verifies it; otherwise label and retain the cancellable buffered-phrase fallback. It never changes Faster or Groxaxo lifecycle.
+- The isolated audio.cpp Qwen3-TTS candidate remains opt-in at `8890`/`8891`: its `qwen3tts-audiocpp` provider is selected only after explicit health, resident-model, private Base-profile, and speech validation. Use native incremental PCM only when the running engine advertises it and the supervisor consumes its engine-owned decoder-mode SSE proof from the same iterator before committing the exact native header or relaying PCM; a direct chunk probe must then verify delivery. Otherwise label and retain the cancellable buffered-phrase fallback. It never changes Faster or Groxaxo lifecycle.
+- Buffered phrase PCM remains the stable audio.cpp Playground and HF Realtime
+  fallback/default while native PCM is repaired and benchmarked. Native PCM is
+  selectable only for explicit candidate testing and is never promoted solely
+  because the engine advertises the capability.
 - Faster clone requests carry an explicit assistant language when known; keep the reproducible local server patch under `integrations/` in sync with the rebuilt image.
 - The realtime UI exposes live `Base` clone profiles from the selected TTS
-  backend and retains one valid selection per backend. An explicit voice wins;
-  otherwise use a valid `selected_profile.json`, then the first authoritative
-  live Base profile, or a truthful unavailable state when none exists.
+  backend and retains one valid selection per backend. Faster keeps
+  `clone:16d9bb336799` (`J.A.R.V.I.S`) as its default.
 - Managed HFRT startup is model-independent: missing Gemma or TTS endpoints are
   warnings, and repository launchers never manage external model containers.
 - Do not test Gemma/llama.cpp while the local Gemma server is being rebuilt.

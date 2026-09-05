@@ -1,13 +1,11 @@
 import asyncio
 import importlib.util
 import json
-import math
 import sys
 from pathlib import Path
 
 import pytest
-from fastapi import HTTPException
-from pydantic import ValidationError
+from fastapi.testclient import TestClient
 
 
 def _load_ui_server_module():
@@ -26,293 +24,18 @@ def _load_ui_server_module():
             pass
 
 
-def _mock_serper(monkeypatch, server, payloads, *, status_code=200):
-    calls = []
-    queued = list(payloads)
-
-    class Response:
-        def __init__(self, payload):
-            self.status_code = status_code
-            self._payload = payload
-
-        def json(self):
-            return self._payload
-
-    class Client:
-        def __init__(self, **_kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
-        async def post(self, url, *, headers, json):
-            calls.append({"url": url, "headers": headers, "json": dict(json)})
-            return Response(queued.pop(0))
-
-    monkeypatch.setattr(server.httpx, "AsyncClient", Client)
-    return calls
-
-
-def _response_json(response):
-    return json.loads(response.body.decode("utf-8"))
-
-
-def test_ui_config_runtime_identity_is_bounded_and_process_immutable(monkeypatch):
-    revision = "a" * 40
-    fingerprint = "b" * 64
-    assets = "main=34-opaque-echo-route;ws=21-opaque-echo-route;chat=5-opaque-echo-route;playback=16-adaptive-safe-start"
-    monkeypatch.setenv("S2S_RUNTIME_REVISION", revision)
-    monkeypatch.setenv("S2S_RUNTIME_DIRTY", "0")
-    monkeypatch.setenv("S2S_RUNTIME_SOURCE_FINGERPRINT", fingerprint)
-    monkeypatch.setenv("S2S_UI_ASSET_GENERATION", assets)
-    server = _load_ui_server_module()
-
-    expected = {
-        "source_revision": revision,
-        "source_dirty": False,
-        "source_fingerprint": fingerprint,
-        "ui_asset_generation": assets,
-    }
-    assert server.config()["runtime"] == expected
-    monkeypatch.setenv("S2S_RUNTIME_REVISION", "c" * 40)
-    assert server.config()["runtime"] == expected
-
-
-@pytest.mark.parametrize(
-    ("name", "value", "field"),
-    [
-        ("S2S_RUNTIME_REVISION", "not-a-revision", "source_revision"),
-        ("S2S_RUNTIME_DIRTY", "maybe", "source_dirty"),
-        ("S2S_RUNTIME_SOURCE_FINGERPRINT", "short", "source_fingerprint"),
-        ("S2S_UI_ASSET_GENERATION", "main=" + ("x" * 300) + ";ws=1;chat=1;playback=1", "ui_asset_generation"),
-    ],
-)
-def test_ui_config_runtime_identity_fails_closed(name, value, field, monkeypatch):
-    monkeypatch.setenv("S2S_RUNTIME_REVISION", "a" * 40)
-    monkeypatch.setenv("S2S_RUNTIME_DIRTY", "0")
-    monkeypatch.setenv("S2S_RUNTIME_SOURCE_FINGERPRINT", "b" * 64)
-    monkeypatch.setenv("S2S_UI_ASSET_GENERATION", "main=34;ws=21;chat=5;playback=16")
-    monkeypatch.setenv(name, value)
-    server = _load_ui_server_module()
-    expected = None if field == "source_dirty" else "unknown"
-    assert server.config()["runtime"][field] == expected
-
-
-def test_search_defaults_to_unfiltered_web_and_returns_truthful_versioned_results(monkeypatch):
-    server = _load_ui_server_module()
-    calls = _mock_serper(
-        monkeypatch,
-        server,
-        [
-            {
-                "answerBox": {"answer": "A bounded direct answer"},
-                "organic": [
-                    {
-                        "title": "Reference",
-                        "snippet": "A factual snippet.",
-                        "link": "https://example.test/reference",
-                        "position": 4,
-                    }
-                ],
-            }
-        ],
-    )
-
-    response = asyncio.run(server.search(server.SearchRequest(query="reference topic", key="test-key")))
-    payload = _response_json(response)
-
-    assert calls == [
-        {
-            "url": "https://google.serper.dev/search",
-            "headers": {"X-API-KEY": "test-key", "Content-Type": "application/json"},
-            "json": {"q": "reference topic", "num": server.MAX_RESULTS},
-        }
-    ]
-    assert payload["type"] == "web_search_result"
-    assert payload["schema_version"] == 1
-    assert payload["provider"] == "serper"
-    assert payload["requested_mode"] == "auto"
-    assert payload["effective_mode"] == "web"
-    assert payload["freshness"] == "none"
-    assert payload["recency_filter_applied"] is False
-    assert payload["fallback_applied"] is False
-    assert payload["answer"] == "A bounded direct answer"
-    assert payload["results"] == [
-        {
-            "title": "Reference",
-            "snippet": "A factual snippet.",
-            "url": "https://example.test/reference",
-            "date": None,
-            "source": None,
-            "position": 4,
-        }
-    ]
-    assert payload["retrieved_at_utc"].endswith("Z")
-    assert "today" not in json.dumps(payload).lower()
-    assert response.headers["cache-control"] == "no-store, max-age=0"
-    assert response.headers["pragma"] == "no-cache"
-
-
-@pytest.mark.parametrize(
-    ("mode", "freshness", "endpoint", "qdr", "result_key"),
-    [
-        ("auto", "day", "news", "qdr:d", "news"),
-        ("auto", "week", "news", "qdr:w", "news"),
-        ("web", "month", "search", "qdr:m", "organic"),
-        ("news", "year", "news", "qdr:y", "news"),
-        ("news", "none", "news", None, "news"),
-    ],
-)
-def test_search_maps_mode_and_freshness_to_serper_endpoint_and_qdr(
-    monkeypatch, mode, freshness, endpoint, qdr, result_key
-):
-    server = _load_ui_server_module()
-    calls = _mock_serper(
-        monkeypatch,
-        server,
-        [{result_key: [{"title": "Dated", "link": "https://example.test", "date": "2 hours ago", "source": "Wire"}]}],
-    )
-
-    response = asyncio.run(
-        server.search(server.SearchRequest(query="dated topic", mode=mode, freshness=freshness, key="test-key"))
-    )
-    payload = _response_json(response)
-
-    assert calls[0]["url"] == f"https://google.serper.dev/{endpoint}"
-    assert calls[0]["json"] == {
-        "q": "dated topic",
-        "num": server.MAX_RESULTS,
-        **({"tbs": qdr} if qdr else {}),
-    }
-    assert payload["requested_mode"] == mode
-    assert payload["effective_mode"] == ("news" if endpoint == "news" else "web")
-    assert payload["freshness"] == freshness
-    assert payload["recency_filter_applied"] is (qdr is not None)
-    assert payload["answer"] is None
-    assert payload["results"][0]["date"] == "2 hours ago"
-    assert payload["results"][0]["source"] == "Wire"
-
-
-def test_empty_effective_news_uses_one_same_filter_web_fallback_without_answer_panel(monkeypatch):
-    server = _load_ui_server_module()
-    calls = _mock_serper(
-        monkeypatch,
-        server,
-        [
-            {"news": [], "answerBox": {"answer": "must not leak"}},
-            {
-                "organic": [{"title": "Fallback", "link": "https://example.test/fallback"}],
-                "answerBox": {"answer": "also must not leak"},
-            },
-        ],
-    )
-
-    response = asyncio.run(
-        server.search(server.SearchRequest(query="recent topic", mode="auto", freshness="week", key="test-key"))
-    )
-    payload = _response_json(response)
-
-    assert [call["url"].rsplit("/", 1)[-1] for call in calls] == ["news", "search"]
-    assert [call["json"]["tbs"] for call in calls] == ["qdr:w", "qdr:w"]
-    assert payload["requested_mode"] == "auto"
-    assert payload["effective_mode"] == "web"
-    assert payload["fallback_applied"] is True
-    assert payload["recency_filter_applied"] is True
-    assert payload["answer"] is None
-    assert payload["results"][0]["title"] == "Fallback"
-
-
-def test_empty_explicit_news_stays_news_without_web_fallback(monkeypatch):
-    server = _load_ui_server_module()
-    calls = _mock_serper(monkeypatch, server, [{"news": []}])
-
-    response = asyncio.run(
-        server.search(server.SearchRequest(query="recent topic", mode="news", freshness="week", key="test-key"))
-    )
-    payload = _response_json(response)
-
-    assert [call["url"].rsplit("/", 1)[-1] for call in calls] == ["news"]
-    assert calls[0]["json"]["tbs"] == "qdr:w"
-    assert payload["requested_mode"] == "news"
-    assert payload["effective_mode"] == "news"
-    assert payload["fallback_applied"] is False
-    assert payload["results"] == []
-    assert payload["answer"] is None
-
-
-def test_search_rejects_invalid_or_oversized_inputs_before_provider_call(monkeypatch):
-    server = _load_ui_server_module()
-    with pytest.raises(ValidationError):
-        server.SearchRequest(query="topic", mode="images", key="test-key")
-    with pytest.raises(ValidationError):
-        server.SearchRequest(query="topic", freshness="hour", key="test-key")
-    with pytest.raises(ValidationError):
-        server.SearchRequest(query="topic", extra_field="private", key="test-key")
-    with pytest.raises(HTTPException, match="Empty query"):
-        asyncio.run(server.search(server.SearchRequest(query="   ", key="test-key")))
-    with pytest.raises(HTTPException, match="too long"):
-        asyncio.run(server.search(server.SearchRequest(query="q" * (server.MAX_QUERY_CHARS + 1), key="test-key")))
-
-
-def test_search_bounds_provider_strings_and_provider_failure_is_content_free(monkeypatch, caplog):
-    server = _load_ui_server_module()
-    calls = _mock_serper(
-        monkeypatch,
-        server,
-        [{"organic": [{"title": "t" * 500, "snippet": "s" * 2000, "link": "u" * 3000, "date": "d" * 200, "source": "x" * 400}]}],
-    )
-    payload = _response_json(
-        asyncio.run(server.search(server.SearchRequest(query="bounded", key="test-key")))
-    )
-    result = payload["results"][0]
-    assert len(result["title"]) == server.MAX_RESULT_TITLE_CHARS
-    assert len(result["snippet"]) == server.MAX_RESULT_SNIPPET_CHARS
-    assert len(result["url"]) == server.MAX_RESULT_URL_CHARS
-    assert len(result["date"]) == server.MAX_RESULT_DATE_CHARS
-    assert len(result["source"]) == server.MAX_RESULT_SOURCE_CHARS
-    assert len(calls) == 1
-
-    secret_query = "private query sentinel"
-    secret_body = "private provider body sentinel"
-    _mock_serper(monkeypatch, server, [{"message": secret_body, "query": secret_query}], status_code=429)
-    with caplog.at_level("WARNING"), pytest.raises(HTTPException) as exc_info:
-        asyncio.run(server.search(server.SearchRequest(query=secret_query, key="test-key")))
-    public_failure = str(exc_info.value.detail) + caplog.text
-    assert secret_query not in public_failure
-    assert secret_body not in public_failure
-
-
-def test_voice_library_uses_portable_default_and_env_override(tmp_path, monkeypatch):
-    monkeypatch.delenv("VOICE_LIBRARY_DIR", raising=False)
-    server = _load_ui_server_module()
-    expected = Path.home() / ".speech-to-speech" / "qwen3-tts-voices"
-
-    assert server.DEFAULT_VOICE_LIBRARY_DIR == expected
-    assert server.DEFAULT_VOICE_LIBRARY_DIR.relative_to(Path.home()) == Path(
-        ".speech-to-speech/qwen3-tts-voices"
-    )
-
-    override = tmp_path / "shared-voices"
-    monkeypatch.setenv("VOICE_LIBRARY_DIR", str(override))
-    overridden_server = _load_ui_server_module()
-    assert overridden_server.DEFAULT_VOICE_LIBRARY_DIR == override
-
-
 def test_load_base_clone_profiles_filters_to_base_profiles(tmp_path):
     server = _load_ui_server_module()
     profiles = tmp_path / "profiles"
-    base = profiles / "alpha-base-0001"
+    base = profiles / "16d9bb336799"
     custom = profiles / "not-base"
     base.mkdir(parents=True)
     custom.mkdir()
     (base / "meta.json").write_text(
         json.dumps(
             {
-                "profile_id": "alpha-base-0001",
-                "name": "Alpha Voice",
+                "profile_id": "16d9bb336799",
+                "name": "J.A.R.V.I.S",
                 "task_type": "Base",
                 "created_at": "2026-05-28T05:29:38Z",
                 "ref_text": "Systems are now fully operational.",
@@ -330,9 +53,9 @@ def test_load_base_clone_profiles_filters_to_base_profiles(tmp_path):
 
     assert voices == [
         {
-            "id": "alpha-base-0001",
-            "voice": "clone:alpha-base-0001",
-            "name": "Alpha Voice",
+            "id": "16d9bb336799",
+            "voice": "clone:16d9bb336799",
+            "name": "J.A.R.V.I.S",
             "task_type": "Base",
             "created_at": "2026-05-28T05:29:38Z",
             "ref_text": "Systems are now fully operational.",
@@ -343,14 +66,14 @@ def test_load_base_clone_profiles_filters_to_base_profiles(tmp_path):
 
 def test_audio_cpp_inventory_matches_candidate_live_backend_without_cross_filtering(tmp_path, monkeypatch):
     server = _load_ui_server_module()
-    _base_profile(tmp_path, "alpha-base-0001")
+    _base_profile(tmp_path, "16d9bb336799")
     _base_profile(tmp_path, "47a4e1ef5258")
     monkeypatch.setattr(server, "DEFAULT_VOICE_LIBRARY_DIR", tmp_path)
     payload = {
-        "defaultVoice": "clone:alpha-base-0001",
+        "defaultVoice": "clone:16d9bb336799",
         "selectedVoice": "clone:776a491528c9",
         "voices": [
-            {"id": "alpha-base-0001", "voice": "clone:alpha-base-0001", "name": "Faster copy", "task_type": "Base"},
+            {"id": "16d9bb336799", "voice": "clone:16d9bb336799", "name": "Faster copy", "task_type": "Base"},
             {"id": "22fb07ef3a80", "voice": "clone:22fb07ef3a80", "name": "Candidate A", "task_type": "Base"},
             {"id": "47a4e1ef5258", "voice": "clone:47a4e1ef5258", "name": "Faster copy 2", "task_type": "Base"},
             {"id": "776a491528c9", "voice": "clone:776a491528c9", "name": "Candidate B", "task_type": "Base"},
@@ -360,12 +83,12 @@ def test_audio_cpp_inventory_matches_candidate_live_backend_without_cross_filter
     scoped = server._scope_audio_cpp_profile_response(payload)
 
     assert [profile["voice"] for profile in scoped["voices"]] == [
-        "clone:alpha-base-0001",
+        "clone:16d9bb336799",
         "clone:22fb07ef3a80",
         "clone:47a4e1ef5258",
         "clone:776a491528c9",
     ]
-    assert scoped["defaultVoice"] == "clone:alpha-base-0001"
+    assert scoped["defaultVoice"] == "clone:16d9bb336799"
     assert scoped["selectedVoice"] == "clone:776a491528c9"
 
 
@@ -384,14 +107,178 @@ def test_live_backend_voice_inventory_disables_http_caching(monkeypatch):
     assert response.headers["pragma"] == "no-cache"
 
 
-def _base_profile(library: Path, profile_id: str = "alpha-base-0001", name: str = "Alpha Voice") -> None:
+def test_audio_cpp_snapshot_proxies_are_get_only_no_store_and_bounded(monkeypatch):
+    """Exercise the mounted UI server; these are not a general candidate relay."""
+    server = _load_ui_server_module()
+    calls = []
+
+    class UpstreamResponse:
+        def __init__(self, status_code, content):
+            self.status_code = status_code
+            self.content = content
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url):
+            calls.append(url)
+            if url.endswith("/voices/profiles/fail-profile"):
+                return UpstreamResponse(409, b'{"detail":"clone changed"}')
+            return UpstreamResponse(200, b'{"ok":true}')
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda **_kwargs: Client())
+    client = TestClient(server.app)
+
+    status = client.get("/api/audio-cpp/control/status")
+    profile = client.get("/api/audio-cpp/v1/voices/profiles/clone-01")
+    upstream_error = client.get("/api/audio-cpp/v1/voices/profiles/fail-profile")
+    outcome = client.get("/api/audio-cpp/audio/outcomes/0123456789abcdef0123456789abcdef")
+    malformed = client.get("/api/audio-cpp/v1/voices/profiles/%2E%2E")
+    malformed_outcome = client.get("/api/audio-cpp/audio/outcomes/not-an-outcome")
+    disallowed_method = client.post("/api/audio-cpp/control/status", content=b'{}')
+
+    assert status.request.method == "GET"
+    assert profile.request.method == "GET"
+    assert status.status_code == profile.status_code == outcome.status_code == 200
+    assert status.json() == profile.json() == outcome.json() == {"ok": True}
+    for response in (status, profile, outcome, upstream_error):
+        assert response.headers["cache-control"] == "no-store, max-age=0"
+        assert response.headers["pragma"] == "no-cache"
+    assert upstream_error.status_code == 409
+    assert upstream_error.json() == {"detail": "clone changed"}
+    assert malformed.status_code == 404
+    assert malformed_outcome.status_code == 404
+    assert disallowed_method.status_code == 405
+    assert calls == [
+        "http://127.0.0.1:8890/control/status",
+        "http://127.0.0.1:8890/v1/voices/profiles/clone-01",
+        "http://127.0.0.1:8890/v1/voices/profiles/fail-profile",
+        "http://127.0.0.1:8890/v1/audio/outcomes/0123456789abcdef0123456789abcdef",
+    ]
+
+
+def test_tuning_resolution_response_is_uncached_even_on_conflict(monkeypatch):
+    server = _load_ui_server_module()
+    calls = []
+
+    class Client:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def request(self, method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return server.httpx.Response(409, json={"detail": "profile revision changed"})
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", lambda **kwargs: Client())
+    response = TestClient(server.app).post("/api/audio-cpp/tuning/resolve", json={"profile_id": "balanced"})
+    assert response.status_code == 409
+    assert response.headers["cache-control"] == "no-store, max-age=0"
+    assert response.headers["pragma"] == "no-cache"
+    assert calls == [("POST", "http://127.0.0.1:8890/v1/tuning/resolve", {"json": {"profile_id": "balanced"}})]
+
+
+def test_local_pipeline_reports_the_persisted_remote_model_identity(monkeypatch):
+    server = _load_ui_server_module()
+
+    class InventoryResponse:
+        status_code = 200
+
+        def json(self):
+            return {"data": [{"id": "inventory-first-but-not-selected"}]}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url):
+            return InventoryResponse()
+
+    monkeypatch.setattr(
+        server,
+        "_read_public_ui_settings",
+        lambda: {
+            "modelProvider": "remote",
+            "modelUrl": "http://192.168.0.178:8081/v1/",
+            "modelName": "gemma-4-12b",
+            "ttsBackend": "qwen3tts-audiocpp",
+        },
+    )
+    monkeypatch.setattr(server.httpx, "AsyncClient", FakeAsyncClient)
+
+    status = asyncio.run(server.local_pipeline())
+
+    assert status["gemma"] == {
+        "provider": "remote",
+        "baseUrl": "http://192.168.0.178:8081/v1",
+        "model": "gemma-4-12b",
+        "reachable": True,
+        "contextWindow": None,
+        "availableModels": ["inventory-first-but-not-selected"],
+    }
+
+
+def test_local_pipeline_ignores_remote_url_when_local_provider_is_selected(monkeypatch):
+    server = _load_ui_server_module()
+
+    class UnreachableResponse:
+        status_code = 503
+
+        def json(self):
+            return {}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url):
+            return UnreachableResponse()
+
+    monkeypatch.setenv("GEMMA_AUDIO_BASE_URL", "http://127.0.0.1:8818/v1")
+    monkeypatch.setenv("GEMMA_AUDIO_MODEL", "local-gemma")
+    monkeypatch.setattr(
+        server,
+        "_read_public_ui_settings",
+        lambda: {
+            "modelProvider": "local",
+            "modelUrl": "http://192.168.0.178:8081/v1",
+            "modelName": "stale-remote-model",
+            "ttsBackend": "faster",
+        },
+    )
+    monkeypatch.setattr(server.httpx, "AsyncClient", FakeAsyncClient)
+
+    status = asyncio.run(server.local_pipeline())
+
+    assert status["gemma"]["provider"] == "local"
+    assert status["gemma"]["baseUrl"] == "http://127.0.0.1:8818/v1"
+    assert status["gemma"]["model"] == "local-gemma"
+
+
+def _base_profile(library: Path, profile_id: str = "16d9bb336799") -> None:
     profile_dir = library / "profiles" / profile_id
     profile_dir.mkdir(parents=True)
     (profile_dir / "ref_audio.wav").write_bytes(b"RIFF\x00\x00\x00\x00WAVE")
     (profile_dir / "meta.json").write_text(
         json.dumps({
             "profile_id": profile_id,
-            "name": name,
+            "name": "J.A.R.V.I.S",
             "task_type": "Base",
             "language": "Auto",
             "ref_text": "Original reference.",
@@ -401,47 +288,13 @@ def _base_profile(library: Path, profile_id: str = "alpha-base-0001", name: str 
     )
 
 
-def test_profile_response_prefers_valid_selection_then_first_live_base_or_none(tmp_path):
-    server = _load_ui_server_module()
-    _base_profile(tmp_path, "beta-base-0002", "Beta Voice")
-    _base_profile(tmp_path, "alpha-base-0001", "Alpha Voice")
-    selected_path = tmp_path / "selected_profile.json"
-
-    selected_path.write_text(json.dumps({"profile_id": "beta-base-0002"}), encoding="utf-8")
-    selected = server._profile_response(tmp_path)
-    assert selected["defaultVoice"] == "clone:alpha-base-0001"
-    assert selected["selectedVoice"] == "clone:beta-base-0002"
-
-    selected_path.write_text(json.dumps({"profile_id": "stale-base-0099"}), encoding="utf-8")
-    fallback = server._profile_response(tmp_path)
-    assert fallback["defaultVoice"] == "clone:alpha-base-0001"
-    assert fallback["selectedVoice"] == "clone:alpha-base-0001"
-
-    empty = server._profile_response(tmp_path / "empty")
-    assert empty["defaultVoice"] is None
-    assert empty["selectedVoice"] is None
-    assert empty["voices"] == []
-
-
-def test_selected_profile_can_be_deleted_without_a_privileged_identity(tmp_path, monkeypatch):
-    server = _load_ui_server_module()
-    _base_profile(tmp_path)
-    monkeypatch.setattr(server, "DEFAULT_VOICE_LIBRARY_DIR", tmp_path)
-    server.select_qwen3_profile(server.ProfileSelectRequest(profile_id="alpha-base-0001"))
-
-    deleted = server.delete_qwen3_profile("alpha-base-0001")
-
-    assert deleted["voices"] == []
-    assert deleted["selectedVoice"] is None
-
-
 def test_clone_profile_management_persists_to_configured_library(tmp_path, monkeypatch):
     server = _load_ui_server_module()
     _base_profile(tmp_path)
     monkeypatch.setattr(server, "DEFAULT_VOICE_LIBRARY_DIR", tmp_path)
 
     created = server.create_qwen3_profile(
-        server.ProfileCreateRequest(name="Copied", ref_text="Copied reference.", source_profile_id="alpha-base-0001")
+        server.ProfileCreateRequest(name="Copied", ref_text="Copied reference.", source_profile_id="16d9bb336799")
     )
     copied = next(profile for profile in created["voices"] if profile["name"] == "Copied")
     assert (tmp_path / "profiles" / copied["id"] / "ref_audio.wav").is_file()
@@ -1000,9 +853,7 @@ def test_tool_output_is_acknowledged_before_one_post_tool_response():
     assert main_js.index("sessionClient.sendToolOutput") < main_js.index("sessionClient.requestToolResponse")
     assert main_js.index("sessionClient.requestToolResponse") < main_js.index("await outputAck")
     assert "requestToolResponse(opts = {})" in client_js
-    assert 'type: "response.create"' in client_js
-    assert "...(opts.tools ? { tools: opts.tools } : {})" in client_js
-    assert "...(opts.toolChoice ? { tool_choice: opts.toolChoice } : {})" in client_js
+    assert 'this._send({ type: "response.create" })' in client_js
 
 
 def test_local_ui_teardown_isolates_closed_client_events():
@@ -1012,12 +863,12 @@ def test_local_ui_teardown_isolates_closed_client_events():
 
     assert "if (client !== c) return;" in main_js
     assert "const closingClient = client;\n  client = null;" in main_js
-    assert "runTool(c, name, callId, lifecycle, prepared)" in main_js
+    assert "runTool(c, name, args, callId)" in main_js
     assert 'if (this._closed && status !== "closed") return;' in client_js
     assert 'this._captureNode?.port.postMessage({ kind: "enable", value: false });' in client_js
-    assert 'this._invalidatePlayback("stop")' in client_js
+    assert 'if (!this._closed) this._invalidatePlayback("stop");' in client_js
     assert 'kind: "clear",' in client_js
-    assert 'generation: this._playbackGeneration' in client_js
+    assert "generation: this._playbackGeneration" in client_js
 
 
 def test_diagnostics_use_transcription_and_dynamic_context_tokens():
@@ -1083,9 +934,6 @@ def test_remote_model_connection_test_redacts_key(monkeypatch):
 def test_hf_ui_persistent_preferences_are_atomic_and_exclude_api_keys(tmp_path, monkeypatch):
     server = _load_ui_server_module()
     monkeypatch.setattr(server, "UI_SETTINGS_PATH", tmp_path / "hf_realtime_ui_settings.json")
-    many_routes = {
-        f"route_{index:064x}": {"delayMs": index} for index in range(18)
-    }
 
     result = server._write_public_ui_settings(
         {
@@ -1097,19 +945,15 @@ def test_hf_ui_persistent_preferences_are_atomic_and_exclude_api_keys(tmp_path, 
             },
             "modelUrl": "http://127.0.0.1:8818",
             "fullBufferTts": False,
+            "ttsDeliveryMode": "native_incremental_pcm",
             "echoCalibrations": {
-                "mic-a::output-b": {"delayMs": 99},
-                f"route_{'b' * 64}": {"delayMs": math.nan},
-                f"route_{'c' * 64}": {"delayMs": 10**10000},
-                **many_routes,
-                f"route_{'a' * 64}": {
+                "mic-a::output-b": {
                     "delayMs": 72,
                     "suppressionStrength": 0.8,
                     "leakageThreshold": 4,
                     "doubleTalkSensitivity": -1,
-                    "echoTailMs": 0,
                     "unexpected": 99,
-                },
+                }
             },
             "modelApiKey": "must-not-persist",
         }
@@ -1118,62 +962,63 @@ def test_hf_ui_persistent_preferences_are_atomic_and_exclude_api_keys(tmp_path, 
     saved = json.loads(server.UI_SETTINGS_PATH.read_text(encoding="utf-8"))
     assert result["ttsBackend"] == "qwen3tts-audiocpp"
     assert saved["modelUrl"] == "http://127.0.0.1:8818"
+    assert saved["ttsDeliveryMode"] == "native_incremental_pcm"
     assert saved["ttsProfileByBackend"] == {
         "qwen3tts-audiocpp": "low-latency",
         "faster": "provider-default",
     }
-    assert saved["echoCalibrations"][f"route_{'a' * 64}"] == {
+    assert saved["echoCalibrations"]["mic-a::output-b"] == {
         "delayMs": 72.0,
         "suppressionStrength": 0.8,
         "leakageThreshold": 1.0,
         "doubleTalkSensitivity": 0.0,
-        "echoTailMs": 350.0,
     }
-    assert "mic-a::output-b" not in saved["echoCalibrations"]
-    assert f"route_{'b' * 64}" not in saved["echoCalibrations"]
-    assert f"route_{'c' * 64}" not in saved["echoCalibrations"]
-    assert len(saved["echoCalibrations"]) == 16
-    assert f"route_{0:064x}" not in saved["echoCalibrations"]
     assert "modelApiKey" not in saved
     assert "must-not-persist" not in server.UI_SETTINGS_PATH.read_text(encoding="utf-8")
     assert not server.UI_SETTINGS_PATH.with_suffix(".tmp").exists()
 
 
-def test_hf_ui_echo_route_order_survives_write_read_and_newest_eviction(tmp_path, monkeypatch):
+def test_hf_ui_history_compaction_preferences_are_bounded(tmp_path, monkeypatch):
     server = _load_ui_server_module()
     monkeypatch.setattr(server, "UI_SETTINGS_PATH", tmp_path / "hf_realtime_ui_settings.json")
-    initial = {
-        f"route_{index:064x}": {"delayMs": index}
-        for index in range(16, 32)
+
+    saved = server._write_public_ui_settings({
+        "historyCompaction": {
+            "enabled": False,
+            "trigger_ratio": 4,
+            "target_ratio": -1,
+            "recent_turns": 99,
+        }
+    })
+
+    assert saved["historyCompaction"] == {
+        "enabled": False,
+        "trigger_ratio": 0.9,
+        "target_ratio": 0.1,
+        "recent_turns": 12,
     }
-    server._write_public_ui_settings({"echoCalibrations": initial})
-    loaded = server._read_public_ui_settings()["echoCalibrations"]
-    newest = f"route_{'0' * 63}a"
-    loaded[newest] = {"delayMs": 77}
-    server._write_public_ui_settings({"echoCalibrations": loaded})
-    reloaded = server._read_public_ui_settings()["echoCalibrations"]
-
-    assert list(reloaded)[-1] == newest
-    assert f"route_{16:064x}" not in reloaded
-    assert f"route_{31:064x}" in reloaded
 
 
-def test_hf_ui_read_scrubs_current_and_legacy_raw_echo_routes(tmp_path, monkeypatch):
+def test_hf_ui_read_migrates_legacy_secret_without_returning_it(tmp_path, monkeypatch):
     server = _load_ui_server_module()
-    current = tmp_path / "current" / "hf_realtime_ui_settings.json"
-    legacy = tmp_path / "legacy" / "hf_realtime_ui_settings.json"
-    current.parent.mkdir(parents=True)
-    legacy.parent.mkdir(parents=True)
-    payload = {"echoCalibrations": {"mic-a::output-b": {"delayMs": 99}}}
-    current.write_text(json.dumps(payload), encoding="utf-8")
-    legacy.write_text(json.dumps(payload), encoding="utf-8")
-    monkeypatch.setattr(server, "UI_SETTINGS_PATH", current)
-    monkeypatch.setattr(server, "_LEGACY_UI_SETTINGS_PATH", legacy)
-    monkeypatch.setattr(server, "_ui_settings_default", current)
+    settings_path = tmp_path / "hf_realtime_ui_settings.json"
+    monkeypatch.setattr(server, "UI_SETTINGS_PATH", settings_path)
+    settings_path.write_text(
+        json.dumps({
+            "modelApiKey": "legacy-secret-must-never-escape",
+            "modelUrl": "http://127.0.0.1:8818",
+            "ttsBackend": "faster",
+        }),
+        encoding="utf-8",
+    )
 
-    assert server._read_public_ui_settings()["echoCalibrations"] == {}
-    assert "mic-a::output-b" not in current.read_text(encoding="utf-8")
-    assert "mic-a::output-b" not in legacy.read_text(encoding="utf-8")
+    restored = server._read_public_ui_settings()
+
+    assert restored == {"modelUrl": "http://127.0.0.1:8818", "ttsBackend": "faster"}
+    persisted = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert persisted == restored
+    assert "modelApiKey" not in persisted
+    assert "legacy-secret-must-never-escape" not in settings_path.read_text(encoding="utf-8")
 
 
 def test_hf_ui_normalizes_legacy_audio_cpp_provider_settings(tmp_path, monkeypatch):

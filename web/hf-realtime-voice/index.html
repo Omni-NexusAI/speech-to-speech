@@ -190,16 +190,33 @@
            <span id="diagnostics-audio-summary">provider pending · profile pending · mode pending · first PCM pending</span>
          </summary>
          <div class="diagnostics-audio-body">
-          <div class="diagnostics-profile-row">
-            <label>TTS profile <select id="diagnostics-tts-profile"></select></label>
-            <button id="diagnostics-tts-profile-apply" type="button">Use in Realtime</button>
-          </div>
+           <div class="diagnostics-profile-row">
+             <label>TTS profile <select id="diagnostics-tts-profile"></select></label>
+             <button id="diagnostics-tts-profile-apply" type="button">Use in Realtime</button>
+           </div>
+            <div class="diagnostics-profile-row">
+              <label>Playback continuity
+                <select id="diagnostics-playback-continuity">
+                  <option value="adaptive" selected>Adaptive (recommended)</option>
+                  <option value="fast-start">Fast start</option>
+                </select>
+              </label>
+            </div>
+            <div class="diagnostics-profile-row">
+              <label>TTS delivery
+                <select id="diagnostics-tts-delivery-mode">
+                  <option value="buffered_phrase" selected>Buffered phrase (stable default)</option>
+                  <option value="native_incremental_pcm">Native PCM (experimental)</option>
+                </select>
+              </label>
+            </div>
           <div class="diagnostics-profile-row diagnostics-profile-save-row">
             <label>New profile name <input id="diagnostics-tts-profile-name" type="text" maxlength="80" placeholder="My tuned profile"></label>
             <button id="diagnostics-tts-profile-save-as" type="button">Save effective values as new profile</button>
           </div>
           <p class="diagnostics-audio-note">Built-in profiles are immutable. Save As creates a custom profile from the current effective values.</p>
-          <p id="diagnostics-tuning-status" class="diagnostics-audio-note">Select audio.cpp to tune its next session.</p>
+           <p id="diagnostics-tuning-status" class="diagnostics-audio-note">Select audio.cpp to tune the next assistant response. An answer already producing keeps its frozen profile.</p>
+           <p class="diagnostics-audio-note">Buffered phrase is the stable audio.cpp default. Native PCM is a separate experimental opt-in and is accepted only after the candidate proves its native delivery header and two nonempty PCM chunks. Both preserve model-native PCM16 at 24 kHz; Faster and Groxaxo remain 16 kHz. Adaptive only changes the startup reservoir (maximum two seconds), never pitch, duration, quality, or sample clock. Fast start retains the fixed profile target.</p>
           <details id="diagnostics-tuning-advanced">
             <summary>Advanced synthesis controls</summary>
             <div class="diagnostics-tuning-value-state" aria-label="Tuning value sources">
@@ -233,13 +250,13 @@
               <legend>Expert safety <span class="layer-badge">explicit opt-in</span></legend>
               <div class="diagnostics-tuning-grid">
                 <label>Required resident model<small class="layer-badge">safety</small><input id="tuning-model" data-tuning-key="model" data-tuning-type="string" type="text" placeholder="current resident model"></label>
-                <label>Decoder context (frames)<small class="layer-badge layer-badge-warning">experimental below 72</small><input id="tuning-left-context-frames" data-tuning-key="left_context_frames" type="number" min="1" max="300" step="1" disabled></label>
+                <label>Decoder context (frames)<small class="layer-badge layer-badge-warning">experimental below 25</small><input id="tuning-left-context-frames" data-tuning-key="left_context_frames" type="number" min="1" max="300" step="1" disabled></label>
                 <label class="diagnostics-tuning-check"><input id="tuning-context-unlock" type="checkbox">Unlock unsafe decoder-context editing</label>
                 <label>Clone mode<small class="layer-badge">fixed</small><input type="text" value="Full ICL" disabled></label>
                 <label>Crossfade (samples)<small class="layer-badge">inactive</small><input id="tuning-crossfade" type="number" value="0" disabled></label>
-                    <label>Model / Realtime transport<small class="layer-badge">fixed</small><input type="text" value="24 kHz / 16 kHz PCM16" disabled></label>
+                    <label>Model / Realtime transport<small class="layer-badge">server acknowledged</small><input type="text" value="audio.cpp: PCM16 / 24 kHz · Faster/Groxaxo: PCM16 / 16 kHz" disabled></label>
               </div>
-              <p class="diagnostics-audio-note diagnostics-context-warning" id="diagnostics-context-warning">Keep decoder context at the model-required 72 frames. Reducing it can cause progressive quality loss.</p>
+              <p class="diagnostics-audio-note diagnostics-context-warning" id="diagnostics-context-warning">Keep decoder context at the model-required 25 frames. Reducing it can cause progressive quality loss.</p>
             </fieldset>
             <div class="diagnostics-tuning-actions">
               <button id="diagnostics-tuning-apply" type="button">Apply temporary overrides</button>
@@ -249,25 +266,36 @@
          </details>
           <details><summary>Echo and live measurements</summary>
             <p id="diagnostics-audio-status">AEC3 is verified when a conversation starts; Native remains the fallback.</p>
-            <p class="diagnostics-audio-note"><strong id="diagnostics-echo-device-pair">opaque route pending</strong> · <span id="diagnostics-echo-output-latency">Output latency: pending</span></p>
-            <p id="diagnostics-echo-calibration-status" class="diagnostics-audio-note">Calibration pending: start quiet playback to collect a stable route measurement.</p>
+            <p class="diagnostics-audio-note"><strong id="diagnostics-echo-device-pair">device pair pending</strong> · <span id="diagnostics-echo-output-latency">Output latency: pending</span></p>
             <div class="diagnostics-tuning-grid">
               <label>Reference delay (ms)<input data-echo-calibration-key="delayMs" type="number" min="0" max="500" step="1" value="0"></label>
-              <label>Strict-only suppression strength<input data-echo-calibration-key="suppressionStrength" type="number" min="0" max="1" step="0.05" value="0.65"></label>
-              <label>Strict-only leakage threshold<input data-echo-calibration-key="leakageThreshold" type="number" min="0.05" max="1" step="0.05" value="0.65"></label>
-              <label>Strict-only double-talk sensitivity<input data-echo-calibration-key="doubleTalkSensitivity" type="number" min="0" max="1" step="0.05" value="0.5"></label>
-              <label>Echo tail (ms)<input data-echo-calibration-key="echoTailMs" type="number" min="350" max="1000" step="10" value="350"></label>
+              <label>Strict suppression strength<input data-echo-calibration-key="suppressionStrength" type="number" min="0" max="1" step="0.05" value="0.65"></label>
+              <label>Leakage threshold<input data-echo-calibration-key="leakageThreshold" type="number" min="0.05" max="1" step="0.05" value="0.65"></label>
+              <label>Double-talk sensitivity<input data-echo-calibration-key="doubleTalkSensitivity" type="number" min="0" max="1" step="0.05" value="0.5"></label>
             </div>
             <div class="diagnostics-tuning-actions">
               <button id="diagnostics-echo-save" type="button">Save device calibration</button>
               <button id="diagnostics-echo-use-measured" type="button">Use measured delay</button>
             </div>
-            <p class="diagnostics-audio-note">Calibration is saved under an opaque microphone/output-route fingerprint. Adaptive keeps AEC3-processed near-end speech eligible for barge-in; Strict can fail closed.</p>
+            <p class="diagnostics-audio-note">Calibration is saved separately for this microphone/output pair. Adaptive keeps AEC3-processed near-end speech eligible for barge-in; Strict can fail closed.</p>
             <pre id="diagnostics-audio-metrics">Waiting for latency, model, profile, echo, and GPU metrics.</pre>
           </details>
          </div>
-       </details>
-      <details class="diagnostics-raw">
+        </details>
+        <details id="diagnostics-history-compaction" class="diagnostics-audio" aria-label="History compaction diagnostics">
+          <summary class="diagnostics-audio-heading"><span>History compaction</span><span id="diagnostics-history-compaction-summary">Configured locally; awaiting backend acknowledgement.</span></summary>
+          <div class="diagnostics-audio-body">
+            <div class="diagnostics-tuning-grid">
+              <label class="diagnostics-tuning-check"><input id="history-compaction-enabled" type="checkbox" checked>Enable bounded history compaction</label>
+              <label>Trigger ratio<input id="history-compaction-trigger" type="number" min="0.20" max="0.90" step="0.01" value="0.70"></label>
+              <label>Target ratio<input id="history-compaction-target" type="number" min="0.10" max="0.85" step="0.01" value="0.50"></label>
+              <label>Recent complete turns<input id="history-compaction-recent-turns" type="number" min="1" max="12" step="1" value="6"></label>
+            </div>
+            <p id="diagnostics-history-compaction-status" class="diagnostics-audio-note">No backend usage measurement has arrived.</p>
+            <p class="diagnostics-audio-note">This only configures the next compaction boundary. It does not estimate retained tokens or claim a compaction result.</p>
+          </div>
+        </details>
+        <details class="diagnostics-raw">
         <summary>Raw metrics</summary>
         <div id="diagnostics-list" class="diagnostics-list"></div>
       </details>
@@ -392,7 +420,7 @@
             <label class="field">
               <span>Voice</span>
               <select id="voice">
-                <option value="" selected disabled>Loading live Base clone profiles...</option>
+                <option value="clone:16d9bb336799" selected>J.A.R.V.I.S (clone:16d9bb336799)</option>
               </select>
             </label>
 
@@ -472,11 +500,11 @@
             <label class="field">
               <span>Assistant echo guard</span>
               <select id="echo-guard">
-                <option value="native">Native browser AEC</option>
-                <option value="adaptive" selected>Adaptive (AEC3 reference cancellation, default)</option>
+                <option value="native" selected>Native browser AEC (default)</option>
+                <option value="adaptive">Adaptive (AEC3 reference cancellation)</option>
                 <option value="strict">Strict</option>
               </select>
-              <small>Adaptive is the default and uses the verified playback-reference AEC3 module, falling back truthfully to Native if loading fails. Strict pauses uncertain mic upload without manufacturing silence.</small>
+              <small>Native browser AEC is the default. Adaptive uses the verified playback-reference AEC3 module and falls back truthfully to Native if loading fails. Strict pauses uncertain mic upload without manufacturing silence.</small>
             </label>
 
             <div class="field local-mode-field">
@@ -583,6 +611,6 @@
       </div>
     </dialog>
 
-  <script type="module" src="main.js?v=36-stateful-polyphase"></script>
+  <script type="module" src="main.js?v=30-history-outcomes"></script>
   </body>
 </html>

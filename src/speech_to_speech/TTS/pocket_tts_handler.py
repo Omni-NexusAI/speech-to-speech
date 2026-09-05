@@ -12,6 +12,7 @@ from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.handler_types import TTSIn, TTSOut
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, EndOfResponse
+from speech_to_speech.pipeline.response_ownership import response_output_allowed
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 
 logger = logging.getLogger(__name__)
@@ -98,22 +99,40 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
     def process(self, tts_input: TTSIn) -> Iterator[TTSOut]:
         speculative_turns = getattr(self, "speculative_turns", None)
         if isinstance(tts_input, EndOfResponse):
-            if speculative_turns and not speculative_turns.is_latest_after_reopen_grace(
-                tts_input.turn_id,
-                tts_input.turn_revision,
+            if not response_output_allowed(
+                runtime_config=getattr(tts_input, "runtime_config", None),
+                response_epoch=tts_input.response_epoch,
+                turn_id=tts_input.turn_id,
+                turn_revision=tts_input.turn_revision,
+                speculative_turns=speculative_turns,
+                cancel_scope=getattr(self, "cancel_scope", None),
             ):
                 return
             yield AUDIO_RESPONSE_DONE
             return
 
-        if speculative_turns and not speculative_turns.is_latest_after_reopen_grace(
-            tts_input.turn_id,
-            tts_input.turn_revision,
+        if not response_output_allowed(
+            runtime_config=tts_input.runtime_config,
+            response_epoch=tts_input.response_epoch,
+            turn_id=tts_input.turn_id,
+            turn_revision=tts_input.turn_revision,
+            speculative_turns=speculative_turns,
+            cancel_scope=getattr(self, "cancel_scope", None),
         ):
             logger.debug("Dropping stale TTS input for turn=%s rev=%s", tts_input.turn_id, tts_input.turn_revision)
             return
         if speculative_turns:
             speculative_turns.commit(tts_input.turn_id, tts_input.turn_revision)
+
+        def response_is_current() -> bool:
+            return response_output_allowed(
+                runtime_config=tts_input.runtime_config,
+                response_epoch=tts_input.response_epoch,
+                turn_id=tts_input.turn_id,
+                turn_revision=tts_input.turn_revision,
+                speculative_turns=speculative_turns,
+                cancel_scope=getattr(self, "cancel_scope", None),
+            )
 
         gen = self.cancel_scope.generation if self.cancel_scope else None
         language_code = tts_input.language_code
@@ -157,7 +176,7 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
             max_tokens=self.max_tokens,
             copy_state=True,  # Don't modify the original voice state
         ):
-            if gen is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(gen):
+            if not response_is_current() or (gen is not None and self.cancel_scope is not None and self.cancel_scope.is_stale(gen)):
                 logger.info("TTS generation cancelled (interruption)")
                 return
             if first_chunk:
@@ -220,6 +239,8 @@ class PocketTTSHandler(BaseHandler[TTSIn, TTSOut]):
 
             # Yield in blocks
             for i in range(0, len(audio_int16), self.blocksize):
+                if not response_is_current():
+                    return
                 chunk = audio_int16[i : i + self.blocksize]
                 # Pad last chunk if needed
                 if len(chunk) < self.blocksize:

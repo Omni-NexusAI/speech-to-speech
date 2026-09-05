@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import queue
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -275,6 +276,69 @@ def test_streaming_text_and_usage():
     assert tools == []
     # assistant text was stored back into the conversation history
     assert any(getattr(i, "role", None) == "assistant" for i in chat.buffer)
+
+
+def test_streaming_outputs_preserve_response_epoch_identity():
+    """Every output from one provider request belongs to one response owner."""
+    h = _make_handler(stream=True)
+    h.client.chat.completions.create = lambda **k: _FakeStream(
+        [
+            _chunk(content="Hallo."),
+            _chunk(usage=SimpleNamespace(prompt_tokens=12, completion_tokens=5)),
+        ]
+    )
+    chat = Chat(10)
+    chat.add_item(make_user_message("Hallo"))
+    runtime_config = RuntimeConfig(
+        chat=chat,
+        session=RealtimeSessionCreateRequest(type="realtime", instructions="Du bist ein Roboter."),
+    )
+    request = GenerateResponseRequest(
+        runtime_config=runtime_config,
+        language_code="de",
+        turn_id="turn_epoch",
+        turn_revision=2,
+        input_epoch=7,
+        response_epoch=11,
+        response_id="resp_epoch_11",
+    )
+
+    outputs = list(h.process(request))
+
+    assert any(isinstance(output, LLMResponseChunk) for output in outputs)
+    assert any(isinstance(output, TokenUsage) for output in outputs)
+    assert isinstance(outputs[-1], EndOfResponse)
+    for output in outputs:
+        assert output.input_epoch == 7
+        assert output.response_epoch == 11
+        assert output.response_id == "resp_epoch_11"
+
+
+def test_stale_epoch_cannot_commit_chat_after_final_admission_check():
+    """The tracker-owned history guard closes the final check/write race."""
+
+    @contextmanager
+    def reject_history(_epoch):
+        yield False
+
+    h = _make_handler(stream=True)
+    h.client.chat.completions.create = lambda **_kwargs: _FakeStream(
+        [_chunk(content="Do not retain me."), _chunk(usage=SimpleNamespace(prompt_tokens=4, completion_tokens=3))]
+    )
+    chat = Chat(10)
+    chat.add_item(make_user_message("superseded input"))
+    runtime_config = RuntimeConfig(
+        chat=chat,
+        session=RealtimeSessionCreateRequest(type="realtime", instructions="Be concise."),
+    )
+    runtime_config.local_pipeline["_response_epoch_is_current"] = lambda epoch: epoch == 31
+    runtime_config.local_pipeline["_response_epoch_history_transaction"] = reject_history
+    request = GenerateResponseRequest(runtime_config=runtime_config, response_epoch=31)
+
+    outputs = list(h.process(request))
+
+    assert not any(getattr(item, "role", None) == "assistant" for item in chat.buffer)
+    assert not any(isinstance(output, TokenUsage) for output in outputs)
 
 
 def test_streaming_tool_call_accumulates_arguments():

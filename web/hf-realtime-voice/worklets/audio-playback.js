@@ -10,12 +10,11 @@
  * Lifecycle / messaging:
  *
  *   main -> worklet:
- *     { kind: "config", inputRate, generation }          startup
- *     { kind: "audio", samples, generation, primeMs, ceilingMs,
- *       targetSamples, ceilingSamples, inputSampleOffset,
- *       inputSampleCount, streamId }                     every PCM chunk
- *     { kind: "end", generation, streamId,
- *       inputSamples }                                   idempotent stream flush
+ *     { kind: "config", inputRate, generation }          next-response default
+ *     { kind: "audio", samples, generation, primeMs, reprimeMs, maxPrimeMs,
+ *       streamId, responseEpoch, sourceSampleRate }        every PCM chunk
+ *     { kind: "end", generation, streamId, responseEpoch,
+ *       sourceSampleRate }                                idempotent stream flush
  *     { kind: "clear", generation, reason }             cancellation boundary
  *
  *   worklet -> main:
@@ -26,7 +25,8 @@
  *     { kind: "stale_chunk_rejected", ... }
  *
  * Priming never consumes queued samples. A genuine mid-stream underrun returns
- * to the same priming target instead of restarting from the next tiny block.
+ * to the bounded steady-state re-prime target, never the larger cold-start
+ * reservoir. The worklet raises that target from observed chunk cadence.
  * `end` bypasses the target for a short final response and drains it exactly
  * once. FasterQwen3TTS, Groxaxo, and buffered fallback use a zero target and
  * therefore retain their immediate playback behavior.
@@ -34,7 +34,7 @@
 
 const STATS_INTERVAL_FRAMES = 12000;
 const MAX_PRIME_MS = 2000;
-const MAX_ENDED_STREAM_IDS = 512;
+const MAX_STREAM_TOMBSTONES = 256;
 
 function _generation(value, fallback) {
   const number = Number(value);
@@ -46,25 +46,27 @@ function _primeMs(value) {
   return Number.isFinite(number) ? Math.max(0, Math.min(MAX_PRIME_MS, number)) : 0;
 }
 
-function _sampleCount(value, fallback = 0) {
+function _sourceSampleRate(value, fallback = 16000) {
   const number = Number(value);
-  return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
+  return Number.isFinite(number) && number > 0 ? number : fallback;
 }
 
-function _samplesForMs(milliseconds, rate) {
-  return Math.max(0, Math.ceil((_primeMs(milliseconds) * rate) / 1000));
+function _responseEpoch(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 0 ? number : null;
 }
 
 class AudioPlaybackProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    // HF Realtime emits the pipeline's native 16 kHz PCM. The client still
-    // sends an explicit config message at startup, but the safe default must
-    // match the actual WebSocket transport if that message is delayed.
-    this._inputRate = 16000;
+    // The default/Faster/Groxaxo path is 16 kHz. The client replaces it with
+    // the server-acknowledged candidate rate (24 kHz for audio.cpp) before
+    // queued PCM is rendered; this only sets the source clock for interpolation.
+    this._defaultInputRate = 16000;
+    this._inputRate = this._defaultInputRate;
     this._stepRatio = this._inputRate / sampleRate;
-    /** @type {{ samples: Float32Array, primeMs: number, ceilingMs: number,
-     * targetSamples: number, ceilingSamples: number, streamId: string }[]} */
+    /** @type {{ samples: Float32Array, primeMs: number, reprimeMs: number, maxPrimeMs: number, continuityMode: "adaptive" | "fast-start", streamId: string, responseEpoch: number | null, sourceSampleRate: number }[]} */
     this._queue = [];
     this._readIdx = 0;
     this._fracPos = 0;
@@ -73,13 +75,14 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
     this._generation = 0;
     this._lastClearedGeneration = -1;
     this._primeTargetMs = 0;
-    this._primeCeilingMs = 0;
-    this._primeTargetSamples = 0;
-    this._primeCeilingSamples = 0;
-    this._ended = false;
+    this._reprimeTargetMs = 0;
+    this._maxPrimeMs = MAX_PRIME_MS;
     this._activeStreamId = "";
-    this._endedStreamId = "";
-    this._endedStreamIds = new Set();
+    this._activeResponseEpoch = null;
+    /** @type {Map<string, number | null>} */
+    this._endedStreams = new Map();
+    /** @type {Set<string>} */
+    this._drainedStreams = new Set();
     this._drainReported = true;
     this._waitingAfterUnderrun = false;
     this._startPending = false;
@@ -87,23 +90,34 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
     this._startingStreamId = "";
     this._framesSinceStats = 0;
     this._totalPlayed = 0;
+    this._lastEnqueueFrame = null;
+    /** @type {Map<string, number>} */
+    this._lastEnqueueFrameByStream = new Map();
+    /** @type {Map<string, number>} */
+    this._observedChunkGapByStream = new Map();
+    /** @type {Map<string, number>} */
+    this._maxObservedChunkGapByStream = new Map();
+    // Node contract tests do not expose AudioWorklet's global currentFrame.
+    // Keep an equivalent local clock for that environment and as a harmless
+    // fallback in unusual worklet hosts.
+    this._clockFrames = 0;
+    this._observedChunkGapMs = 0;
+    this._maxObservedChunkGapMs = 0;
     this._underruns = 0;
     this._reprimes = 0;
     this._staleChunks = 0;
     this._clears = 0;
-    this._totalInputSamples = 0;
-    /** @type {Map<string, number>} */
-    this._streamInputSamples = new Map();
 
     this.port.onmessage = (event) => {
       const data = event.data;
       if (!data || typeof data !== "object") return;
       switch (data.kind) {
         case "config":
-          if (typeof data.inputRate === "number" && data.inputRate > 0) {
-            this._inputRate = data.inputRate;
-            this._stepRatio = this._inputRate / sampleRate;
-          }
+          this._defaultInputRate = _sourceSampleRate(data.inputRate, this._defaultInputRate);
+          // A config acknowledgement chooses the default only for a response
+          // created afterwards. Existing queued PCM retains its own source
+          // clock, so a live 16 kHz <-> 24 kHz provider switch cannot retime it.
+          if (this._queue.length === 0) this._setInputRate(this._defaultInputRate);
           this._generation = _generation(data.generation, this._generation);
           break;
         case "audio":
@@ -125,8 +139,19 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
     return Math.max(0, total);
   }
 
+  _setInputRate(sourceSampleRate) {
+    this._inputRate = _sourceSampleRate(sourceSampleRate, this._defaultInputRate);
+    this._stepRatio = this._inputRate / sampleRate;
+  }
+
   _queuedMs() {
-    return (this._queuedSamples() / this._inputRate) * 1000;
+    let seconds = 0;
+    for (let index = 0; index < this._queue.length; index += 1) {
+      const buffer = this._queue[index];
+      const unread = buffer.samples.length - (index === 0 ? this._readIdx : 0);
+      seconds += Math.max(0, unread) / buffer.sourceSampleRate;
+    }
+    return seconds * 1000;
   }
 
   _diagnostic(kind, detail = {}) {
@@ -134,18 +159,19 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
       kind,
       generation: this._generation,
       queuedMs: this._queuedMs(),
-      queuedSamples: this._queuedSamples(),
       primeTargetMs: this._primeTargetMs,
-      primeCeilingMs: this._primeCeilingMs,
-      targetSamples: this._primeTargetSamples,
-      ceilingSamples: this._primeCeilingSamples,
-      inputSamples: this._streamInputSamples.get(this._activeStreamId) || 0,
-      totalInputSamples: this._totalInputSamples,
+      reprimeTargetMs: this._reprimeTargetMs,
+      maxPrimeMs: this._maxPrimeMs,
+      observedChunkGapMs: this._observedChunkGapMs,
+      maxObservedChunkGapMs: this._maxObservedChunkGapMs,
       state: this._state,
       underruns: this._underruns,
       reprimes: this._reprimes,
       staleChunks: this._staleChunks,
       clears: this._clears,
+      responseEpoch: this._activeResponseEpoch,
+      streamId: this._activeStreamId,
+      sourceSampleRate: this._inputRate,
       ...detail,
     });
   }
@@ -167,66 +193,88 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
     }
     if (!(data.samples instanceof Float32Array) || data.samples.length === 0) return;
     const streamId = String(data.streamId || "");
+    const responseEpoch = _responseEpoch(data.responseEpoch);
     const chunkPrimeMs = _primeMs(data.primeMs);
-    const chunkCeilingMs = Math.max(chunkPrimeMs, _primeMs(data.ceilingMs));
-    const chunkTargetSamples = _sampleCount(
-      data.targetSamples,
-      _samplesForMs(chunkPrimeMs, this._inputRate),
-    );
-    const chunkCeilingSamples = Math.max(
-      chunkTargetSamples,
-      _sampleCount(data.ceilingSamples, _samplesForMs(chunkCeilingMs, this._inputRate)),
-    );
-    const inputSampleCount = _sampleCount(data.inputSampleCount, data.samples.length);
-    const expectedOffset = this._streamInputSamples.get(streamId) || 0;
-    const inputSampleOffset = _sampleCount(data.inputSampleOffset, expectedOffset);
-    if (inputSampleCount !== data.samples.length || inputSampleOffset !== expectedOffset) {
-      this._reject("audio", receivedGeneration, "input_sample_mismatch");
-      return;
-    }
-    if (streamId && this._endedStreamIds.has(streamId)) {
+    const maxPrimeMs = _primeMs(data.maxPrimeMs || MAX_PRIME_MS) || MAX_PRIME_MS;
+    const requestedReprimeMs = _primeMs(data.reprimeMs);
+    const continuityMode = data.continuityMode === "fast-start" ? "fast-start" : "adaptive";
+    const sourceSampleRate = _sourceSampleRate(data.sourceSampleRate, this._defaultInputRate);
+    if (streamId && (this._endedStreams.has(streamId) || this._drainedStreams.has(streamId))) {
       this._reject("audio", receivedGeneration, "audio_after_stream_end");
       return;
     }
 
-    // A response and its tool-result continuation share a generation but have
-    // distinct stream IDs. If the continuation arrives before the prior PCM has
-    // drained, reopen the same FIFO and append it without clearing or re-priming.
-    if (this._state === "idle") {
-      this._primeTargetMs = chunkPrimeMs;
-      this._primeCeilingMs = chunkCeilingMs;
-      this._primeTargetSamples = chunkTargetSamples;
-      this._primeCeilingSamples = chunkCeilingSamples;
-      this._ended = false;
+    const enqueueFrame = typeof currentFrame === "number" ? currentFrame : this._clockFrames;
+    const previousEnqueueFrame = this._lastEnqueueFrameByStream.get(streamId);
+    if (previousEnqueueFrame !== undefined) {
+      const gapMs = Math.max(0, ((enqueueFrame - previousEnqueueFrame) / sampleRate) * 1000);
+      this._observedChunkGapByStream.set(streamId, gapMs);
+      this._maxObservedChunkGapByStream.set(
+        streamId,
+        Math.max(this._maxObservedChunkGapByStream.get(streamId) || 0, gapMs),
+      );
+    }
+    this._lastEnqueueFrameByStream.set(streamId, enqueueFrame);
+
+    const adaptiveReprime = continuityMode === "adaptive"
+      && (chunkPrimeMs > 0 || requestedReprimeMs > 0);
+    const queued = {
+      samples: data.samples,
+      primeMs: chunkPrimeMs,
+      reprimeMs: adaptiveReprime
+        ? Math.min(maxPrimeMs, Math.max(80, requestedReprimeMs || Math.min(chunkPrimeMs, 240)))
+        : requestedReprimeMs,
+      maxPrimeMs,
+      continuityMode,
+      streamId,
+      responseEpoch,
+      sourceSampleRate,
+    };
+    const wasIdle = this._state === "idle";
+    this._queue.push(queued);
+    if (wasIdle) {
       this._drainReported = false;
       this._waitingAfterUnderrun = false;
       this._state = "priming";
-      this._activeStreamId = streamId;
-    } else if (streamId && streamId !== this._activeStreamId) {
-      this._activeStreamId = streamId;
-      this._ended = false;
-      if (this._state === "priming" && this._queuedSamples() === 0) {
-        this._primeTargetMs = chunkPrimeMs;
-        this._primeCeilingMs = chunkCeilingMs;
-        this._primeTargetSamples = chunkTargetSamples;
-        this._primeCeilingSamples = chunkCeilingSamples;
-      }
-    } else if (this._ended) {
-      this._reject("audio", receivedGeneration, "audio_after_stream_end");
-      return;
+      this._activateQueuedStream(queued);
+    } else if (streamId === this._activeStreamId) {
+      this._applyActiveStreamCadence(queued);
     }
-
-    this._queue.push({
-      samples: data.samples,
-      primeMs: chunkPrimeMs,
-      ceilingMs: chunkCeilingMs,
-      targetSamples: chunkTargetSamples,
-      ceilingSamples: chunkCeilingSamples,
-      streamId,
-    });
-    this._streamInputSamples.set(streamId, expectedOffset + inputSampleCount);
-    this._totalInputSamples += inputSampleCount;
     this._maybeStart(false);
+  }
+
+  _activateQueuedStream(buffer) {
+    this._activeStreamId = buffer.streamId;
+    this._activeResponseEpoch = buffer.responseEpoch;
+    this._primeTargetMs = buffer.primeMs;
+    this._maxPrimeMs = buffer.maxPrimeMs;
+    this._reprimeTargetMs = buffer.reprimeMs;
+    this._observedChunkGapMs = this._observedChunkGapByStream.get(buffer.streamId) || 0;
+    this._maxObservedChunkGapMs = this._maxObservedChunkGapByStream.get(buffer.streamId) || 0;
+    this._lastEnqueueFrame = this._lastEnqueueFrameByStream.get(buffer.streamId) ?? null;
+    this._applyActiveStreamCadence(buffer);
+    this._setInputRate(buffer.sourceSampleRate);
+  }
+
+  _applyActiveStreamCadence(buffer) {
+    const gapMs = this._observedChunkGapByStream.get(buffer.streamId) || 0;
+    const maxGapMs = this._maxObservedChunkGapByStream.get(buffer.streamId) || 0;
+    this._observedChunkGapMs = gapMs;
+    this._maxObservedChunkGapMs = maxGapMs;
+    this._lastEnqueueFrame = this._lastEnqueueFrameByStream.get(buffer.streamId) ?? null;
+    // Adaptive may learn a response-local recovery reservoir. Fast Start is
+    // deliberately a fixed minimum-reservoir comparison mode: allowing it to
+    // learn here would make its actual behaviour indistinguishable from
+    // Adaptive after the first backend gap.
+    this._reprimeTargetMs = buffer.continuityMode === "adaptive"
+      ? Math.min(
+        buffer.maxPrimeMs,
+        // Learned recovery is monotonic for this response. A short chunk after
+        // one long scheduler/backend gap must not lower the reservoir and cause
+        // the same response to oscillate through repeated underruns.
+        Math.max(buffer.reprimeMs, maxGapMs > 0 ? maxGapMs + 80 : 0),
+      )
+      : buffer.reprimeMs;
   }
 
   _end(data) {
@@ -236,38 +284,25 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
       return;
     }
     const streamId = String(data.streamId || "");
-    if (streamId && this._endedStreamIds.has(streamId)) return;
-    if (streamId && this._activeStreamId && streamId !== this._activeStreamId) {
-      this._reject("end", receivedGeneration, "inactive_stream");
-      return;
-    }
-    if (this._ended) return;
-    const reportedInputSamples = _sampleCount(
-      data.inputSamples,
-      this._streamInputSamples.get(streamId) || 0,
-    );
-    if (reportedInputSamples !== (this._streamInputSamples.get(streamId) || 0)) {
-      this._reject("end", receivedGeneration, "input_sample_mismatch");
-      return;
-    }
-    this._ended = true;
-    this._endedStreamId = streamId;
-    if (streamId) {
-      this._endedStreamIds.delete(streamId);
-      this._endedStreamIds.add(streamId);
-      while (this._endedStreamIds.size > MAX_ENDED_STREAM_IDS) {
-        const oldest = this._endedStreamIds.values().next().value;
-        if (!oldest) break;
-        this._endedStreamIds.delete(oldest);
+    const responseEpoch = _responseEpoch(data.responseEpoch);
+    if (streamId && (this._endedStreams.has(streamId) || this._drainedStreams.has(streamId))) return;
+    if (streamId) this._endedStreams.set(streamId, responseEpoch);
+    const hasQueuedStream = streamId
+      ? this._queue.some((buffer) => buffer.streamId === streamId)
+      : this._queue.length > 0;
+    if (!hasQueuedStream) {
+      // A stream may finish after its last buffer was rendered while another
+      // response is already queued. Retire that response independently rather
+      // than assigning the eventual shared-FIFO drain to the newer response.
+      this._reportStreamDrained(streamId, responseEpoch, this._queue.length === 0);
+      if (this._queue.length === 0 && (!this._activeStreamId || this._activeStreamId === streamId)) {
+        this._markQueueIdle();
       }
-    }
-    if (this._queuedSamples() === 0) {
-      this._markDrained();
       return;
     }
     // Synthesis is complete: a response shorter than the normal prime target
     // must still speak immediately, without consuming or trimming its head.
-    this._maybeStart(true);
+    if (!streamId || this._queue[0]?.streamId === streamId) this._maybeStart(true);
   }
 
   _clear(data) {
@@ -290,21 +325,21 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
     this._readIdx = 0;
     this._fracPos = 0;
     this._state = "idle";
-    this._ended = false;
     this._activeStreamId = "";
-    this._endedStreamId = "";
-    this._endedStreamIds.clear();
+    this._activeResponseEpoch = null;
+    this._endedStreams.clear();
+    this._drainedStreams.clear();
     this._drainReported = true;
     this._waitingAfterUnderrun = false;
+    this._lastEnqueueFrame = null;
+    this._lastEnqueueFrameByStream.clear();
+    this._observedChunkGapByStream.clear();
+    this._maxObservedChunkGapByStream.clear();
+    this._observedChunkGapMs = 0;
+    this._maxObservedChunkGapMs = 0;
     this._startPending = false;
     this._startWasReprime = false;
     this._startingStreamId = "";
-    this._primeTargetMs = 0;
-    this._primeCeilingMs = 0;
-    this._primeTargetSamples = 0;
-    this._primeCeilingSamples = 0;
-    this._totalInputSamples = 0;
-    this._streamInputSamples.clear();
     this._clears += 1;
     this._diagnostic("cleared", { reason });
     if (hadUndrainedPlayback) {
@@ -321,19 +356,17 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
 
   _maybeStart(force) {
     if (this._state !== "priming" || this._queuedSamples() === 0) return;
-    if (!force && this._queuedSamples() < this._primeTargetSamples) return;
-
     const reprime = this._waitingAfterUnderrun;
+    const targetMs = reprime ? this._reprimeTargetMs : this._primeTargetMs;
+    const queuedMs = this._queuedMs();
+    if (!force && targetMs > 0 && queuedMs + 1e-6 < targetMs) return;
     if (reprime) this._reprimes += 1;
     this._state = "playing";
     this._waitingAfterUnderrun = false;
     this._startPending = true;
     this._startWasReprime = reprime;
     this._startingStreamId = this._queue[0]?.streamId || this._activeStreamId;
-    this._diagnostic(reprime ? "reprimed" : "primed", {
-      forced: !!force,
-      streamId: this._startingStreamId,
-    });
+    this._diagnostic(reprime ? "reprimed" : "primed", { forced: !!force, targetMs });
   }
 
   /** Linear-interpolated read at the current fractional position. */
@@ -356,31 +389,36 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
 
   /** Advance by the resampling ratio and pop only fully consumed buffers. */
   _advance() {
-    this._fracPos += this._stepRatio;
+    const completedRate = this._queue[0]?.sourceSampleRate ?? this._inputRate;
+    this._fracPos += completedRate / sampleRate;
     while (this._fracPos >= 1) {
       this._fracPos -= 1;
       this._readIdx += 1;
     }
     while (this._queue.length > 0 && this._readIdx >= this._queue[0].samples.length) {
       const completedStream = this._queue[0].streamId;
+      const completedEpoch = this._queue[0].responseEpoch;
+      const completedBufferRate = this._queue[0].sourceSampleRate;
       this._readIdx -= this._queue[0].samples.length;
       this._queue.shift();
+      if (this._queue.length > 0 && this._queue[0].sourceSampleRate !== completedBufferRate) {
+        // `fracPos` is measured in source samples. Preserve the tiny physical
+        // residual across a rate boundary rather than applying the old rate to
+        // the new response's PCM.
+        this._fracPos = (this._fracPos * this._queue[0].sourceSampleRate) / completedBufferRate;
+        this._setInputRate(this._queue[0].sourceSampleRate);
+        while (this._fracPos >= 1 && this._readIdx < this._queue[0].samples.length) {
+          this._fracPos -= 1;
+          this._readIdx += 1;
+        }
+      }
       if (this._queue.length > 0 && this._queue[0].streamId !== completedStream) {
-        const completedInputSamples = this._streamInputSamples.get(completedStream) || 0;
-        this._diagnostic("stream_drained", {
-          streamId: completedStream,
-          inputSamples: completedInputSamples,
-          continued: true,
-        });
-        this._streamInputSamples.delete(completedStream);
+        this._reportStreamDrained(completedStream, completedEpoch, false);
         // The new response already carries the config snapshot that was
         // acknowledged when it was created. It becomes the re-prime policy only
         // after playback crosses its FIFO boundary; older queued PCM remains on
         // the target it started with.
-        this._primeTargetMs = this._queue[0].primeMs;
-        this._primeCeilingMs = this._queue[0].ceilingMs;
-        this._primeTargetSamples = this._queue[0].targetSamples;
-        this._primeCeilingSamples = this._queue[0].ceilingSamples;
+        this._activateQueuedStream(this._queue[0]);
         // The FIFO remains continuous across tool/result responses, but report
         // the exact point at which the next response's first sample is rendered.
         // This is bookkeeping only: it does not pause or re-prime playback.
@@ -392,33 +430,53 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
   }
 
   _handleEmptyQueue() {
-    if (this._ended) {
-      this._markDrained();
+    if (this._activeStreamId && this._endedStreams.has(this._activeStreamId)) {
+      this._reportStreamDrained(
+        this._activeStreamId,
+        this._endedStreams.get(this._activeStreamId) ?? this._activeResponseEpoch,
+        true,
+      );
+      this._markQueueIdle();
       return;
     }
     if (this._state !== "playing") return;
     this._state = "priming";
     this._waitingAfterUnderrun = true;
-    this._primeTargetMs = this._primeCeilingMs;
-    this._primeTargetSamples = this._primeCeilingSamples;
     this._startPending = false;
     this._startingStreamId = "";
     this._underruns += 1;
-    this._diagnostic("underrun", { streamId: this._activeStreamId });
+    this._diagnostic("underrun");
   }
 
-  _markDrained() {
-    const streamId = this._activeStreamId || this._endedStreamId;
+  _markQueueIdle() {
     this._state = "idle";
     this._readIdx = 0;
     this._fracPos = 0;
     this._waitingAfterUnderrun = false;
     this._startPending = false;
     this._startingStreamId = "";
-    if (this._drainReported) return;
     this._drainReported = true;
-    this._diagnostic("drained", { streamId });
-    this._streamInputSamples.delete(streamId);
+    this._activeStreamId = "";
+    this._activeResponseEpoch = null;
+  }
+
+  _reportStreamDrained(streamId, responseEpoch, queueEmpty) {
+    if (!streamId || this._drainedStreams.has(streamId)) return;
+    this._drainedStreams.add(streamId);
+    while (this._drainedStreams.size > MAX_STREAM_TOMBSTONES) {
+      const oldest = this._drainedStreams.values().next().value;
+      if (!oldest) break;
+      this._drainedStreams.delete(oldest);
+    }
+    this._endedStreams.delete(streamId);
+    this._lastEnqueueFrameByStream.delete(streamId);
+    this._observedChunkGapByStream.delete(streamId);
+    this._maxObservedChunkGapByStream.delete(streamId);
+    this._diagnostic("drained", {
+      streamId,
+      responseEpoch,
+      queueEmpty: queueEmpty === true,
+    });
   }
 
   process(_, outputs) {
@@ -441,6 +499,7 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
             this._diagnostic("started", {
               reprime: this._startWasReprime,
               streamId: this._startingStreamId || this._queue[0]?.streamId || this._activeStreamId,
+              responseEpoch: this._activeResponseEpoch,
             });
             this._startingStreamId = "";
           }
@@ -453,6 +512,7 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
     }
 
     this._framesSinceStats += output.length;
+    this._clockFrames += output.length;
     if (this._framesSinceStats >= STATS_INTERVAL_FRAMES) {
       this._framesSinceStats %= STATS_INTERVAL_FRAMES;
       this._diagnostic("stats", { played: this._totalPlayed });

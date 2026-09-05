@@ -25,6 +25,7 @@ from speech_to_speech.LLM.chat import Chat, make_user_message
 from speech_to_speech.LLM.responses_api_language_model import ResponsesApiModelHandler
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.messages import EndOfResponse, GenerateResponseRequest, LLMResponseChunk, TokenUsage
+from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 
 
 def _make_text_delta_event(text):
@@ -147,6 +148,87 @@ def test_process_streams_text_from_response_events():
     assert isinstance(outputs[0], LLMResponseChunk) and outputs[0].text == "Hello."
     assert isinstance(outputs[1], LLMResponseChunk) and outputs[1].text == "How are you?"
     assert isinstance(outputs[2], EndOfResponse)
+
+
+def test_streaming_outputs_preserve_response_epoch_identity():
+    """Responses API text and terminal output remain bound to one owner."""
+    handler = _make_handler()
+    handler.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            create=lambda **kwargs: _make_stream(
+                [
+                    _make_text_delta_event("Hello."),
+                    _make_output_item_done_event(content="Hello."),
+                ]
+            )
+        )
+    )
+    request = _make_request("Hi")
+    request.input_epoch = 7
+    request.response_epoch = 11
+    request.response_id = "resp_epoch_11"
+
+    outputs = list(handler.process(request))
+
+    assert any(isinstance(output, LLMResponseChunk) for output in outputs)
+    assert isinstance(outputs[-1], EndOfResponse)
+    for output in outputs:
+        assert output.input_epoch == 7
+        assert output.response_epoch == 11
+        assert output.response_id == "resp_epoch_11"
+
+
+def test_streaming_current_response_epoch_survives_newer_speculative_input():
+    """Post-audible non-interrupt output is governed by response ownership."""
+
+    handler = _make_handler()
+    tracker = SpeculativeTurnTracker()
+    tracker.observe("turn_new", 0)
+    handler.speculative_turns = tracker
+    handler.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            create=lambda **kwargs: _make_stream(
+                [
+                    _make_text_delta_event("Retained answer."),
+                    _make_output_item_done_event(content="Retained answer."),
+                ]
+            )
+        )
+    )
+    request = _make_request("Earlier accepted input")
+    request.turn_id = "turn_old"
+    request.turn_revision = 0
+    request.response_epoch = 73
+    request.runtime_config.local_pipeline["_response_epoch_is_current"] = lambda epoch: epoch == 73
+
+    outputs = list(handler.process(request))
+
+    assert any(
+        isinstance(output, LLMResponseChunk) and output.text == "Retained answer."
+        for output in outputs
+    )
+    assert isinstance(outputs[-1], EndOfResponse)
+    assert outputs[-1].response_epoch == 73
+
+
+def test_responses_api_does_not_call_provider_for_cancelled_queued_epoch():
+    """Queued non-interrupt turns wait at the shared LLM admission boundary."""
+
+    handler = _make_handler()
+    provider_calls = []
+    handler.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **kwargs: provider_calls.append(kwargs))
+    )
+    request = _make_request("Queued accepted input")
+    request.response_epoch = 74
+    waited = []
+    request.runtime_config.local_pipeline["_wait_response_epoch_current"] = (
+        lambda epoch: (waited.append(epoch), False)[1]
+    )
+
+    assert list(handler.process(request)) == []
+    assert waited == [74]
+    assert provider_calls == []
 
 
 def test_text_only_streams_raw_deltas_without_sentence_trimming():

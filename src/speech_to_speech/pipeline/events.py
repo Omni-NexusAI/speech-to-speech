@@ -34,6 +34,7 @@ class SpeechStartedEvent(PipelineEvent):
     turn_revision: int | None = None
     reopened: bool = False
     interrupt_response: bool = Field(default=True, exclude=True)
+    input_epoch: int | None = None
 
 
 class SpeechStoppedEvent(PipelineEvent):
@@ -42,6 +43,9 @@ class SpeechStoppedEvent(PipelineEvent):
     audio_end_ms: int = 0
     turn_id: str | None = None
     turn_revision: int | None = None
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
 
 
 # ── Transcription events (TranscriptionNotifier) ─────────────────────
@@ -72,6 +76,9 @@ class TranscriptionCompletedEvent(PipelineEvent):
     # The realtime service must close the transcription item without starting the
     # regular text-only response path a second time.
     direct_audio_completed: bool = Field(default=False, exclude=True)
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
 
 
 # ── LLM output events (LMOutputProcessor) ────────────────────────────
@@ -87,6 +94,11 @@ class AssistantTextEvent(PipelineEvent):
     # send loop discard stale assistant text by the same generation-aware rule as
     # audio, instead of blanket-dropping while cancel_scope.discarding is set.
     cancel_generation: int | None = None
+    # Conversation-local response ownership.  This is additive metadata for
+    # local clients; OpenAI-compatible fields remain unchanged.
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
 
 
 class TokenUsageEvent(PipelineEvent):
@@ -95,6 +107,9 @@ class TokenUsageEvent(PipelineEvent):
     output_tokens: int = 0
     turn_id: str | None = None
     turn_revision: int | None = None
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
 
 
 class ResponseFailedEvent(PipelineEvent):
@@ -108,6 +123,9 @@ class ResponseFailedEvent(PipelineEvent):
     message: str = ""
     turn_id: str | None = None
     turn_revision: int | None = None
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
 
 
 class ResponseOutputCompleteEvent(PipelineEvent):
@@ -117,6 +135,9 @@ class ResponseOutputCompleteEvent(PipelineEvent):
     turn_id: str | None = None
     turn_revision: int | None = None
     cancel_generation: int | None = None
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
 
 
 class PipelineMetricEvent(PipelineEvent):
@@ -130,3 +151,11 @@ class PipelineMetricEvent(PipelineEvent):
     turn_id: str | None = None
     turn_revision: int | None = None
     detail: dict[str, Any] = Field(default_factory=dict)
+    input_epoch: int | None = None
+    response_epoch: int | None = None
+    response_id: str | None = None
+    # Only the router may set this for the cancellation result it owns.  A
+    # terminal cancellation diagnostic is allowed to describe the just-staled
+    # response; provider-originated late metrics remain subject to epoch
+    # rejection.
+    authoritative_terminal: bool = False

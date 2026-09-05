@@ -14,6 +14,7 @@ from openai.types.realtime import (
     ConversationItemCreateEvent,
     InputAudioBufferAppendEvent,
     InputAudioBufferCommitEvent,
+    ResponseAudioDeltaEvent,
     ResponseCancelEvent,
     ResponseCreateEvent,
     SessionUpdateEvent,
@@ -22,7 +23,7 @@ from starlette.websockets import WebSocketState
 
 from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit, SessionState
 from speech_to_speech.api.openai_realtime.service import PipelineRuntimeServerEvent, ServerEvent, build_error_event
-from speech_to_speech.api.openai_realtime.source_identity import runtime_source_identity
+from speech_to_speech.LLM.direct_history_compaction import normalize_history_compaction
 from speech_to_speech.pipeline.control import SESSION_END, PipelineControlMessage, is_control_message
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
@@ -38,6 +39,8 @@ from speech_to_speech.pipeline.events import (
 )
 from speech_to_speech.pipeline.log_context import pipeline_log_ctx
 from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, PIPELINE_END, AudioOutput
+from speech_to_speech.pipeline.model_operations import ModelOperationToken
+from speech_to_speech.pipeline.response_ownership import ResponseOwner
 
 logger = logging.getLogger(__name__)
 MAX_AUDIO_BATCH_BYTES = 6400
@@ -46,7 +49,7 @@ MAX_AUDIO_BATCH_BYTES = 6400
 # monkeypatch this to a small value since their fixtures usually skip the
 # real handler chain.
 SESSION_END_DRAIN_TIMEOUT_S = 10.0
-BACKEND_RUNTIME_API_VERSION = 8
+BACKEND_RUNTIME_API_VERSION = 7
 MODEL_CANCEL_TIMEOUT_S = 2.0
 QItem = TypeVar("QItem")
 _AUDIO_CPP_TUNING_BOUNDS: dict[str, tuple[float, float]] = {
@@ -76,6 +79,66 @@ _AUDIO_CPP_MODELS = {
     "qwen3-tts-0.6b-base-bf16",
     "qwen3-tts-1.7b-base-bf16",
 }
+_AUDIO_CPP_EFFECTIVE_TUNING_KEYS = frozenset({
+    "model",
+    "clone_mode",
+    *_AUDIO_CPP_TUNING_BOUNDS,
+})
+
+
+def _validate_audio_cpp_tuning_values(
+    values: Any,
+    *,
+    require_complete: bool,
+    allow_null_model_seed: bool,
+) -> dict[str, Any]:
+    """Validate only engine-safe candidate fields at the HFRT trust boundary."""
+
+    if not isinstance(values, dict):
+        raise ValueError("tts_tuning values must be an object")
+    keys = set(values)
+    if keys - _AUDIO_CPP_EFFECTIVE_TUNING_KEYS:
+        raise ValueError("tts_tuning contains unsupported effective fields")
+    if require_complete and keys != _AUDIO_CPP_EFFECTIVE_TUNING_KEYS:
+        raise ValueError("tts_tuning effective snapshot is incomplete")
+
+    validated: dict[str, Any] = {}
+    if "clone_mode" in values:
+        if values["clone_mode"] != "full_icl":
+            raise ValueError("tts_tuning supports Base full_icl cloning only")
+        validated["clone_mode"] = "full_icl"
+    if "model" in values:
+        model = values["model"]
+        if model is None and allow_null_model_seed:
+            validated["model"] = None
+        elif model in _AUDIO_CPP_MODELS:
+            validated["model"] = model
+        else:
+            raise ValueError("tts_tuning model is invalid")
+
+    for key in _AUDIO_CPP_TUNING_BOUNDS:
+        if key not in values:
+            continue
+        value = values[key]
+        if key == "seed" and value is None and allow_null_model_seed:
+            validated[key] = None
+            continue
+        bounds = _AUDIO_CPP_TUNING_BOUNDS[key]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or (key in _AUDIO_CPP_INTEGER_TUNING_FIELDS and not isinstance(value, int))
+            or not bounds[0] <= value <= bounds[1]
+        ):
+            raise ValueError("tts_tuning effective value is out of bounds")
+        validated[key] = value
+    if "temperature" in validated and validated["temperature"] <= 0:
+        raise ValueError("tts_tuning temperature must be greater than zero")
+    context = validated.get("left_context_frames")
+    steady = validated.get("steady_block_frames")
+    if context is not None and steady is not None and context + steady > 300:
+        raise ValueError("tts_tuning left context plus steady block must not exceed 300 frames")
+    return validated
 
 
 def _validated_audio_cpp_tuning(tuning: Any) -> dict[str, Any]:
@@ -89,10 +152,21 @@ def _validated_audio_cpp_tuning(tuning: Any) -> dict[str, Any]:
     if not isinstance(tuning, dict):
         raise ValueError("tts_tuning must be an object")
     tuning_keys = set(tuning)
-    if tuning_keys - {"provider", "profile_id", "overrides", "resolved"}:
+    modern_required_keys = {"provider", "profile_id", "profile_revision", "effective", "overrides"}
+    modern_keys = {
+        "provider",
+        "profile_id",
+        "profile_revision",
+        "effective",
+        "overrides",
+        "delivery_mode",
+    }
+    if tuning_keys - (modern_keys | {"resolved"}):
         raise ValueError("tts_tuning contains unsupported fields")
-    if not {"provider", "profile_id", "overrides"}.issubset(tuning_keys):
-        raise ValueError("tts_tuning requires provider, profile_id, and overrides")
+    if not modern_required_keys.issubset(tuning_keys):
+        raise ValueError(
+            "tts_tuning requires provider, profile_id, profile_revision, effective, and overrides"
+        )
     if tuning.get("provider") != "qwen3tts-audiocpp":
         raise ValueError("tts_tuning is available only for qwen3tts-audiocpp")
     profile_id = tuning.get("profile_id")
@@ -100,27 +174,34 @@ def _validated_audio_cpp_tuning(tuning: Any) -> dict[str, Any]:
     if not isinstance(profile_id, str) or not profile_id or not isinstance(overrides, dict):
         raise ValueError("tts_tuning requires profile_id and object overrides")
 
-    validated_overrides: dict[str, Any] = {}
-    for key, value in overrides.items():
-        if key == "model":
-            if value not in _AUDIO_CPP_MODELS:
-                raise ValueError("tts_tuning model override is invalid")
-            validated_overrides[key] = value
-            continue
-        bounds = _AUDIO_CPP_TUNING_BOUNDS.get(key)
-        if bounds is None or isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ValueError("tts_tuning overrides are invalid")
-        if key in _AUDIO_CPP_INTEGER_TUNING_FIELDS and not isinstance(value, int):
-            raise ValueError("tts_tuning integer override is invalid")
-        if not bounds[0] <= value <= bounds[1]:
-            raise ValueError("tts_tuning override is out of bounds")
-        validated_overrides[key] = value
+    validated_overrides = _validate_audio_cpp_tuning_values(
+        overrides,
+        require_complete=False,
+        allow_null_model_seed=True,
+    )
 
     validated: dict[str, Any] = {
         "provider": "qwen3tts-audiocpp",
         "profile_id": profile_id,
         "overrides": validated_overrides,
     }
+    # Engine capability is not user consent to use the experimental native
+    # relay.  Buffered phrase delivery is the compatibility/default path until
+    # the caller explicitly opts into native PCM for this conversation.
+    delivery_mode = tuning.get("delivery_mode", "buffered_phrase")
+    if delivery_mode not in {"buffered_phrase", "native_incremental_pcm"}:
+        raise ValueError("tts_tuning delivery_mode is invalid")
+    validated["delivery_mode"] = delivery_mode
+    revision = tuning.get("profile_revision")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
+        raise ValueError("tts_tuning profile_revision must be a positive integer")
+    validated["profile_revision"] = revision
+    validated["effective"] = _validate_audio_cpp_tuning_values(
+        tuning.get("effective"),
+        require_complete=True,
+        allow_null_model_seed=True,
+    )
+
     resolved = tuning.get("resolved")
     if resolved is not None:
         if not isinstance(resolved, dict) or set(resolved) != {"text_lookahead", "phrase_flush_ms"}:
@@ -140,6 +221,48 @@ class _PipelineConfigError(ValueError):
     def __init__(self, message: str, code: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+def _validated_playback_policy(value: Any, *, target_backend: str) -> dict[str, Any]:
+    """Validate the local browser policy committed for the next response.
+
+    PCM transport remains server-owned.  This object carries only bounded
+    playback admission choices so the server can echo the exact frozen policy
+    with the response lifecycle even if a later config acknowledgement
+    overtakes that lifecycle event on the socket.
+    """
+    if not isinstance(value, dict) or set(value) != {
+        "prime_target_ms",
+        "continuity_mode",
+        "native_streaming",
+        "max_prime_ms",
+    }:
+        raise _PipelineConfigError("playback_policy has invalid fields", "invalid_playback_policy")
+    continuity = value.get("continuity_mode")
+    if continuity not in {"adaptive", "fast-start"}:
+        raise _PipelineConfigError("playback_policy continuity mode is invalid", "invalid_playback_policy")
+    native_streaming = value.get("native_streaming")
+    if not isinstance(native_streaming, bool):
+        raise _PipelineConfigError("playback_policy native_streaming must be boolean", "invalid_playback_policy")
+    prime = value.get("prime_target_ms")
+    maximum = value.get("max_prime_ms")
+    if (
+        isinstance(prime, bool)
+        or not isinstance(prime, int)
+        or isinstance(maximum, bool)
+        or not isinstance(maximum, int)
+        or not 0 <= prime <= maximum <= 2000
+    ):
+        raise _PipelineConfigError("playback_policy prime values are out of bounds", "invalid_playback_policy")
+    if target_backend != "qwen3tts-audiocpp":
+        native_streaming = False
+        prime = 0
+    return {
+        "prime_target_ms": prime,
+        "continuity_mode": continuity,
+        "native_streaming": native_streaming,
+        "max_prime_ms": maximum,
+    }
 
 
 async def _prepare_pipeline_config_update(
@@ -173,6 +296,15 @@ async def _prepare_pipeline_config_update(
                 "invalid_max_response_tokens",
             ) from exc
 
+    if "history_compaction" in config:
+        value = config["history_compaction"]
+        if not isinstance(value, dict):
+            raise _PipelineConfigError("history_compaction must be an object", "invalid_history_compaction")
+        try:
+            proposed_pipeline["history_compaction"] = normalize_history_compaction(value)
+        except (TypeError, ValueError) as exc:
+            raise _PipelineConfigError("Invalid history_compaction values", "invalid_history_compaction") from exc
+
     previous_backend = proposed_pipeline.get("tts_backend", "faster")
     target_backend = previous_backend
     if "tts_backend" in config:
@@ -197,6 +329,25 @@ async def _prepare_pipeline_config_update(
         # A provider switch never inherits a different provider's synthesis
         # snapshot.  The candidate client sends its resolved profile explicitly.
         proposed_pipeline.pop("tts_tuning", None)
+
+    # Source clock is server-owned and derives solely from the committed
+    # provider. Browser microphone/VAD input remains the fixed 16 kHz path.
+    proposed_pipeline["audio_output_sample_rate"] = (
+        24000 if target_backend == "qwen3tts-audiocpp" else 16000
+    )
+
+    if "playback_policy" in config:
+        proposed_pipeline["playback_policy"] = _validated_playback_policy(
+            config["playback_policy"],
+            target_backend=target_backend,
+        )
+    elif target_backend != previous_backend:
+        proposed_pipeline["playback_policy"] = {
+            "prime_target_ms": 0,
+            "continuity_mode": "adaptive",
+            "native_streaming": False,
+            "max_prime_ms": 2000,
+        }
 
     if "model_endpoint" in config:
         model_config = config["model_endpoint"]
@@ -230,14 +381,15 @@ async def _prepare_pipeline_config_update(
     return proposed_pipeline, proposed_endpoint
 
 
-async def _send_event(ws: WebSocket, event: ServerEvent) -> None:
+async def _send_event(ws: WebSocket, event: ServerEvent) -> bool:
     # Skip cleanly when the ws is already closing/closed — happens during Ctrl-C
     # shutdown, where the lifespan starts closing sockets while the route handler
     # or send loop is still in flight pushing events.
     if ws.application_state != WebSocketState.CONNECTED:
-        return
+        return False
     try:
         await ws.send_json(event.model_dump())
+        return True
     except WebSocketDisconnect:
         logger.debug("Skipped event: ws disconnected mid-send")
     except RuntimeError as e:
@@ -251,6 +403,7 @@ async def _send_event(ws: WebSocket, event: ServerEvent) -> None:
             logger.error(f"Failed to send event to client: {e}")
     except Exception as e:  # noqa: BLE001
         logger.error(f"Failed to send event to client: {e}")
+    return False
 
 
 async def _send_events(ws: WebSocket, events: list[ServerEvent]) -> None:
@@ -265,7 +418,14 @@ def _keep_audio_sentinel(item: Any) -> bool:
 def _keep_user_text_event(item: Any) -> bool:
     return isinstance(
         item,
-        (SpeechStoppedEvent, PartialTranscriptionEvent, TranscriptionCompletedEvent, TokenUsageEvent, PipelineMetricEvent),
+        (
+            SpeechStartedEvent,
+            SpeechStoppedEvent,
+            PartialTranscriptionEvent,
+            TranscriptionCompletedEvent,
+            TokenUsageEvent,
+            PipelineMetricEvent,
+        ),
     )
 
 
@@ -275,6 +435,36 @@ def _audio_payload(item: Any) -> Any:
 
 def _audio_generation(item: Any) -> int | None:
     return item.cancel_generation if isinstance(item, AudioOutput) else None
+
+
+def _audio_response_epoch(item: Any) -> int | None:
+    return item.response_epoch if isinstance(item, AudioOutput) else None
+
+
+def _audio_input_epoch(item: Any) -> int | None:
+    return item.input_epoch if isinstance(item, AudioOutput) else None
+
+
+def _audio_response_id(item: Any) -> str | None:
+    return item.response_id if isinstance(item, AudioOutput) else None
+
+
+def _audio_sample_rate(item: Any) -> int:
+    """Return one trusted source clock; legacy queue entries stay at 16 kHz."""
+
+    rate = item.source_sample_rate if isinstance(item, AudioOutput) else 16000
+    return rate if isinstance(rate, int) and not isinstance(rate, bool) and rate > 0 else 16000
+
+
+def _audio_identity(item: Any) -> tuple[int | None, int | None, str | None, int]:
+    """The immutable response identity and source clock for one PCM batch."""
+
+    return (
+        _audio_input_epoch(item),
+        _audio_response_epoch(item),
+        _audio_response_id(item),
+        _audio_sample_rate(item),
+    )
 
 
 def _flush_queue(q: Queue[QItem], *, preserve: Callable[[QItem], bool] | None = None) -> None:
@@ -297,6 +487,49 @@ def _flush_queue(q: Queue[QItem], *, preserve: Callable[[QItem], bool] | None = 
             for item in reversed(preserved):
                 q.queue.appendleft(item)
             q.not_empty.notify(len(preserved))
+
+
+def _belongs_to_cancelled_response(
+    item: Any,
+    *,
+    owner: ResponseOwner | None,
+    cancel_generation: int | None,
+) -> bool:
+    """Return whether one queued output belongs to the response being cancelled.
+
+    Cancellation may wait up to two seconds for a provider transport. A newer
+    response can be admitted during that wait, so a blanket queue drain would
+    delete the successor. Modern pipeline output carries an immutable response
+    epoch; the cancellation generation is retained only for legacy output.
+    """
+
+    response_epoch = getattr(item, "response_epoch", None)
+    if owner is not None and response_epoch is not None:
+        return response_epoch == owner.response_epoch
+    generation = getattr(item, "cancel_generation", None)
+    return (
+        cancel_generation is not None
+        and generation is not None
+        and generation == cancel_generation
+    )
+
+
+def _flush_cancelled_response_output(
+    q: Queue[QItem],
+    *,
+    owner: ResponseOwner | None,
+    cancel_generation: int | None,
+) -> None:
+    """Remove only the cancelled owner's queued output, preserving successors."""
+
+    _flush_queue(
+        q,
+        preserve=lambda item: not _belongs_to_cancelled_response(
+            item,
+            owner=owner,
+            cancel_generation=cancel_generation,
+        ),
+    )
 
 
 async def _drain_pending_response_events(
@@ -420,13 +653,9 @@ def _clean_unit(unit: PipelineUnit, preserve: Callable[[Any], bool] | None = Non
     unit.should_listen.set()
 
 
-async def _cancel_active_generation(unit: PipelineUnit, reason: str) -> None:
-    """Cancel one response without ending or poisoning its conversation."""
-    result = await asyncio.to_thread(
-        unit.model_operations.cancel_and_wait,
-        reason,
-        MODEL_CANCEL_TIMEOUT_S,
-    )
+def _cancel_handler_transports(unit: PipelineUnit, reason: str) -> None:
+    """Close handler-local transports before cancellation yields to a successor."""
+
     for handler in unit.handlers:
         if getattr(handler, "model_operations", None) is unit.model_operations:
             continue
@@ -436,6 +665,77 @@ async def _cancel_active_generation(unit: PipelineUnit, reason: str) -> None:
                 cancel_active()
             except Exception:
                 logger.debug("Handler cancellation failed during %s", reason, exc_info=True)
+
+
+def _operation_matches_response(
+    operation: ModelOperationToken | None,
+    owner: ResponseOwner | None,
+    cancel_generation: int | None,
+) -> bool:
+    """Bind a coordinator token to the response being superseded."""
+
+    if operation is None:
+        return False
+    if cancel_generation is not None and operation.cancel_generation != cancel_generation:
+        return False
+    if owner is None:
+        return True
+    if owner.turn_id is not None and operation.turn_id != owner.turn_id:
+        return False
+    if owner.turn_revision is not None and operation.turn_revision != owner.turn_revision:
+        return False
+    return True
+
+
+def _capture_superseded_response(unit: PipelineUnit, supersession: Any) -> dict[str, Any]:
+    """Invalidate transport generation at the synchronous VAD boundary."""
+
+    cancelled_generation = unit.cancel_scope.generation
+    operation = unit.model_operations.active_token()
+    if not _operation_matches_response(operation, supersession.previous, cancelled_generation):
+        operation = None
+    elif operation is not None:
+        unit.model_operations.request_cancel_token(operation, supersession.reason)
+    # This must happen before VAD can claim/start the accepted successor.
+    unit.cancel_scope.cancel()
+    _cancel_handler_transports(unit, supersession.reason)
+    return {
+        "operation": operation,
+        "cancel_generation": cancelled_generation,
+    }
+
+
+async def _cancel_active_generation(
+    unit: PipelineUnit,
+    reason: str,
+    *,
+    response_owner: ResponseOwner | None = None,
+    model_operation: ModelOperationToken | None = None,
+    capture_current_operation: bool = True,
+    cancel_handler_transports: bool = True,
+) -> None:
+    """Cancel one response without ending or poisoning its conversation."""
+    if response_owner is None and unit.session is not None and unit.session.session_id:
+        response_owner = unit.service._state(unit.session.session_id).response_ownership.active()
+    if model_operation is None and capture_current_operation:
+        # Capture synchronously before the first await. A successor may acquire
+        # as soon as handler transports release the old operation; the later
+        # wait must remain bound to this exact token.
+        model_operation = unit.model_operations.request_cancel(reason)
+    elif model_operation is not None:
+        unit.model_operations.request_cancel_token(model_operation, reason)
+    # Close handler-local transports before the first await. Once cancellation
+    # yields, VAD or a manual response.create may install a successor and these
+    # identity-unbound compatibility methods would otherwise close that new
+    # response instead of the captured one.
+    if cancel_handler_transports:
+        _cancel_handler_transports(unit, reason)
+    result = await asyncio.to_thread(
+        unit.model_operations.wait_for_cancellation,
+        model_operation,
+        reason,
+        MODEL_CANCEL_TIMEOUT_S,
+    )
     operation = result.operation
     unit.text_output_queue.put(
         PipelineMetricEvent(
@@ -445,6 +745,13 @@ async def _cancel_active_generation(unit: PipelineUnit, reason: str) -> None:
             elapsed_ms=result.elapsed_ms,
             turn_id=operation.turn_id if operation else None,
             turn_revision=operation.turn_revision if operation else None,
+            input_epoch=response_owner.input_epoch if response_owner else None,
+            response_epoch=response_owner.response_epoch if response_owner else None,
+            response_id=response_owner.response_id if response_owner else None,
+            # This event is synthesized by the router from its own completed
+            # cancellation operation.  It is safe to emit even for legacy SDK
+            # streams that began before response-epoch ownership existed.
+            authoritative_terminal=True,
             detail={
                 "reason": reason,
                 "operation": operation.kind if operation else None,
@@ -492,8 +799,44 @@ def _generation_is_discardable(unit: PipelineUnit, generation: int | None) -> bo
     return False
 
 
-def _should_discard_audio(unit: PipelineUnit, item: Any) -> bool:
-    return _generation_is_discardable(unit, _audio_generation(item))
+def _should_discard_audio(
+    unit: PipelineUnit,
+    item: Any,
+    *,
+    service: Any | None = None,
+    conn_id: str | None = None,
+) -> bool:
+    """Reject stale PCM by both cancellation generation and response epoch."""
+    if _generation_is_discardable(unit, _audio_generation(item)):
+        return True
+    response_epoch = _audio_response_epoch(item)
+    if response_epoch is not None and service is not None and conn_id is not None:
+        return not service._state(conn_id).response_ownership.admits_output(response_epoch)
+    return False
+
+
+def _audio_identity_is_admissible(
+    service: Any,
+    conn_id: str | None,
+    identity: tuple[int | None, int | None, str | None, int],
+) -> bool:
+    """Recheck a dequeued PCM batch against its captured ownership tuple."""
+
+    input_epoch, response_epoch, response_id, _source_rate = identity
+    if response_epoch is None:
+        return True
+    if conn_id is None or input_epoch is None:
+        return False
+    owner = service._state(conn_id).response_ownership.owner_for_response_epoch(response_epoch)
+    return bool(
+        owner is not None
+        and owner.input_epoch == input_epoch
+        # A direct-audio owner can legitimately have no response ID until the
+        # encoder allocates its first response.created event.  Once a concrete
+        # ID is present, it must be the one captured with this batch.
+        and (response_id is None or owner.response_id == response_id)
+        and service.is_response_epoch_output_admissible(conn_id, response_epoch)
+    )
 
 
 async def _release_unit_after_drain(unit: PipelineUnit, session: Any, session_id: str) -> None:
@@ -551,7 +894,6 @@ def create_app(
             "playback",
         ],
         **(runtime_info or {}),
-        **runtime_source_identity(),
     }
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -616,6 +958,12 @@ def create_app(
         # Defensive: drain edge queues and reset events so stale data from a
         # previous session that survived SESSION_END propagation doesn't leak.
         _clean_unit(unit)
+        unit.service._state(session_id).runtime_config.local_pipeline[
+            "_capture_superseded_response"
+        ] = lambda supersession, bound_unit=unit: _capture_superseded_response(
+            bound_unit,
+            supersession,
+        )
 
         try:
             await _send_event(ws, unit.service.build_session_created(session_id))
@@ -648,8 +996,9 @@ def create_app(
                         continue
                     # Commit only after the entire update has validated.  Invalid
                     # tuning or endpoint data cannot partially change providers.
-                    rt_cfg.local_pipeline = proposed_pipeline
-                    rt_cfg.model_endpoint = proposed_endpoint
+                    with rt_cfg.history_maintenance_lock:
+                        rt_cfg.local_pipeline = proposed_pipeline
+                        rt_cfg.model_endpoint = proposed_endpoint
                     await ws.send_json(
                         {
                             "type": (
@@ -663,6 +1012,59 @@ def create_app(
                             },
                         }
                     )
+                    continue
+
+                # Local capability declaration. It has no OpenAI Realtime
+                # schema equivalent: browser worklets can acknowledge actual
+                # rendered playback, while all other clients settle on their
+                # first delivered PCM for compatibility.
+                if raw.get("type") == "pipeline.playback.capability":
+                    rendered_ack = raw.get("rendered_playback_ack")
+                    if not isinstance(rendered_ack, bool):
+                        await _send_event(
+                            ws,
+                            unit.service.make_error(
+                                "pipeline.playback.capability requires boolean rendered_playback_ack",
+                                "invalid_playback_capability",
+                            ),
+                        )
+                        continue
+                    unit.service.set_rendered_playback_ack_supported(session_id, rendered_ack)
+                    continue
+
+                # Local extension: OpenAI Realtime has no browser-rendered
+                # audio acknowledgement.  The worklet sends this exactly once
+                # for its first scheduled sample, so response completion alone
+                # cannot make an unheard answer non-supersedable.
+                if raw.get("type") == "pipeline.playback.started":
+                    response_id = raw.get("response_id")
+                    response_epoch = raw.get("response_epoch")
+                    if (
+                        not isinstance(response_id, str)
+                        or not response_id
+                        or isinstance(response_epoch, bool)
+                        or not isinstance(response_epoch, int)
+                        or response_epoch < 1
+                    ):
+                        await _send_event(
+                            ws,
+                            unit.service.make_error(
+                                "pipeline.playback.started requires response_id and positive response_epoch",
+                                "invalid_playback_started",
+                            ),
+                        )
+                        continue
+                    acknowledged = unit.service.handle_playback_started(
+                        session_id,
+                        response_id=response_id,
+                        response_epoch=response_epoch,
+                    )
+                    if acknowledged is not None:
+                        await _send_event(ws, acknowledged)
+                        await _send_events(
+                            ws,
+                            unit.service.take_deferred_settlement_events(session_id),
+                        )
                     continue
 
                 event = unit.service.parse_client_event(raw)
@@ -702,19 +1104,107 @@ def create_app(
                         if result.type != "error":
                             unit.cancel_scope.new_response()
                         await _send_event(ws, result)
+                        if result.type != "error":
+                            await _send_events(
+                                ws,
+                                unit.service.take_deferred_settlement_events(session_id),
+                            )
+                            owner_event = unit.service.response_owner_event(session_id)
+                            if owner_event is not None:
+                                await _send_event(ws, owner_event)
 
                 elif isinstance(event, ResponseCancelEvent):
                     state = unit.service._state(session_id)
-                    was_active = state.in_response or state.response_pending
+                    events = None
+                    cancelled_owner = None
+                    cancelled_operation = None
+                    cancelled_generation = None
+                    was_active = False
+                    # Capture ownership and every identity-free cancellation
+                    # side effect while the same transaction blocks VAD/manual
+                    # successor admission. Otherwise response.cancel can read A,
+                    # let B claim, then accidentally cancel B's generation or
+                    # compatibility transport before its owner check rejects A.
+                    with state.response_ownership.transaction():
+                        cancelled_owner = state.response_ownership.active()
+                        cancelled_generation = unit.cancel_scope.generation
+                        was_active = state.in_response or state.response_pending
+                        if was_active:
+                            operation = unit.model_operations.active_token()
+                            if _operation_matches_response(
+                                operation,
+                                cancelled_owner,
+                                cancelled_generation,
+                            ):
+                                cancelled_operation = operation
+                                if cancelled_operation is not None:
+                                    unit.model_operations.request_cancel_token(
+                                        cancelled_operation,
+                                        "response_cancel",
+                                    )
+                            unit.cancel_scope.cancel()
+                            # These compatibility transports do not carry an
+                            # owner parameter. Close them before finish_response
+                            # can promote a queued successor and before unlock.
+                            _cancel_handler_transports(unit, "response_cancel")
+                            if cancelled_owner is not None:
+                                events = unit.service.handle_response_cancel_if_owner(
+                                    session_id,
+                                    input_epoch=cancelled_owner.input_epoch,
+                                    response_epoch=cancelled_owner.response_epoch,
+                                    response_id=cancelled_owner.response_id,
+                                )
+                            else:
+                                # Legacy response flags without epoch ownership.
+                                cancelled_operation = unit.model_operations.request_cancel(
+                                    "response_cancel"
+                                )
+                                events = unit.service.handle_response_cancel(session_id)
                     if was_active:
-                        unit.cancel_scope.cancel()
-                        await _cancel_active_generation(unit, "response_cancel")
-                    _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
-                    _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
-                    events = unit.service.handle_response_cancel(session_id)
+                        if cancelled_owner is not None:
+                            _flush_cancelled_response_output(
+                                unit.output_queue,
+                                owner=cancelled_owner,
+                                cancel_generation=cancelled_generation,
+                            )
+                            _flush_cancelled_response_output(
+                                unit.text_output_queue,
+                                owner=cancelled_owner,
+                                cancel_generation=cancelled_generation,
+                            )
+                        else:
+                            _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
+                            _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
+                        await _cancel_active_generation(
+                            unit,
+                            "response_cancel",
+                            response_owner=cancelled_owner,
+                            model_operation=cancelled_operation,
+                            capture_current_operation=False,
+                            cancel_handler_transports=False,
+                        )
+                    elif cancelled_owner is not None:
+                        events = unit.service.handle_response_cancel_if_owner(
+                            session_id,
+                            input_epoch=cancelled_owner.input_epoch,
+                            response_epoch=cancelled_owner.response_epoch,
+                            response_id=cancelled_owner.response_id,
+                        )
+                    else:
+                        events = unit.service.handle_response_cancel(session_id)
                     if events:
                         await _send_events(ws, events)
-                    unit.response_playing.clear()
+                    await _send_events(
+                        ws,
+                        unit.service.take_deferred_settlement_events(session_id),
+                    )
+                    active_after_cancel = state.response_ownership.active()
+                    if (
+                        active_after_cancel is None
+                        or cancelled_owner is None
+                        or active_after_cancel.response_epoch == cancelled_owner.response_epoch
+                    ):
+                        unit.response_playing.clear()
 
         except WebSocketDisconnect:
             logger.info(f"Client {session_id} disconnected from pipeline {unit.index}")
@@ -806,13 +1296,20 @@ def create_app(
                 try:
                     text_msg = unit.text_output_queue.get_nowait()
                     is_speech_start = isinstance(text_msg, SpeechStartedEvent)
-
-                    was_in_response = False
-                    was_response_pending = False
+                    legacy_active_response = False
                     if is_speech_start and session_id:
-                        st = unit.service._state(session_id)
-                        was_in_response = st.in_response
-                        was_response_pending = st.response_pending
+                        # Capture before dispatch: AudioHandler closes the
+                        # interrupted OpenAI response while producing the
+                        # speech-start events, so its post-dispatch flags are
+                        # intentionally already clear.
+                        pre_dispatch_state = unit.service._state(session_id)
+                        legacy_active_response = bool(
+                            unit.response_playing.is_set()
+                            and (
+                                pre_dispatch_state.in_response
+                                or pre_dispatch_state.current_response_id is not None
+                            )
+                        )
 
                     if isinstance(text_msg, AssistantTextEvent) and _generation_is_discardable(
                         unit, text_msg.cancel_generation
@@ -822,28 +1319,147 @@ def create_app(
                         events = unit.service.dispatch_pipeline_event(session_id, text_msg)
                         if events:
                             await _send_events(ws, events)
+                        await _send_events(
+                            ws,
+                            unit.service.take_deferred_settlement_events(session_id),
+                        )
 
-                    if is_speech_start and (was_in_response or was_response_pending):
-                        active_cfg = unit.service._state(session_id).runtime_config if session_id else None
-                        if text_msg.interrupt_response and (
-                            active_cfg is None or active_cfg.interrupt_response_enabled
-                        ):
-                            unit.cancel_scope.cancel()
-                            await _cancel_active_generation(unit, "barge_in")
-                            if session_id:
-                                unit.service._state(session_id).response_pending = False
-                            _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
-                            _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
-                            if unit.response_playing.is_set():
+                    if is_speech_start and session_id:
+                        supersession = unit.service.take_pending_supersession(
+                            session_id,
+                            text_msg.input_epoch,
+                        )
+                        if supersession is None:
+                            logger.debug(
+                                "Skipping stale/unmatched speech-start input_epoch=%s",
+                                text_msg.input_epoch,
+                            )
+                            continue
+                        response_state = unit.service._state(session_id)
+                        active_cfg = response_state.runtime_config
+                        # ``response_playing`` alone is a queue-worker hint,
+                        # not ownership. ``legacy_active_response`` was bound
+                        # to the real pre-dispatch protocol response above.
+                        should_interrupt = bool(
+                            (
+                                supersession
+                                and supersession.previous is not None
+                                and (
+                                    supersession.pre_audible
+                                    or (
+                                        text_msg.interrupt_response
+                                        and active_cfg.interrupt_response_enabled
+                                    )
+                                )
+                            )
+                            or (
+                                legacy_active_response
+                                and text_msg.interrupt_response
+                                and active_cfg.interrupt_response_enabled
+                            )
+                        )
+                        if should_interrupt:
+                            cancelled_owner = supersession.previous if supersession else None
+                            captured_cancel = unit.service.take_pending_transport_cancellation(
+                                session_id,
+                                text_msg.input_epoch,
+                            )
+                            if isinstance(captured_cancel, dict):
+                                cancelled_generation = captured_cancel.get("cancel_generation")
+                                cancelled_operation = captured_cancel.get("operation")
+                                cancellation_already_captured = True
+                                should_cancel_transport = True
+                            else:
+                                candidate_generation = unit.cancel_scope.generation
+                                candidate_operation = unit.model_operations.active_token()
+                                operation_matches = _operation_matches_response(
+                                    candidate_operation,
+                                    cancelled_owner,
+                                    candidate_generation,
+                                )
+                                # A speech-start event may reach this loop after
+                                # its completed-but-unheard predecessor was
+                                # replaced and a successor already acquired the
+                                # model.  Never bump the mutable cancel scope or
+                                # close handler transports unless they are bound
+                                # to the exact superseded operation.  The only
+                                # ownerless exception is the legacy protocol
+                                # response path, where pre-dispatch state is the
+                                # sole available identity.
+                                should_cancel_transport = bool(
+                                    operation_matches
+                                    or (legacy_active_response and cancelled_owner is None)
+                                )
+                                cancelled_generation = (
+                                    candidate_generation if should_cancel_transport else None
+                                )
+                                cancelled_operation = (
+                                    candidate_operation if operation_matches else None
+                                )
+                                if should_cancel_transport:
+                                    unit.cancel_scope.cancel()
+                                cancellation_already_captured = False
+                            if should_cancel_transport and (
+                                (supersession and supersession.requires_transport_cancel)
+                                or legacy_active_response
+                            ):
+                                await _cancel_active_generation(
+                                    unit,
+                                    "pre_audible_supersession"
+                                    if supersession and supersession.pre_audible
+                                    else "barge_in",
+                                    response_owner=cancelled_owner,
+                                    model_operation=cancelled_operation,
+                                    capture_current_operation=False,
+                                    cancel_handler_transports=not cancellation_already_captured,
+                                )
+                            # A prior iteration may have pulled a partial PCM
+                            # batch off the queue while waiting for text/output
+                            # completion. It belongs to the invalidated owner
+                            # and must not be reintroduced after the selective
+                            # queue cleanup. A successor admitted during the
+                            # transport wait must remain untouched.
+                            if (
+                                session is not None
+                                and session.pending_output_item is not None
+                                and _belongs_to_cancelled_response(
+                                    session.pending_output_item,
+                                    owner=cancelled_owner,
+                                    cancel_generation=cancelled_generation,
+                                )
+                            ):
+                                session.pending_output_item = None
+                            if cancelled_owner is not None:
+                                _flush_cancelled_response_output(
+                                    unit.output_queue,
+                                    owner=cancelled_owner,
+                                    cancel_generation=cancelled_generation,
+                                )
+                                _flush_cancelled_response_output(
+                                    unit.text_output_queue,
+                                    owner=cancelled_owner,
+                                    cancel_generation=cancelled_generation,
+                                )
+                            else:
+                                _flush_queue(unit.output_queue, preserve=_keep_audio_sentinel)
+                                _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)
+                            active_after_cancel = response_state.response_ownership.active()
+                            if unit.response_playing.is_set() and (
+                                active_after_cancel is None
+                                or cancelled_owner is None
+                                or active_after_cancel.response_epoch == cancelled_owner.response_epoch
+                            ):
                                 unit.response_playing.clear()
                             logger.info(
-                                "Pipeline %d: speech during %s: cancelled, queue flushed",
+                                "Pipeline %d: superseded response epoch=%s pre_audible=%s; queue flushed",
                                 unit.index,
-                                "response" if was_in_response else "pending response",
+                                supersession.previous.response_epoch if supersession and supersession.previous else None,
+                                supersession.pre_audible if supersession else False,
                             )
-                        else:
+                        elif supersession and supersession.previous is not None:
                             logger.info(
-                                f"Pipeline {unit.index}: speech during response: interrupt_response disabled, ignoring"
+                                "Pipeline %d: speech during audible response retained because interrupt_response is disabled",
+                                unit.index,
                             )
                 except Empty:
                     pass
@@ -856,16 +1472,41 @@ def create_app(
                         audio_chunk = unit.output_queue.get_nowait()
 
                     if _is_pipeline_end(audio_chunk):
+                        audio_generation = _audio_generation(audio_chunk)
                         await _drain_pending_response_events(ws, unit, session_id)
                         if ws is not None and session_id:
-                            await _send_events(ws, unit.service.finish_response(session_id))
+                            terminal_events = unit.service.response.finish_audio_terminal_if_owner(
+                                session_id,
+                                input_epoch=_audio_input_epoch(audio_chunk),
+                                response_epoch=_audio_response_epoch(audio_chunk),
+                                response_id=_audio_response_id(audio_chunk),
+                            )
+                            if terminal_events is None:
+                                unit.cancel_scope.response_done(audio_generation)
+                                logger.info(
+                                    "Pipeline %d: response terminal became stale during event drain",
+                                    unit.index,
+                                )
+                                continue
+                            await _send_events(ws, terminal_events)
+                            await _send_events(
+                                ws,
+                                unit.service.take_deferred_settlement_events(session_id),
+                            )
                         break
 
                     if _is_audio_done(audio_chunk):
                         audio_generation = _audio_generation(audio_chunk)
-                        if audio_generation is not None and unit.cancel_scope.is_stale(audio_generation):
-                            if session_id:
-                                unit.service._state(session_id).response_pending = False
+                        if _should_discard_audio(
+                            unit,
+                            audio_chunk,
+                            service=unit.service,
+                            conn_id=session_id,
+                        ):
+                            if session_id and _audio_response_epoch(audio_chunk) is None:
+                                stale_state = unit.service._state(session_id)
+                                if stale_state.response_ownership.active() is None:
+                                    stale_state.response_pending = False
                             unit.cancel_scope.response_done(audio_generation)
                             unit.should_listen.set()
                             logger.info(f"Pipeline {unit.index}: stale response complete, listening re-enabled")
@@ -884,9 +1525,24 @@ def create_app(
                             continue
                         await _drain_pending_response_events(ws, unit, session_id)
                         if ws is not None and session_id:
-                            await _send_events(ws, unit.service.finish_response(session_id))
-                        if session_id:
-                            unit.service._state(session_id).response_pending = False
+                            terminal_events = unit.service.response.finish_audio_terminal_if_owner(
+                                session_id,
+                                input_epoch=_audio_input_epoch(audio_chunk),
+                                response_epoch=_audio_response_epoch(audio_chunk),
+                                response_id=_audio_response_id(audio_chunk),
+                            )
+                            if terminal_events is None:
+                                unit.cancel_scope.response_done(audio_generation)
+                                logger.info(
+                                    "Pipeline %d: audio completion became stale during event drain",
+                                    unit.index,
+                                )
+                                continue
+                            await _send_events(ws, terminal_events)
+                            await _send_events(
+                                ws,
+                                unit.service.take_deferred_settlement_events(session_id),
+                            )
                         unit.response_playing.clear()
                         unit.cancel_scope.response_done(audio_generation)
                         unit.should_listen.set()
@@ -905,9 +1561,16 @@ def create_app(
                     if is_control_message(audio_chunk):
                         continue
 
-                    if _should_discard_audio(unit, audio_chunk):
+                    if _should_discard_audio(
+                        unit,
+                        audio_chunk,
+                        service=unit.service,
+                        conn_id=session_id,
+                    ):
                         continue
 
+                    batch_identity = _audio_identity(audio_chunk)
+                    source_sample_rate = _audio_sample_rate(audio_chunk)
                     audio_chunk = _to_audio_bytes(audio_chunk)
 
                     audio_batch = bytearray(audio_chunk)
@@ -927,8 +1590,22 @@ def create_app(
                                 session.pending_output_item = next_chunk
                             break
 
-                        if _should_discard_audio(unit, next_chunk):
+                        if _should_discard_audio(
+                            unit,
+                            next_chunk,
+                            service=unit.service,
+                            conn_id=session_id,
+                        ):
                             continue
+
+                        if _audio_identity(next_chunk) != batch_identity:
+                            # Do not merge epochs or response IDs: a detached
+                            # completion can arrive beside the first PCM of the
+                            # next accepted turn. Preserve its order for the
+                            # following iteration.
+                            if session is not None:
+                                session.pending_output_item = next_chunk
+                            break
 
                         next_audio = _to_audio_bytes(next_chunk)
                         if len(audio_batch) + len(next_audio) > MAX_AUDIO_BATCH_BYTES:
@@ -937,12 +1614,73 @@ def create_app(
                             break
                         audio_batch.extend(next_audio)
 
+                    # Pulling a chunk is not admission. A newer speech-start
+                    # can invalidate this owner while batching, so confirm the
+                    # immutable tuple again before conversion allocates or
+                    # mutates a protocol response.
+                    if not _audio_identity_is_admissible(unit.service, session_id, batch_identity):
+                        continue
+
                     if not unit.response_playing.is_set():
                         unit.response_playing.set()
                         unit.should_listen.set()
 
                     if ws is not None and session_id:
-                        await _send_events(ws, unit.service.encode_audio_chunk(session_id, bytes(audio_batch)))
+                        input_epoch, response_epoch, response_id, _ = batch_identity
+                        encoded_events = unit.service.encode_audio_chunk(
+                            session_id,
+                            bytes(audio_batch),
+                            source_sample_rate=source_sample_rate,
+                            input_epoch=input_epoch,
+                            response_epoch=response_epoch,
+                            response_id=response_id,
+                        )
+                        if not encoded_events:
+                            continue
+                        # Bind the socket-side verification to the response ID
+                        # returned by this encode, rather than looking up the
+                        # mutable current_response_id after another task runs.
+                        encoded_response_id = next(
+                            (
+                                event.response_id
+                                for event in encoded_events
+                                if isinstance(event, ResponseAudioDeltaEvent)
+                            ),
+                            response_id,
+                        )
+                        encoded_identity = (
+                            input_epoch,
+                            response_epoch,
+                            encoded_response_id,
+                            source_sample_rate,
+                        )
+                        delivered_pcm = False
+                        for encoded_event in encoded_events:
+                            # The await below can yield to a speech-start path;
+                            # check immediately before every protocol event so
+                            # an old PCM batch cannot attach to a newer turn.
+                            if not _audio_identity_is_admissible(
+                                unit.service,
+                                session_id,
+                                encoded_identity,
+                            ):
+                                break
+                            sent = await _send_event(ws, encoded_event)
+                            if (
+                                sent
+                                and isinstance(encoded_event, ResponseAudioDeltaEvent)
+                                and bool(encoded_event.delta)
+                            ):
+                                delivered_pcm = True
+                        if delivered_pcm and _audio_identity_is_admissible(
+                            unit.service,
+                            session_id,
+                            encoded_identity,
+                        ):
+                            await _send_events(
+                                ws,
+                                unit.service.handle_first_delivered_pcm(session_id),
+                            )
                 except Empty:
                     pass
 

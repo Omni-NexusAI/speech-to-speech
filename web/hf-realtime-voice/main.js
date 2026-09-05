@@ -16,28 +16,14 @@
  * @typedef {"idle" | "connecting" | "queued" | "your-turn" | "listening" | "user-speaking" | "processing" | "ai-speaking" | "error"} AppState
  */
 
-import {
-  S2sWsRealtimeClient,
-  prepareToolArgumentsForBrowser,
-} from "./ws/s2s-ws-client.js?v=22-stateful-polyphase";
+import { S2sWsRealtimeClient } from "./ws/s2s-ws-client.js?v=17-synthesis-outcomes";
 import { $, truncateError, DEBUG } from "./ui/dom.js";
-import { ChatView, boundedCorrelationId } from "./ui/chat.js?v=5-opaque-echo-route";
+import { ChatView } from "./ui/chat.js";
+import { StartAttemptController } from "./ui/start-attempt.js";
 import { Account } from "./ui/account.js";
-import {
-  SearchTurnPolicy,
-  WEB_SEARCH_ARGUMENT_SCHEMA,
-  searchPolicyOutput,
-} from "./tools/web-search.js?v=1-search-freshness";
-import {
-  echoRouteIdentityMatches,
-  isOpaqueEchoRouteKey,
-  loadSanitizedEchoCalibrations,
-  sanitizeEchoCalibrations,
-  upsertEchoCalibration,
-} from "./echo-route-calibration.js?v=1-opaque-route";
-import { runtimeIdentityMatches } from "./runtime-identity.js?v=1-source-identity";
+import { formatHistoryCompactionDiagnostics } from "./ui/history-compaction-diagnostics.js";
 
-const DEFAULT_VOICE = "";
+const DEFAULT_VOICE = "clone:16d9bb336799";
 const DEFAULT_INSTRUCTIONS =
   "You are a friendly voice assistant. " +
   "Keep replies short, warm, and spoken. Avoid long monologues.";
@@ -50,15 +36,7 @@ const TOOL_USE_HINT =
   "that you are acting before the tool call, using natural wording that fits " +
   "the specific request and varies with the conversation. Do not reuse a stock " +
   "phrase, describe capabilities, or wait for another turn. Call the tool right " +
-  "away in the same response. A camera snapshot is point-in-time: when the user " +
-  "asks what is visible now or what changed, call camera_snapshot again instead " +
-  "of relying on an earlier description. For web_search, choose mode and freshness " +
-  "from the request instead of claiming that undated results are current. Treat " +
-  "retrieved_at_utc as retrieval time, not publication time, and cite each result's " +
-  "date and source when present. Never call an unchanged or broader search after a " +
-  "result. The same accepted user turn may use only one initial search and, only if " +
-  "needed, one distinct narrower refinement; after that, answer from the available " +
-  "results without another tool call.";
+  "away in the same response.";
 
 const STORAGE_KEYS = {
   // Direct s2s server URL, used only when the deploy has no LOAD_BALANCER_URL
@@ -80,11 +58,19 @@ const STORAGE_KEYS = {
   ttsBackend: "s2s.ws.ttsBackend",
   voiceByBackend: "s2s.ws.voiceByBackend",
   ttsProfileByBackend: "s2s.ws.ttsProfileByBackend",
+  playbackContinuity: "s2s.ws.playbackContinuity",
+  ttsDeliveryMode: "s2s.ws.ttsDeliveryMode",
+  historyCompaction: "s2s.ws.historyCompaction",
   modelProvider: "s2s.ws.modelProvider",
   modelUrl: "s2s.ws.modelUrl",
   modelName: "s2s.ws.modelName",
-  modelApiKey: "s2s.ws.modelApiKey",
 };
+
+// Older builds mistakenly treated the model API key as a local preference.
+// Keep the literal separate from STORAGE_KEYS so new code cannot accidentally
+// read or write it.  Migration deliberately removes the entry without
+// retrieving or logging its value.
+const LEGACY_MODEL_API_KEY_STORAGE_KEY = "s2s.ws.modelApiKey";
 
 // ── Noise gate ──────────────────────────────────────────────────────────────
 // The Settings cursor sets the gate's open threshold in dBFS. Its leftmost
@@ -113,20 +99,22 @@ const TOOL_DEFS = {
     name: "web_search",
     description:
       "Search the web for current or factual information you don't already know " +
-      "(news, prices, facts, documentation). Choose news/web mode and a real recency " +
-      "filter when the request requires them. Returns versioned structured results " +
-      "with dates and sources when the provider supplies them.",
-    parameters: WEB_SEARCH_ARGUMENT_SCHEMA,
+      "(news, prices, facts, documentation). Returns the top results with titles, " +
+      "snippets and URLs.",
+    parameters: {
+      type: "object",
+      properties: { query: { type: "string", description: "The search query." } },
+      required: ["query"],
+    },
   },
   camera_snapshot: {
     type: "function",
     name: "camera_snapshot",
     description:
       "Capture the current frame from the user's webcam so you can see what they " +
-      "are showing you. Each call is a point-in-time view. Use it whenever the user " +
-      "refers to something visual or asks you to look, and call it again for what " +
-      "is visible now or what changed since an earlier snapshot.",
-    parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
+      "are showing you. Use it whenever the user refers to something visual or " +
+      "asks you to look.",
+    parameters: { type: "object", properties: {}, required: [] },
   },
 };
 
@@ -135,12 +123,15 @@ const SNAPSHOT_MAX_EDGE = 768;
 const SNAPSHOT_QUALITY = 0.7;
 
 function loadSettings() {
+  // API keys are page-session-only.  Remove a legacy persisted entry before
+  // reading any preferences; do not inspect the value during this migration.
+  localStorage.removeItem(LEGACY_MODEL_API_KEY_STORAGE_KEY);
   const storedEchoGuard = localStorage.getItem(STORAGE_KEYS.echoGuard);
   const echoGuardVersion = localStorage.getItem(STORAGE_KEYS.echoGuardVersion);
   // "off" was the historical name for browser-native AEC.  Migrate it
   // truthfully and keep Native as the safe default while AEC3 is unavailable.
   const echoGuard = storedEchoGuard === "strict" ? "strict" :
-    storedEchoGuard === "native" ? "native" : "adaptive";
+    storedEchoGuard === "adaptive" ? "adaptive" : "native";
   if (echoGuardVersion !== "3") {
     localStorage.setItem(STORAGE_KEYS.echoGuard, echoGuard);
     localStorage.setItem(STORAGE_KEYS.echoGuardVersion, "3");
@@ -159,8 +150,15 @@ function loadSettings() {
   return {
     directUrl: localStorage.getItem(STORAGE_KEYS.directUrl) || "http://127.0.0.1:8765",
     voice: storedVoice,
-    voiceByBackend: { ...voiceByBackend, [normalizedBackend]: storedVoice },
+    voiceByBackend: { faster: DEFAULT_VOICE, ...voiceByBackend, [normalizedBackend]: storedVoice },
     ttsProfileByBackend,
+    playbackContinuity: localStorage.getItem(STORAGE_KEYS.playbackContinuity) === "fast-start" ? "fast-start" : "adaptive",
+    // Native PCM is experimental until an explicit per-session choice. Never
+    // infer it from a healthy candidate capability.
+    ttsDeliveryMode: localStorage.getItem(STORAGE_KEYS.ttsDeliveryMode) === "native_incremental_pcm"
+      ? "native_incremental_pcm"
+      : "buffered_phrase",
+    historyCompaction: normalizeHistoryCompaction(loadJsonSetting(STORAGE_KEYS.historyCompaction)),
     instructions: localStorage.getItem(STORAGE_KEYS.instructions) || DEFAULT_INSTRUCTIONS,
     noiseGate: loadGateThreshold(),
     echoGuard,
@@ -173,7 +171,7 @@ function loadSettings() {
     modelProvider: localStorage.getItem(STORAGE_KEYS.modelProvider) || "local",
     modelUrl: localStorage.getItem(STORAGE_KEYS.modelUrl) || "",
     modelName: localStorage.getItem(STORAGE_KEYS.modelName) || "",
-    modelApiKey: localStorage.getItem(STORAGE_KEYS.modelApiKey) || "",
+    modelApiKey: "",
   };
 }
 
@@ -193,7 +191,6 @@ function loadGateThreshold() {
 /** @param {ReturnType<typeof loadSettings>} s */
 function saveSettings(s) {
   s.voiceByBackend = { ...(s.voiceByBackend || {}), [s.ttsBackend]: s.voice };
-  s.echoCalibrations = sanitizeEchoCalibrations(s.echoCalibrations);
   localStorage.setItem(STORAGE_KEYS.directUrl, s.directUrl);
   localStorage.setItem(STORAGE_KEYS.voice, s.voice);
   localStorage.setItem(STORAGE_KEYS.instructions, s.instructions);
@@ -201,6 +198,10 @@ function saveSettings(s) {
   localStorage.setItem(STORAGE_KEYS.echoGuard, s.echoGuard);
   localStorage.setItem(STORAGE_KEYS.echoGuardVersion, "3");
   localStorage.setItem(STORAGE_KEYS.echoCalibrations, JSON.stringify(s.echoCalibrations || {}));
+  localStorage.setItem(STORAGE_KEYS.playbackContinuity, s.playbackContinuity === "fast-start" ? "fast-start" : "adaptive");
+  localStorage.setItem(STORAGE_KEYS.ttsDeliveryMode, s.ttsDeliveryMode === "native_incremental_pcm" ? "native_incremental_pcm" : "buffered_phrase");
+  s.historyCompaction = normalizeHistoryCompaction(s.historyCompaction);
+  localStorage.setItem(STORAGE_KEYS.historyCompaction, JSON.stringify(s.historyCompaction));
   localStorage.setItem(STORAGE_KEYS.fullBufferTts, s.fullBufferTts ? "1" : "0");
   localStorage.setItem(STORAGE_KEYS.liveTranscript, s.liveTranscript ? "1" : "0");
   localStorage.setItem(STORAGE_KEYS.maxResponseTokens, String(s.maxResponseTokens));
@@ -210,7 +211,6 @@ function saveSettings(s) {
   localStorage.setItem(STORAGE_KEYS.modelProvider, s.modelProvider);
   localStorage.setItem(STORAGE_KEYS.modelUrl, s.modelUrl);
   localStorage.setItem(STORAGE_KEYS.modelName, s.modelName);
-  localStorage.setItem(STORAGE_KEYS.modelApiKey, s.modelApiKey);
   // Browser storage is convenient, but an environment/browser reset clears it.
   // Preserve only non-secret preferences in the managed local UI state. API
   // keys remain browser-only and are intentionally excluded from this payload.
@@ -225,7 +225,74 @@ function saveSettings(s) {
 }
 
 function loadEchoCalibrations() {
-  return loadSanitizedEchoCalibrations(localStorage, STORAGE_KEYS.echoCalibrations);
+  try {
+    const value = JSON.parse(localStorage.getItem(STORAGE_KEYS.echoCalibrations) || "{}");
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+function loadJsonSetting(key) {
+  try {
+    const value = JSON.parse(localStorage.getItem(key) || "null");
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeHistoryCompaction(value) {
+  const raw = value && typeof value === "object" ? value : {};
+  const trigger = Math.max(0.20, Math.min(0.90, Number(raw.trigger_ratio) || 0.70));
+  const target = Math.max(0.10, Math.min(trigger - 0.05, Number(raw.target_ratio) || 0.50));
+  return {
+    enabled: raw.enabled !== false,
+    trigger_ratio: trigger,
+    target_ratio: target,
+    recent_turns: Math.max(1, Math.min(12, Math.round(Number(raw.recent_turns) || 6))),
+  };
+}
+
+function syncHistoryCompactionControls() {
+  const config = normalizeHistoryCompaction(settings.historyCompaction);
+  historyCompactionEnabled.checked = config.enabled;
+  historyCompactionTrigger.value = config.trigger_ratio.toFixed(2);
+  historyCompactionTarget.value = config.target_ratio.toFixed(2);
+  historyCompactionRecentTurns.value = String(config.recent_turns);
+}
+
+function renderHistoryCompactionDiagnostics(contextDetail = null) {
+  const configured = normalizeHistoryCompaction(settings.historyCompaction);
+  const acknowledged = acknowledgedHistoryCompaction;
+  const rendered = formatHistoryCompactionDiagnostics({ configured, acknowledged, contextDetail });
+  if (diagnosticsHistoryCompactionSummary) {
+    diagnosticsHistoryCompactionSummary.textContent = rendered.summary;
+  }
+  if (!diagnosticsHistoryCompactionStatus) return;
+  diagnosticsHistoryCompactionStatus.textContent = rendered.status;
+}
+
+async function applyHistoryCompactionSettings() {
+  settings.historyCompaction = normalizeHistoryCompaction({
+    enabled: historyCompactionEnabled.checked,
+    trigger_ratio: Number(historyCompactionTrigger.value),
+    target_ratio: Number(historyCompactionTarget.value),
+    recent_turns: Number(historyCompactionRecentTurns.value),
+  });
+  syncHistoryCompactionControls();
+  acknowledgedHistoryCompaction = null;
+  const saved = await saveSettings(settings);
+  if (!saved.ok) {
+    if (diagnosticsHistoryCompactionStatus) {
+      diagnosticsHistoryCompactionStatus.textContent = `Could not persist compaction settings: ${saved.error}`;
+    }
+    return;
+  }
+  if (client && LIVE_STATES.has(currentState)) {
+    client.updateLocalPipeline({ history_compaction: settings.historyCompaction });
+  }
+  renderHistoryCompactionDiagnostics();
 }
 
 function publicSettingsPayload(s) {
@@ -234,10 +301,13 @@ function publicSettingsPayload(s) {
     voice: s.voice,
     voiceByBackend: s.voiceByBackend,
     ttsProfileByBackend: s.ttsProfileByBackend || {},
+    playbackContinuity: s.playbackContinuity === "fast-start" ? "fast-start" : "adaptive",
+    ttsDeliveryMode: s.ttsDeliveryMode === "native_incremental_pcm" ? "native_incremental_pcm" : "buffered_phrase",
+    historyCompaction: normalizeHistoryCompaction(s.historyCompaction),
     instructions: s.instructions,
     noiseGate: s.noiseGate,
     echoGuard: s.echoGuard,
-    echoCalibrations: sanitizeEchoCalibrations(s.echoCalibrations),
+    echoCalibrations: s.echoCalibrations || {},
     fullBufferTts: s.fullBufferTts,
     liveTranscript: s.liveTranscript,
     maxResponseTokens: s.maxResponseTokens,
@@ -254,11 +324,8 @@ async function restorePersistentSettings() {
     if (!response.ok) return;
     const payload = await response.json();
     if (!payload?.settings || typeof payload.settings !== "object") return;
-    // Preserve any browser-local API key already present on this device.
+    // Preserve any page-session-only API key already present in this browser.
     settings = { ...settings, ...payload.settings, modelApiKey: settings.modelApiKey };
-    settings.echoCalibrations = sanitizeEchoCalibrations(
-      payload.settings.echoCalibrations ?? settings.echoCalibrations,
-    );
     settings.ttsBackend = normalizeTtsProvider(settings.ttsBackend);
     settings.voiceByBackend = normalizeTtsProviderMap(
       payload.settings.voiceByBackend || settings.voiceByBackend || {},
@@ -376,9 +443,10 @@ const diagnosticsTtsProfileSaveAs = $("#diagnostics-tts-profile-save-as");
 const diagnosticsAudioSummary = $("#diagnostics-audio-summary");
 const diagnosticsAudioStatus = $("#diagnostics-audio-status");
 const diagnosticsAudioMetrics = $("#diagnostics-audio-metrics");
+const diagnosticsPlaybackContinuity = $("#diagnostics-playback-continuity");
+const diagnosticsTtsDeliveryMode = $("#diagnostics-tts-delivery-mode");
 const diagnosticsEchoDevicePair = $("#diagnostics-echo-device-pair");
 const diagnosticsEchoOutputLatency = $("#diagnostics-echo-output-latency");
-const diagnosticsEchoCalibrationStatus = $("#diagnostics-echo-calibration-status");
 const diagnosticsEchoSave = $("#diagnostics-echo-save");
 const diagnosticsEchoUseMeasured = $("#diagnostics-echo-use-measured");
 const diagnosticsEchoInputs = Array.from(document.querySelectorAll("[data-echo-calibration-key]"));
@@ -394,6 +462,13 @@ const diagnosticsTuningEffectiveValues = $("#diagnostics-tuning-effective-values
 const diagnosticsTuningContextUnlock = $("#tuning-context-unlock");
 const diagnosticsTuningContext = $("#tuning-left-context-frames");
 const diagnosticsContextWarning = $("#diagnostics-context-warning");
+const historyCompactionEnabled = $("#history-compaction-enabled");
+const historyCompactionTrigger = $("#history-compaction-trigger");
+const historyCompactionTarget = $("#history-compaction-target");
+const historyCompactionRecentTurns = $("#history-compaction-recent-turns");
+const diagnosticsHistoryCompactionSummary = $("#diagnostics-history-compaction-summary");
+const diagnosticsHistoryCompactionStatus = $("#diagnostics-history-compaction-status");
+let acknowledgedHistoryCompaction = null;
 let candidateTuningResolved = null;
 let candidateTuningProfileDocument = null;
 let candidateInactiveTuningFields = new Set();
@@ -514,11 +589,45 @@ function candidateRestTuningPayload(
 function activeTtsTuning(backend = settings.ttsBackend) {
   if (normalizeTtsProvider(backend) !== AUDIO_CPP_PROVIDER) return null;
   const state = realtimeTuningState(backend);
-  const payload = candidateRestTuningPayload(state.overrides, candidateTuningResolved, state.profile_id);
-  // `scope` belongs only to the candidate supervisor's REST API.  The Realtime
-  // WebSocket has a deliberately smaller, strict session schema.
-  const { scope: _restScope, ...sessionTuning } = payload;
-  return sessionTuning;
+  const profile = candidateTuningResolved?.profile || {};
+  const revision = Number(profile.revision ?? candidateTuningResolved?.profile_revision);
+  const effectiveValues = effectiveCandidateTuning(candidateTuningResolved);
+  // WebSocket session config is an immutable response-input snapshot. Do not
+  // send the mutable UI diagnostic object (`resolved`) or a partial profile.
+  if (!Number.isSafeInteger(revision) || revision <= 0) return null;
+  const effective = { clone_mode: "full_icl" };
+  for (const key of SAFE_TUNING_KEYS) {
+    if (effectiveValues[key] === undefined) return null;
+    effective[key] = effectiveValues[key];
+  }
+  return {
+    provider: AUDIO_CPP_PROVIDER,
+    profile_id: state.profile_id,
+    profile_revision: revision,
+    effective,
+    overrides: { ...state.overrides },
+    delivery_mode: settings.ttsDeliveryMode === "native_incremental_pcm"
+      ? "native_incremental_pcm"
+      : "buffered_phrase",
+  };
+}
+
+/**
+ * Return the complete immutable audio.cpp tuning snapshot that the WebSocket
+ * router requires for each response.  A profile list is not sufficient: the
+ * selected profile must have been resolved by the candidate and carry its
+ * concrete revision and effective fields.  This keeps an unavailable/stale
+ * browser resolve from becoming a late TTS failure after Gemma has answered.
+ */
+function requiredCandidateTtsTuning(backend = settings.ttsBackend) {
+  if (normalizeTtsProvider(backend) !== AUDIO_CPP_PROVIDER) return null;
+  const tuning = activeTtsTuning(backend);
+  if (!tuning) {
+    throw new Error(
+      "audio.cpp needs a complete resolved tuning profile before a conversation can start. Refresh the selected TTS backend and try again.",
+    );
+  }
+  return tuning;
 }
 
 /** Browser-only playback snapshot paired with a pipeline config update. The
@@ -531,46 +640,36 @@ function activePlaybackConfig(backend = settings.ttsBackend) {
       provider,
       nativeStreaming: false,
       profileId: "",
-      profileRevision: "",
-      model: "",
-      clone: settings.voice || "",
-      firstBlockFrames: 0,
-      steadyBlockFrames: 0,
+      profileRevision: null,
       resolvedPrimeMs: 0,
-      outputRate: 16000,
+      // Faster, Groxaxo, and the buffered provider path retain their
+      // immediate zero-reservoir contract. Cadence learning is an explicit
+      // audio.cpp-native experiment and must not introduce re-prime pauses in
+      // another backend.
+      continuityMode: "fast-start",
     };
   }
   const state = realtimeTuningState(provider);
+  const profile = candidateTuningResolved?.profile || {};
+  const profileRevision = Number(profile.revision ?? candidateTuningResolved?.profile_revision);
   const effective = effectiveCandidateTuning();
   const firstBlockFrames = Number(effective.first_block_frames);
-  const steadyBlockFrames = Number(effective.steady_block_frames);
   const resolvedPrimeMs = Number.isFinite(firstBlockFrames)
     ? firstBlockFrames * 80
     : 0;
   const backendStatus = ttsBackendStatuses?.[provider];
-  const profileDocument = candidateTuningProfileDocument?.profiles?.[state.profile_id] || {};
   return {
     provider,
     profileId: state.profile_id,
-    profileRevision: candidateTuningResolved?.profile?.revision
-      ?? candidateTuningResolved?.revision
-      ?? profileDocument.revision
-      ?? "",
-    model: effective.model || backendStatus?.currentModel || backendStatus?.requiredModel || "",
-    clone: settings.voice || "",
+    profileRevision: Number.isSafeInteger(profileRevision) && profileRevision > 0
+      ? profileRevision
+      : null,
     // Both engine capability and the direct chunk/header probe must agree.
-    nativeStreaming: backendStatus?.nativeStreaming === true
+    nativeStreaming: settings.ttsDeliveryMode === "native_incremental_pcm"
+      && backendStatus?.nativeStreaming === true
       && candidateTuningResolved?.capabilities?.native_incremental_pcm === true,
-    firstBlockFrames: Number.isSafeInteger(firstBlockFrames) && firstBlockFrames > 0
-      ? firstBlockFrames
-      : 0,
-    steadyBlockFrames: Number.isSafeInteger(steadyBlockFrames) && steadyBlockFrames > 0
-      ? steadyBlockFrames
-      : 0,
     resolvedPrimeMs,
-    // The Realtime WebSocket contract carries 16 kHz PCM to the browser even
-    // though audio.cpp's native transport is 24 kHz before server resampling.
-    outputRate: 16000,
+    continuityMode: settings.playbackContinuity === "fast-start" ? "fast-start" : "adaptive",
   };
 }
 
@@ -587,7 +686,9 @@ function updateRealtimeAudioSummary() {
   const latestTts = [...pipelineMetrics].reverse().find((metric) => metric.stage === "tts" && ["request_start", "done"].includes(metric.status));
   const mode = latestTts?.detail?.mode || latestTts?.detail?.streaming_mode || (
     backend === AUDIO_CPP_PROVIDER
-      ? backendStatus?.nativeStreaming ? "native PCM" : "buffered fallback"
+      ? settings.ttsDeliveryMode === "native_incremental_pcm" && backendStatus?.nativeStreaming
+        ? "native PCM (experimental)"
+        : "buffered phrase (stable default)"
       : "provider managed"
   );
   const firstPcm = latestFirst?.detail?.first_pcm_ms ?? latestFirst?.elapsed_ms;
@@ -599,6 +700,16 @@ function setCandidateTuningEnabled(enabled) {
   diagnosticsTtsProfileApply.disabled = !enabled;
   diagnosticsTtsProfileName.disabled = !enabled;
   diagnosticsTtsProfileSaveAs.disabled = !enabled;
+  if (diagnosticsPlaybackContinuity) {
+    diagnosticsPlaybackContinuity.disabled = !enabled;
+    diagnosticsPlaybackContinuity.value = settings.playbackContinuity === "fast-start" ? "fast-start" : "adaptive";
+  }
+  if (diagnosticsTtsDeliveryMode) {
+    diagnosticsTtsDeliveryMode.disabled = !enabled;
+    diagnosticsTtsDeliveryMode.value = settings.ttsDeliveryMode === "native_incremental_pcm"
+      ? "native_incremental_pcm"
+      : "buffered_phrase";
+  }
   diagnosticsTuningApply.disabled = !enabled;
   diagnosticsTuningClear.disabled = !enabled;
   if (!enabled) {
@@ -654,7 +765,10 @@ async function resolveCandidateTuning(
   const firstMs = Number(effective.first_block_frames || 0) * 80;
   const steadyMs = Number(effective.steady_block_frames || 0) * 80;
   const native = !!resolved.capabilities?.native_incremental_pcm;
-  diagnosticsTuningStatus.textContent = `${resolved.profile?.name || resolved.profile?.id || "Profile"} · ${native ? "native incremental PCM" : "buffered fallback"} · first/steady ${firstMs}/${steadyMs} ms · model 24 kHz PCM16 · Realtime transport 16 kHz.`;
+  const selectedMode = settings.ttsDeliveryMode === "native_incremental_pcm"
+    ? native ? "native incremental PCM (experimental)" : "native PCM requested but unavailable"
+    : "buffered phrase (stable default)";
+  diagnosticsTuningStatus.textContent = `${resolved.profile?.name || resolved.profile?.id || "Profile"} · ${selectedMode} · first/steady ${firstMs}/${steadyMs} ms · audio.cpp PCM16 / 24 kHz server-acknowledged transport.`;
   diagnosticsTuningNamedValues.textContent = `${resolved.profile?.name || profileId} · ${compactTuningSummary(resolved.profile || {})}`;
   diagnosticsTuningOverrideValues.textContent = compactTuningSummary(resolved.temporaryOverrides || {});
   diagnosticsTuningEffectiveValues.textContent = compactTuningSummary(effective);
@@ -665,6 +779,10 @@ async function resolveCandidateTuning(
 
 function applyCandidateTuningToLiveSession() {
   const tuning = activeTtsTuning();
+  if (client && LIVE_STATES.has(currentState) && !tuning) {
+    diagnosticsTuningStatus.textContent = "Realtime tuning update withheld: the selected profile is not fully resolved. Refresh it before the next response.";
+    return false;
+  }
   if (client && LIVE_STATES.has(currentState) && tuning) {
     client.updateLocalPipeline(
       {
@@ -673,7 +791,9 @@ function applyCandidateTuningToLiveSession() {
       },
       activePlaybackConfig(AUDIO_CPP_PROVIDER),
     );
+    settings.playbackContinuity = settings.playbackContinuity === "fast-start" ? "fast-start" : "adaptive";
   }
+  return true;
 }
 
 async function refreshCandidateTuningProfiles() {
@@ -730,7 +850,7 @@ diagnosticsTtsProfileApply?.addEventListener("click", async () => {
     const saved = await saveSettings(settings);
     if (!saved.ok) throw new Error(saved.error || "Realtime profile selection could not be saved");
     applyCandidateTuningToLiveSession();
-    diagnosticsTuningStatus.textContent += " Saved for Realtime only; Voice Studio keeps its own active selection.";
+    diagnosticsTuningStatus.textContent += " Saved for Realtime only and applies from the next assistant response; an active answer keeps its frozen profile. Voice Studio keeps its own active selection.";
   } catch (error) {
     diagnosticsTuningStatus.textContent = `Profile apply failed: ${error instanceof Error ? error.message : String(error)}`;
   }
@@ -787,6 +907,28 @@ diagnosticsTtsProfile?.addEventListener("change", () => {
   });
 });
 
+diagnosticsPlaybackContinuity?.addEventListener("change", async () => {
+  settings.playbackContinuity = diagnosticsPlaybackContinuity.value === "fast-start" ? "fast-start" : "adaptive";
+  const saved = await saveSettings(settings);
+  diagnosticsTuningStatus.textContent = saved.ok
+    ? "Playback continuity saved. It applies from the next assistant response; current audio keeps its existing queue."
+    : `Playback continuity is browser-only until settings save succeeds: ${saved.error}`;
+  applyCandidateTuningToLiveSession();
+});
+
+diagnosticsTtsDeliveryMode?.addEventListener("change", async () => {
+  settings.ttsDeliveryMode = diagnosticsTtsDeliveryMode.value === "native_incremental_pcm"
+    ? "native_incremental_pcm"
+    : "buffered_phrase";
+  await saveSettings(settings);
+  applyCandidateTuningToLiveSession();
+  updateRealtimeAudioSummary();
+});
+
+for (const control of [historyCompactionEnabled, historyCompactionTrigger, historyCompactionTarget, historyCompactionRecentTurns]) {
+  control?.addEventListener("change", applyHistoryCompactionSettings);
+}
+
 diagnosticsTuningContextUnlock?.addEventListener("change", syncDecoderContextUnlock);
 
 diagnosticsTuningApply?.addEventListener("click", async () => {
@@ -821,11 +963,11 @@ function echoCalibrationFromControls() {
     if (Number.isFinite(number)) calibration[input.dataset.echoCalibrationKey] = number;
   }
   return {
-    delayMs: Math.max(0, Math.min(500, Number.isFinite(calibration.delayMs) ? calibration.delayMs : 0)),
-    suppressionStrength: Math.max(0, Math.min(1, Number.isFinite(calibration.suppressionStrength) ? calibration.suppressionStrength : 0.65)),
-    leakageThreshold: Math.max(0.05, Math.min(1, Number.isFinite(calibration.leakageThreshold) ? calibration.leakageThreshold : 0.65)),
-    doubleTalkSensitivity: Math.max(0, Math.min(1, Number.isFinite(calibration.doubleTalkSensitivity) ? calibration.doubleTalkSensitivity : 0.5)),
-    echoTailMs: Math.max(350, Math.min(1000, Number.isFinite(calibration.echoTailMs) ? calibration.echoTailMs : 350)),
+    delayMs: Math.max(0, Math.min(500, Number(calibration.delayMs) || 0)),
+    suppressionStrength: Math.max(0, Math.min(1, Number(calibration.suppressionStrength) || 0)),
+    leakageThreshold: Math.max(0.05, Math.min(1, Number(calibration.leakageThreshold) || 0.65)),
+    doubleTalkSensitivity: Math.max(0, Math.min(1, Number(calibration.doubleTalkSensitivity) || 0)),
+    echoTailMs: Number(latestEchoStatus?.calibration?.echoTailMs) || 350,
   };
 }
 
@@ -837,22 +979,14 @@ function paintEchoStatus(status) {
     const value = calibration[input.dataset.echoCalibrationKey];
     if (Number.isFinite(Number(value))) input.value = String(value);
   }
-  const routeKey = isOpaqueEchoRouteKey(status.routeKey) ? status.routeKey : "";
-  const routeEpoch = Number.isSafeInteger(status.routeEpoch) ? status.routeEpoch : 0;
-  diagnosticsEchoDevicePair.textContent = routeKey
-    ? `Opaque route ${routeKey.slice(6, 14)}… · epoch ${routeEpoch}`
-    : "opaque route pending";
+  diagnosticsEchoDevicePair.textContent = status.devicePair || "device pair pending";
   diagnosticsEchoOutputLatency.textContent =
     `Output latency: ${Number(status.outputLatencyMs || 0).toFixed(1)} ms`;
-  const result = status.calibrationResult || {};
-  const accepted = result.accepted === true && Number.isFinite(Number(result.delayMs));
-  diagnosticsEchoUseMeasured.disabled = !accepted;
-  diagnosticsEchoCalibrationStatus.textContent = accepted
-    ? `Stable calibration: ${result.sampleCount} samples over ${Number(result.spanMs).toFixed(0)} ms · median ${Number(result.medianMs).toFixed(1)} ms · p95 ${Number(result.p95Ms).toFixed(1)} ms · jitter ${Number(result.jitterMs).toFixed(1)} ms.`
-    : `Calibration pending: ${Number(result.sampleCount || 0)} samples · ${String(result.reason || "collecting")}.`;
   const requested = status.requestedMode || settings.echoGuard;
   const effective = status.effectiveMode || (requested === "strict" ? "strict-fallback" : "native");
-  const engine = status.available ? "verified AEC3" : "Native browser AEC fallback";
+  const engine = status.available
+    ? status.engine || "AEC3"
+    : status.error || status.loaderReason || "Native browser AEC fallback";
   diagnosticsAudioStatus.textContent =
     `Requested/effective echo: ${requested}/${effective} · reference ${status.referenceWired === false ? "missing" : "wired"} · ${engine}.`;
   setDiagnosticWarning(
@@ -864,40 +998,28 @@ function paintEchoStatus(status) {
 }
 
 async function saveActiveEchoCalibration({ useMeasuredDelay = false } = {}) {
-  const routeKey = latestEchoStatus?.routeKey;
-  const routeEpoch = latestEchoStatus?.routeEpoch;
-  if (!isOpaqueEchoRouteKey(routeKey) || !Number.isSafeInteger(routeEpoch)) {
-    diagnosticsAudioStatus.textContent = "Start a conversation before saving route calibration.";
+  const pair = latestEchoStatus?.devicePair;
+  if (!pair) {
+    diagnosticsAudioStatus.textContent = "Start a conversation before saving device-pair calibration.";
     return;
   }
   if (useMeasuredDelay) {
-    const result = latestEchoStatus?.calibrationResult;
-    if (result?.accepted !== true || !Number.isFinite(Number(result.delayMs))) {
-      diagnosticsAudioStatus.textContent = "A stable quiet-playback calibration is not available yet.";
+    const echo = [...pipelineMetrics].reverse().find((metric) => metric.stage === "echo_guard");
+    const measured = Number(echo?.detail?.lag_ms);
+    const outputLatency = Number(latestEchoStatus?.outputLatencyMs || 0);
+    if (!Number.isFinite(measured)) {
+      diagnosticsAudioStatus.textContent = "No stable AEC3 delay measurement is available yet.";
       return;
     }
     const delayInput = diagnosticsEchoInputs.find(
       (input) => input.dataset.echoCalibrationKey === "delayMs",
     );
-    if (delayInput) delayInput.value = String(Math.max(0, Math.round(Number(result.delayMs))));
+    if (delayInput) delayInput.value = String(Math.max(0, Math.round(measured - outputLatency)));
   }
   const calibration = echoCalibrationFromControls();
-  const savingClient = client;
-  if (!savingClient?.setEchoCalibration(calibration, routeKey, routeEpoch)) {
-    diagnosticsAudioStatus.textContent = "The audio route changed; review the new route before saving.";
-    return;
-  }
-  settings.echoCalibrations = upsertEchoCalibration(
-    settings.echoCalibrations, routeKey, calibration,
-  );
+  settings.echoCalibrations = { ...(settings.echoCalibrations || {}), [pair]: calibration };
+  client?.setEchoCalibration(calibration);
   const saved = await saveSettings(settings);
-  if (
-    client !== savingClient
-    || !echoRouteIdentityMatches(latestEchoStatus, routeKey, routeEpoch)
-  ) {
-    diagnosticsAudioStatus.textContent = "The audio route changed while saving; review the active route.";
-    return;
-  }
   if (!saved.ok) {
     diagnosticsAudioStatus.textContent = `Calibration save failed: ${saved.error}`;
     return;
@@ -1015,19 +1137,25 @@ let profileLibraryWritable = false;
 let localPipeline = null;
 /** @type {Record<string, any>} */
 let ttsBackendStatuses = {};
+let localIdentityRequest = 0;
+let localIdentityRetryTimer = 0;
+// Startup status is a probe, not a background service manager.  Retry a
+// transient failure a small, bounded number of times; a focus, backend switch,
+// or explicit refresh starts a fresh probe budget.
+const MAX_LOCAL_IDENTITY_RETRIES = 2;
+let localIdentityRetryAttempts = 0;
 // A backend switch can finish before an older inventory response.  Only the
 // most recently requested backend is allowed to change the voice picker.
 let voiceInventoryRequest = 0;
 let diagnosticsOpen = localStorage.getItem(STORAGE_KEYS.diagnostics) === "1";
 /** @type {Array<any>} */
 let pipelineMetrics = [];
-const EXPECTED_UI_API_VERSION = 22;
-const EXPECTED_BACKEND_API_VERSION = 8;
-const DIAGNOSTIC_STAGES = ["mic", "echo_guard", "vad", "transcription", "gemma", "context", "tool", "search", "tts", "playback"];
+const EXPECTED_UI_API_VERSION = 21;
+const EXPECTED_BACKEND_API_VERSION = 7;
+const DIAGNOSTIC_STAGES = ["mic", "echo_guard", "vad", "transcription", "gemma", "context", "tool", "tts", "playback"];
 const DIAGNOSTIC_STAGE_LABELS = { echo_guard: "Echo Guard" };
 const diagnosticWarnings = new Map();
 let backendRuntime = null;
-let frontendRuntime = null;
 let backendMetricTimer = 0;
 let backendRuntimeTimer = 0;
 
@@ -1049,25 +1177,8 @@ let toolsEnabled = loadTools();
 let serverSearchKey = false;
 // A user-supplied key (fallback when the deploy has none). localStorage only.
 let userSearchKey = localStorage.getItem(STORAGE_KEYS.searchKey) || "";
-const searchTurnPolicy = new SearchTurnPolicy();
-let searchTurnItemId = "";
-
-/** @param {string} [itemId] */
-function resetSearchTurnPolicy(itemId = "") {
-  searchTurnPolicy.reset();
-  searchTurnItemId = itemId;
-}
-
-/** A cumulative VAD revision retains its item ID and therefore its budget. */
-function beginAcceptedSearchTurn(itemId) {
-  const nextItemId = typeof itemId === "string" ? itemId : "";
-  if (!nextItemId || nextItemId !== searchTurnItemId) resetSearchTurnPolicy(nextItemId);
-}
 /** @type {MediaStream | null} */
 let cameraStream = null;
-// Monotonic within the page session. This identifies each actual camera tool
-// invocation independently from backend call IDs, including malformed calls.
-let cameraCaptureGeneration = 0;
 
 /** Search is usable if the server has a key or the user supplied one. */
 function searchAvailable() {
@@ -1117,6 +1228,7 @@ let queuedTicketId = "";
 
 /** @type {S2sWsRealtimeClient | null} */
 let client = null;
+const startAttempts = new StartAttemptController();
 /** @type {MediaStream | null} */
 let micStream = null;
 let micMuted = false;
@@ -1219,7 +1331,6 @@ function renderVoiceOptions() {
     option.selected = true;
     inputVoice.append(option);
     inputVoice.disabled = true;
-    syncSelectedProfileEditor();
     return;
   }
 
@@ -1267,14 +1378,14 @@ function syncSelectedProfileEditor() {
   profileLibraryStatus.textContent = profileLibraryWritable
     ? `Changes persist only to the selected ${settings.ttsBackend} clone library.`
     : "The selected backend is inventory-only here; use its own Voice Studio for profile changes.";
-  profileCreateBtn.disabled = !profileLibraryWritable;
-  profileImportBtn.disabled = !profileLibraryWritable;
-  profileSaveBtn.disabled = !profileLibraryWritable || !profile;
-  profileDeleteBtn.disabled = !profileLibraryWritable || !profile;
+  for (const button of [profileCreateBtn, profileSaveBtn, profileDeleteBtn, profileImportBtn]) {
+    button.disabled = !profileLibraryWritable;
+  }
   if (!profile) return;
   inputProfileName.value = profile.name || "";
   inputProfileRefText.value = profile.ref_text || "";
   inputProfileLanguage.value = profile.language || "Auto";
+  profileDeleteBtn.disabled = !profileLibraryWritable || profile.id === DEFAULT_VOICE.replace("clone:", "");
 }
 
 async function qwen3Json(url, options = {}) {
@@ -1289,7 +1400,7 @@ async function qwen3Json(url, options = {}) {
 
 function applyVoiceProfilePayload(payload, backend = settings.ttsBackend) {
   if (backend !== settings.ttsBackend || (payload.backend && payload.backend !== backend)) return;
-  defaultVoice = payload.defaultVoice || "";
+  defaultVoice = payload.defaultVoice || DEFAULT_VOICE;
   voiceProfiles = Array.isArray(payload.voices) ? payload.voices : [];
   profileLibraryWritable = !!payload.writable;
   const liveVoices = new Set(voiceProfiles.map((profile) => profile.voice));
@@ -1300,10 +1411,6 @@ function applyVoiceProfilePayload(payload, backend = settings.ttsBackend) {
       ? saved
       : (liveVoices.has(providerSelected) ? providerSelected : (liveVoices.has(defaultVoice) ? defaultVoice : voiceProfiles[0].voice));
     settings.voiceByBackend = { ...(settings.voiceByBackend || {}), [backend]: settings.voice };
-  } else {
-    settings.voice = "";
-    settings.voiceByBackend = { ...(settings.voiceByBackend || {}), [backend]: "" };
-    void saveSettings(settings);
   }
   renderVoiceOptions();
 }
@@ -1329,6 +1436,7 @@ async function selectVoiceProfile() {
   // after the selected clone has reached server-backed settings; otherwise the
   // status endpoint necessarily reports the previous clone and blocks Start.
   await refreshTtsBackends();
+  await refreshLocalIdentity();
   renderSelectedTtsBackendStatus(profile);
 }
 
@@ -1665,7 +1773,7 @@ async function watchCameraPermission() {
  * Grab the current webcam frame as a downscaled JPEG data URL. The preview is
  * mirrored in CSS for a natural self-view, but we draw the raw (un-mirrored)
  * video here so the model sees the scene in its true orientation.
- * @returns {{ dataUrl: string, width: number, height: number } | null}
+ * @returns {string | null}
  */
 function captureSnapshot() {
   if (!cameraStream || !camVideo.videoWidth) return null;
@@ -1680,7 +1788,7 @@ function captureSnapshot() {
   const ctx = canvas.getContext("2d");
   if (!ctx) return null;
   ctx.drawImage(camVideo, 0, 0, w, h);
-  return { dataUrl: canvas.toDataURL("image/jpeg", SNAPSHOT_QUALITY), width: w, height: h };
+  return canvas.toDataURL("image/jpeg", SNAPSHOT_QUALITY);
 }
 
 /** Brief shutter flash on the preview so the user sees a snapshot was taken. */
@@ -1688,88 +1796,6 @@ function flashPreview() {
   camPip.classList.remove("flash");
   void camPip.offsetWidth; // reflow so the animation restarts
   camPip.classList.add("flash");
-}
-
-/**
- * @typedef {Object} CameraCallLifecycle
- * @property {number} captureGeneration
- * @property {number} requestedAtMs
- * @property {string} cardId
- * @property {string} callId
- * @property {string} responseId
- * @property {string} itemId
- * @property {string} acceptedTurnId
- * @property {"requested"|"captured"|"unavailable"|"invalid_arguments"} captureStatus
- * @property {"pending"|"acknowledged"|"rejected"} outputStatus
- * @property {number} [completedAtMs]
- * @property {number} [width]
- * @property {number} [height]
- */
-
-/** @param {CameraCallLifecycle} lifecycle @param {Record<string, unknown>} [extra] */
-function cameraLifecycleDetail(lifecycle, extra = {}) {
-  return {
-    capture_generation: lifecycle.captureGeneration,
-    requested_at_ms: lifecycle.requestedAtMs,
-    completed_at_ms: lifecycle.completedAtMs,
-    card_id: lifecycle.cardId,
-    call_id: lifecycle.callId,
-    response_id: lifecycle.responseId,
-    item_id: lifecycle.itemId,
-    accepted_turn_id: lifecycle.acceptedTurnId,
-    capture_status: lifecycle.captureStatus,
-    output_status: lifecycle.outputStatus,
-    width: lifecycle.width,
-    height: lifecycle.height,
-    ...extra,
-  };
-}
-
-/**
- * @param {string} name
- * @param {string} callId
- * @param {{ responseId?: unknown, itemId?: unknown, acceptedTurnId?: unknown }} [correlation]
- * @returns {CameraCallLifecycle | undefined}
- */
-function beginToolLifecycle(name, callId, correlation = {}) {
-  if (name !== "camera_snapshot") return undefined;
-  const captureGeneration = ++cameraCaptureGeneration;
-  const lifecycle = {
-    captureGeneration,
-    requestedAtMs: Date.now(),
-    cardId: `camera-card-${captureGeneration}`,
-    callId: boundedCorrelationId(callId),
-    responseId: boundedCorrelationId(correlation.responseId),
-    itemId: boundedCorrelationId(correlation.itemId),
-    acceptedTurnId: boundedCorrelationId(correlation.acceptedTurnId),
-    captureStatus: /** @type {const} */ ("requested"),
-    outputStatus: /** @type {const} */ ("pending"),
-  };
-  addPipelineMetric({
-    stage: "camera",
-    status: "requested",
-    detail: cameraLifecycleDetail(lifecycle),
-  });
-  return lifecycle;
-}
-
-/**
- * @param {CameraCallLifecycle | undefined} lifecycle
- * @param {"captured"|"unavailable"|"invalid_arguments"} status
- * @param {{ width?: number, height?: number }} [dimensions]
- */
-function finishCameraCapture(lifecycle, status, dimensions = {}) {
-  if (!lifecycle) return;
-  lifecycle.captureStatus = status;
-  lifecycle.completedAtMs = Date.now();
-  lifecycle.width = dimensions.width;
-  lifecycle.height = dimensions.height;
-  addPipelineMetric({
-    stage: "camera",
-    status,
-    elapsed_ms: lifecycle.completedAtMs - lifecycle.requestedAtMs,
-    detail: cameraLifecycleDetail(lifecycle),
-  });
 }
 
 // ── Tool executor ─────────────────────────────────────────────────────────
@@ -1782,73 +1808,30 @@ function finishCameraCapture(lifecycle, status, dimensions = {}) {
  * for a follow-up response. We also hand the result back to the caller so it
  * can be shown in the conversation once the tool has actually run.
  * @param {S2sWsRealtimeClient} sessionClient
- * @param {string} name @param {string} callId
- * @param {CameraCallLifecycle | undefined} lifecycle
- * @param {{
- *   tool: string,
- *   displayArguments: string,
- *   validation: { ok: true, args: Record<string, unknown> } |
- *     { ok: false, code: string, path: string, errorClass: string }
- * }} prepared
- * @returns {Promise<{ output: string, image?: string, lifecycle?: CameraCallLifecycle, responseToolChoice?: "auto"|"none", responseTools?: object[] }>}
+ * @param {string} name @param {string} argsJson @param {string} callId
+ * @returns {Promise<{ output: string, image?: string }>}
  */
-async function runTool(sessionClient, name, callId, lifecycle, prepared) {
-  if (client !== sessionClient) return { output: "", lifecycle };
+async function runTool(sessionClient, name, argsJson, callId) {
+  if (client !== sessionClient) return { output: "" };
+  let args = /** @type {Record<string, unknown>} */ ({});
+  try { args = JSON.parse(argsJson || "{}"); } catch { /* keep {} */ }
 
-  const safeName = prepared.tool;
-  if (DEBUG) console.debug(`[tool] run name=${safeName} callId=${JSON.stringify(callId)}`);
+  if (DEBUG) console.debug(`[tool] run name=${name} callId=${JSON.stringify(callId)} args=${argsJson}`);
+  if (!callId) console.warn("[tool] empty call_id — the backend didn't tag the call, can't return a function_call_output");
 
-  /** @type {{ output: string, image?: string, lifecycle?: CameraCallLifecycle, responseToolChoice?: "auto"|"none", responseTools?: object[] }} */
-  let result = { output: "", lifecycle, responseToolChoice: /** @type {const} */ ("none") };
+  /** @type {{ output: string, image?: string }} */
+  let result = { output: "" };
   const toolStartedAt = performance.now();
-  addPipelineMetric({ stage: "tool", status: "active", detail: { name: safeName, callId } });
+  addPipelineMetric({ stage: "tool", status: "active", detail: { name } });
   try {
-    const validation = prepared.validation;
-    const validatedArgs = validation?.ok ? validation.args : {};
-    if (!validation.ok) {
-      result.output = prepared.displayArguments;
-      finishCameraCapture(lifecycle, "invalid_arguments");
-      addPipelineMetric({
-        stage: "tool",
-        status: "invalid_arguments",
-        detail: { name: safeName, callId, code: validation.code, path: validation.path, error_class: validation.errorClass },
-      });
-    } else if (name === "web_search") {
-      const decision = searchTurnPolicy.accept(validatedArgs);
-      result.responseToolChoice = decision.terminal ? "none" : "auto";
-      if (!decision.terminal) result.responseTools = [TOOL_DEFS.web_search];
-      if (!decision.accepted) {
-        result.output = searchPolicyOutput(decision.reason);
-        addPipelineMetric({
-          stage: "search",
-          status: "rejected",
-          detail: { reason: decision.reason, terminal: true },
-        });
-      } else {
-        addPipelineMetric({
-          stage: "search",
-          status: "requested",
-          detail: {
-            requested_mode: decision.args.mode,
-            freshness: decision.args.freshness,
-            refinement: decision.refinement,
-          },
-        });
-        const searchResult = await execWebSearch(decision.args);
-        result.output = searchResult.output;
-        addPipelineMetric({ stage: "search", status: "done", detail: searchResult.diagnostic });
-      }
+    if (name === "web_search") {
+      const query = typeof args.query === "string" ? args.query : "";
+      result.output = await execWebSearch(query);
     } else if (name === "camera_snapshot") {
-      const snapshot = captureSnapshot();
-      if (snapshot) {
-        if (DEBUG) console.debug(`[tool] camera_snapshot captured generation=${lifecycle?.captureGeneration ?? 0}`);
-        result = {
-          output: "Snapshot captured from the webcam and attached as an image.",
-          image: snapshot.dataUrl,
-          lifecycle,
-          responseToolChoice: "none",
-        };
-        finishCameraCapture(lifecycle, "captured", snapshot);
+      const dataUrl = captureSnapshot();
+      if (dataUrl) {
+        if (DEBUG) console.debug(`[tool] camera_snapshot captured frame (${dataUrl.length} chars), sending image + output`);
+        result = { output: "Snapshot captured from the webcam and attached as an image.", image: dataUrl };
         // Return the tool output; the frame itself rides along with the
         // response.create below (sent right before it), so the model sees the
         // snapshot in the very response it's about to speak.
@@ -1856,56 +1839,31 @@ async function runTool(sessionClient, name, callId, lifecycle, prepared) {
       } else {
         console.warn("[tool] camera_snapshot: no frame — camera off or not ready");
         result.output = "The camera is not available right now.";
-        finishCameraCapture(lifecycle, "unavailable");
       }
     } else {
-      // `prepareToolArgumentsForBrowser` makes unknown tools invalid, so this
-      // branch is defensive and deliberately omits the untrusted raw name.
-      result.output = "Unknown tool.";
+      result.output = `Unknown tool: ${name}`;
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     result.output = `Tool failed: ${msg}`;
-    if (name === "web_search") {
-      result.responseToolChoice = "none";
-      addPipelineMetric({
-        stage: "search",
-        status: "failed",
-        detail: { error_class: err instanceof TypeError ? "network_error" : "search_error", terminal: true },
-      });
-    }
-    if (lifecycle?.captureStatus === "requested") finishCameraCapture(lifecycle, "unavailable");
   }
   if (client !== sessionClient) return result;
   try {
-    addPipelineMetric({ stage: "tool", status: "sending_output", detail: { name: safeName, callId } });
+    addPipelineMetric({ stage: "tool", status: "sending_output", detail: { name, callId } });
     const outputAck = sessionClient.sendToolOutput(callId, result.output);
     // Hosted ordering: output, optional image, then response.create. The
     // backend owns the response-ID barrier and starts exactly one follow-up.
-    const responseOptions = {
-      ...(result.image ? { image: result.image } : {}),
-      ...(result.responseToolChoice ? { toolChoice: result.responseToolChoice } : {}),
-      ...(result.responseTools ? { tools: result.responseTools } : {}),
-    };
-    sessionClient.requestToolResponse(Object.keys(responseOptions).length ? responseOptions : undefined);
+    sessionClient.requestToolResponse(result.image ? { image: result.image } : undefined);
     await outputAck;
-    if (lifecycle) {
-      lifecycle.outputStatus = "acknowledged";
-      addPipelineMetric({ stage: "camera", status: "output_acknowledged", detail: cameraLifecycleDetail(lifecycle) });
-    }
-    addPipelineMetric({ stage: "tool", status: "output_acknowledged", detail: { name: safeName, callId } });
+    addPipelineMetric({ stage: "tool", status: "output_acknowledged", detail: { name, callId } });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     result.output = `Tool output was not accepted: ${msg}`;
-    if (lifecycle) {
-      lifecycle.outputStatus = "rejected";
-      addPipelineMetric({ stage: "camera", status: "output_rejected", detail: cameraLifecycleDetail(lifecycle) });
-    }
-    addPipelineMetric({ stage: "tool", status: "failed", elapsed_ms: performance.now() - toolStartedAt, detail: { name: safeName } });
+    addPipelineMetric({ stage: "tool", status: "failed", elapsed_ms: performance.now() - toolStartedAt, detail: { name } });
     return result;
   }
-  if (DEBUG) console.debug(`[tool] requesting model response after ${safeName}`);
-  addPipelineMetric({ stage: "tool", status: "done", elapsed_ms: performance.now() - toolStartedAt, detail: { name: safeName } });
+  if (DEBUG) console.debug(`[tool] requesting model response after ${name}`);
+  addPipelineMetric({ stage: "tool", status: "done", elapsed_ms: performance.now() - toolStartedAt, detail: { name } });
   return result;
 }
 
@@ -1924,13 +1882,11 @@ function renderTtsBackendOptions() {
   inputTtsBackend.value = settings.ttsBackend;
 }
 
-/**
- * @param {{ query: string, mode: "auto"|"web"|"news", freshness: "none"|"day"|"week"|"month"|"year" }} searchArgs
- * @returns {Promise<{ output: string, diagnostic: Record<string, unknown> }>}
- */
-async function execWebSearch(searchArgs) {
+/** @param {string} query @returns {Promise<string>} */
+async function execWebSearch(query) {
+  if (!query) return "No query provided.";
   /** @type {Record<string, string>} */
-  const body = { ...searchArgs };
+  const body = { query };
   // Only send a user key when there's no server key (server prefers its own).
   if (!serverSearchKey && userSearchKey) body.key = userSearchKey;
 
@@ -1938,27 +1894,23 @@ async function execWebSearch(searchArgs) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-    cache: "no-store",
   });
   if (!res.ok) {
-    throw new Error(`search unavailable (${res.status})`);
+    let detail = String(res.status);
+    try { const j = await res.json(); if (j.detail) detail = j.detail; } catch {}
+    throw new Error(`search error (${detail})`);
   }
   const json = await res.json();
-  if (json?.type !== "web_search_result" || json?.schema_version !== 1 || !Array.isArray(json?.results)) {
-    throw new Error("search result contract mismatch");
+  // Date-stamp the header so the model treats these as fresh realtime facts
+  // rather than its (older) training knowledge.
+  const today = new Date().toISOString().slice(0, 10);
+  /** @type {string[]} */
+  const lines = [`Google search result from ${today}:`];
+  if (json.answer) lines.push(`Answer: ${json.answer}`);
+  for (const r of json.results || []) {
+    lines.push(`- ${r.title}: ${r.snippet} (${r.url})`);
   }
-  return {
-    output: JSON.stringify(json),
-    diagnostic: {
-      schema_version: 1,
-      requested_mode: json.requested_mode,
-      effective_mode: json.effective_mode,
-      freshness: json.freshness,
-      recency_filter_applied: json.recency_filter_applied === true,
-      fallback_applied: json.fallback_applied === true,
-      result_count: json.results.length,
-    },
-  };
+  return lines.length > 1 ? lines.join("\n") : `${lines[0]}\nNo results found.`;
 }
 
 /** Learn server config (search key + connection target), then refresh the UI. */
@@ -2023,14 +1975,19 @@ function renderDiagnostics() {
   const ttsStart = [...visibleMetrics].reverse().find((m) => m.stage === "tts" && m.status === "request_start");
   const ttsFirst = [...visibleMetrics].reverse().find((m) => m.stage === "tts" && m.status === "first_audio");
   const ttsDone = [...visibleMetrics].reverse().find((m) => m.stage === "tts" && m.status === "done");
+  const ttsFailure = [...visibleMetrics].reverse().find((m) => m.stage === "tts" && ["failed", "runaway_aborted"].includes(m.status));
   const llmFirstPhrase = [...visibleMetrics].reverse().find((m) => m.stage === "gemma" && m.status === "first_stable_phrase");
   const firstPlayback = [...visibleMetrics].reverse().find((m) => m.stage === "playback" && m.status === "first_audio");
   const playbackQueue = [...visibleMetrics].reverse().find((m) => (
     m.stage === "playback" && Number.isFinite(Number(m.detail?.prime_target_ms))
   ));
+  const responseLifecycle = [...visibleMetrics].reverse().find((m) => (
+    m.stage === "response" && m.status === "lifecycle"
+  ));
   const responseDone = [...visibleMetrics].reverse().find((m) => m.stage === "response" && m.status === "done");
-  if (diagnosticsAudioMetrics && (ttsStart || ttsFirst || ttsDone || llmFirstPhrase || firstPlayback || playbackQueue || responseDone)) {
-    const start = ttsStart?.detail || {}; const first = ttsFirst?.detail || {}; const done = ttsDone?.detail || {};
+  if (diagnosticsAudioMetrics && (ttsStart || ttsFirst || ttsDone || llmFirstPhrase || firstPlayback || playbackQueue || responseLifecycle || responseDone)) {
+    const start = ttsStart?.detail || {}; const first = ttsFirst?.detail || {};
+    const done = ttsFailure && (!ttsDone || ttsFailure.receivedAt > ttsDone.receivedAt) ? ttsFailure.detail || {} : ttsDone?.detail || {};
     const selectedTtsStatus = ttsBackendStatuses[settings.ttsBackend];
     const gpu = done.gpu || selectedTtsStatus?.health?.backend?.runtime?.gpu_now;
     const gpuText = gpu && typeof gpu === "object"
@@ -2049,7 +2006,19 @@ function renderDiagnostics() {
     const effectiveLanguage = done.effective_language ?? first.effective_language ?? start.effective_language ?? "unknown";
     const autoLanguageSupport = done.language_auto_supported ?? first.language_auto_supported ?? start.language_auto_supported;
     const autoLanguageText = autoLanguageSupport == null ? "unknown" : autoLanguageSupport ? "verified" : "not verified";
-    diagnosticsAudioMetrics.textContent = `Profile ${done.profile_id ?? start.tts_profile_id ?? "unknown"} · ${done.model ?? start.model ?? "unknown model"}\nMode: ${done.delivery_mode ?? done.mode ?? start.streaming_mode ?? "unknown"}\nLanguage: requested ${requestedLanguage} · effective ${effectiveLanguage} · Auto ${autoLanguageText}\nLLM first stable phrase: ${firstPhraseMs} ms\nTTS first PCM: ${first.first_pcm_ms ?? ttsFirst?.elapsed_ms ?? "unknown"} ms · First playback: ${firstPlaybackMs} ms\nPlayback: prime ${playback.prime_target_ms ?? 0} ms · queued ${Math.round(Number(playback.queued_ms || 0))} ms · underruns ${playback.underruns ?? 0} · re-primes ${playback.reprimes ?? 0} · stale ${playback.stale_chunks ?? 0}\nSynthesis RTF: ${done.rtf ?? "unknown"} · End-to-end: ${endToEndMs} ms\nGeneration: ${done.generation_ms ?? "unknown"} ms · Audio: ${done.audio_duration_ms ?? "unknown"} ms · GPU: ${gpuText}\nReference: source ${referenceSeconds(done.reference_source_seconds)} · requested ${referenceSeconds(done.reference_requested_limit_seconds)} · used ${referenceSeconds(done.reference_used_seconds)} · ${referenceLimit} · ${referencePairing}`;
+    const lifecycleDetail = responseLifecycle?.detail || {};
+    const lifecycle = lifecycleDetail.lifecycle_state ?? done.lifecycle_state ?? start.lifecycle_state ?? "unknown";
+    const responseEpoch = lifecycleDetail.response_epoch ?? done.response_epoch ?? start.response_epoch ?? "unknown";
+    const inputEpoch = lifecycleDetail.input_epoch ?? done.input_epoch ?? start.input_epoch ?? "unknown";
+    const supersessionReason = lifecycleDetail.supersession_reason ?? done.supersession_reason ?? "none";
+    const frozenProfile = done.frozen_profile_id ?? done.profile_id ?? start.tts_profile_id ?? "unknown";
+    diagnosticsAudioMetrics.textContent = `Lifecycle: ${lifecycle} · input epoch ${inputEpoch} · response epoch ${responseEpoch} · supersession ${supersessionReason}\nProfile: selected ${realtimeTuningState(settings.ttsBackend).profile_id || "unknown"} · frozen ${frozenProfile} rev ${done.profile_revision ?? "unknown"} · clone ${done.clone_fingerprint ?? "unknown"} · seed ${done.seed_policy ?? done.seed ?? "unknown"} · phrase ${done.phrase_index ?? "unknown"}\nModel: ${done.model ?? start.model ?? "unknown model"} · Mode: ${done.delivery_mode ?? done.mode ?? start.streaming_mode ?? "unknown"}\nLanguage: requested ${requestedLanguage} · effective ${effectiveLanguage} · Auto ${autoLanguageText}\nLLM first stable phrase: ${firstPhraseMs} ms\nTTS first PCM: ${first.first_pcm_ms ?? ttsFirst?.elapsed_ms ?? "unknown"} ms · First playback: ${firstPlaybackMs} ms\nPlayback: ${playback.continuity_mode ?? settings.playbackContinuity} · prime ${playback.prime_target_ms ?? 0} ms · queued ${Math.round(Number(playback.queued_ms || 0))} ms · underruns ${playback.underruns ?? 0} · re-primes ${playback.reprimes ?? 0} · stale ${playback.stale_chunks ?? 0}${playback.provider_unsustainable ? " · Provider cannot sustain realtime" : ""}\nSynthesis RTF: ${done.rtf ?? "unknown"} · End-to-end: ${endToEndMs} ms\nGeneration: ${done.generation_ms ?? "unknown"} ms · Audio: ${done.audio_duration_ms ?? "unknown"} ms · GPU: ${gpuText}\nReference: source ${referenceSeconds(done.reference_source_seconds)} · requested ${referenceSeconds(done.reference_requested_limit_seconds)} · used ${referenceSeconds(done.reference_used_seconds)} · ${referenceLimit} · ${referencePairing}`;
+  }
+  if (diagnosticsAudioMetrics && (ttsFirst || ttsDone || ttsFailure)) {
+    const end = ttsFailure && (!ttsDone || ttsFailure.receivedAt > ttsDone.receivedAt) ? ttsFailure : ttsDone;
+    const detail = end?.detail || {};
+    const first = ttsFirst?.detail || {};
+    diagnosticsAudioMetrics.textContent += `\nEngine stages: prompt ${detail.engine_prompt_ms ?? "unknown"} ms · prefill ${detail.engine_prefill_ms ?? "unknown"} ms · talker ${detail.engine_talker_ms ?? "unknown"} ms · decode ${detail.engine_decode_ms ?? "unknown"} ms\nCandidate-observed first PCM (includes admission): ${first.engine_first_pcm_ms ?? detail.engine_first_pcm_ms ?? "unknown"} ms · native proof hold: ${first.native_proof_hold_ms ?? detail.native_proof_hold_ms ?? "unknown"} ms\nCodec frames: ${detail.generated_codec_frames ?? "unknown"} / cap ${detail.generation_cap_frames ?? "unknown"} · engine EOS: ${detail.engine_eos == null ? "unknown" : detail.engine_eos ? "yes" : "no"} · outcome: ${end?.status ?? "pending"}`;
   }
   const echo = [...visibleMetrics].reverse().find((m) => m.stage === "echo_guard");
   if (echo && diagnosticsAudioStatus) {
@@ -2069,6 +2038,7 @@ function renderDiagnostics() {
     : null);
   const contextMax = context?.detail?.max_tokens ?? localPipeline?.gemma?.contextWindow;
   const contextUsed = context?.detail?.history_tokens ?? 0;
+  renderHistoryCompactionDiagnostics(context?.detail || null);
   const contextText = contextMax ? `Context ${contextUsed.toLocaleString()} / ${contextMax.toLocaleString()}` : "";
   const modelText = localPipeline?.gemma
     ? `${localPipeline.gemma.provider === "remote" ? "Remote" : "Local"} model ${localPipeline.gemma.model || "unknown"} @ ${localPipeline.gemma.baseUrl || "unknown"}`
@@ -2122,14 +2092,7 @@ function renderDiagnostics() {
 }
 
 async function refreshLocalPipeline() {
-  try {
-    const res = await fetch("api/local-pipeline");
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    localPipeline = await res.json();
-    renderLocalPipeline();
-  } catch (err) {
-    console.warn("[ui] failed to load local pipeline status:", err);
-  }
+  return refreshLocalIdentity({ retry: true, resetRetry: true });
 }
 
 async function refreshTtsBackends() {
@@ -2146,6 +2109,77 @@ async function refreshTtsBackends() {
   updateRealtimeAudioSummary();
 }
 
+/**
+ * Reconcile selected-provider identity with no cached state. A newer refresh
+ * wins over a late focus/startup result so a just-selected backend never shows
+ * the previous provider's model. This probes only; it never manages services.
+ */
+async function refreshLocalIdentity({ retry = false, resetRetry = false } = {}) {
+  if (resetRetry) {
+    if (localIdentityRetryTimer) window.clearTimeout(localIdentityRetryTimer);
+    localIdentityRetryTimer = 0;
+    localIdentityRetryAttempts = 0;
+  }
+  const request = ++localIdentityRequest;
+  const selectedBackend = settings.ttsBackend;
+  const pipelinePromise = fetch("api/local-pipeline", { cache: "no-store" }).then(async (res) => {
+    if (!res.ok) throw new Error(`local pipeline HTTP ${res.status}`);
+    return res.json();
+  });
+  const backendPromise = fetch("api/tts/backends", { cache: "no-store" }).then(async (res) => {
+    if (!res.ok) throw new Error(`TTS backends HTTP ${res.status}`);
+    return res.json();
+  });
+
+  // Identity is useful before the (potentially slower) clone/backend inventory
+  // has completed.  Render the selected provider as soon as local-pipeline
+  // settles; otherwise a delayed inventory call leaves the static Checking…
+  // labels visible despite a healthy local service.
+  const pipelineResult = await pipelinePromise.then(
+    (value) => ({ status: "fulfilled", value }),
+    (reason) => ({ status: "rejected", reason }),
+  );
+  if (request !== localIdentityRequest || selectedBackend !== settings.ttsBackend) return false;
+  const pipelineOk = pipelineResult.status === "fulfilled";
+  localPipeline = pipelineOk ? pipelineResult.value : {
+    mode: "unavailable", gemma: { reachable: false },
+    tts: { backend: selectedBackend, reachable: false, displayName: selectedBackend },
+    vad: {}, tools: {}, unavailableReason: pipelineResult.reason?.message || "Local status unavailable",
+  };
+  // This fallback intentionally uses local-pipeline's selected-provider data
+  // until the richer backend inventory arrives.
+  renderLocalPipeline();
+
+  const backendResult = await backendPromise.then(
+    (value) => ({ status: "fulfilled", value }),
+    (reason) => ({ status: "rejected", reason }),
+  );
+  if (request !== localIdentityRequest || selectedBackend !== settings.ttsBackend) return false;
+  const backendsOk = backendResult.status === "fulfilled";
+  ttsBackendStatuses = backendsOk
+    ? Object.fromEntries((backendResult.value.backends || []).map((item) => [item.id, item]))
+    : {};
+  renderTtsBackendOptions();
+  renderLocalPipeline();
+  updateRealtimeAudioSummary();
+  if (!pipelineOk || !backendsOk) {
+    setDiagnosticWarning("local-identity", `Selected provider status unavailable: ${pipelineResult.reason?.message || backendResult.reason?.message || "probe failed"}`);
+    if (retry && !localIdentityRetryTimer && localIdentityRetryAttempts < MAX_LOCAL_IDENTITY_RETRIES) {
+      localIdentityRetryAttempts += 1;
+      localIdentityRetryTimer = window.setTimeout(() => {
+        localIdentityRetryTimer = 0;
+        void refreshLocalIdentity({ retry: true });
+      }, 1500);
+    }
+  } else {
+    localIdentityRetryAttempts = 0;
+    if (localIdentityRetryTimer) window.clearTimeout(localIdentityRetryTimer);
+    localIdentityRetryTimer = 0;
+    setDiagnosticWarning("local-identity");
+  }
+  return pipelineOk && backendsOk;
+}
+
 async function assertTtsBackendReady() {
   await refreshTtsBackends();
   // Candidate startup requires a live supervisor profile resolve.  Do not let
@@ -2154,7 +2188,12 @@ async function assertTtsBackendReady() {
   await fetchVoiceProfiles();
   const status = ttsBackendStatuses[settings.ttsBackend];
   const selectedExists = voiceProfiles.some((profile) => profile.voice === settings.voice);
-  if (status?.ready && selectedExists && (!status.explicitValidation || status.validation?.voice === settings.voice)) return;
+  if (status?.ready && selectedExists && (!status.explicitValidation || status.validation?.voice === settings.voice)) {
+    // Freeze this browser-side resolve for the initial pipeline update.  Later
+    // diagnostics changes deliberately send a new update for the *next*
+    // response; they cannot mutate this initial session snapshot in transit.
+    return requiredCandidateTtsTuning(settings.ttsBackend);
+  }
   if (!selectedExists) throw new Error("The selected clone is not present in the selected TTS backend. Refresh or choose an available clone.");
   if (settings.ttsBackend === "groxaxo") {
     throw new Error("Groxaxo is unavailable or has no 0.6B-Base/1.7B-Base model loaded in Voice Studio.");
@@ -2213,7 +2252,6 @@ async function fetchConfig() {
         setDiagnosticWarning("frontend-version");
       }
       serverSearchKey = !!json.search;
-      frontendRuntime = json.runtime && typeof json.runtime === "object" ? json.runtime : null;
       lbMode = !!json.lb;
       // Lock to LB mode only when the deploy reports a load balancer.
       allowDirect = json.allowDirect ?? !lbMode;
@@ -2229,6 +2267,7 @@ async function fetchConfig() {
   void account.refresh();
   await fetchVoiceProfiles();
   await refreshTtsBackends();
+  await refreshLocalIdentity();
   await refreshFasterModelInventory();
   ttsStreamingStatus.textContent = settings.fullBufferTts
     ? "Non-streaming assistant dispatch is selected. The backend's actual PCM capability remains separately reported."
@@ -2252,14 +2291,16 @@ async function fetchVoiceProfiles() {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const json = await res.json();
     if (request !== voiceInventoryRequest || backend !== settings.ttsBackend) return;
-    if (json?.reachable === false) throw new Error("Voice backend unavailable");
     applyVoiceProfilePayload(json, backend);
     return;
   } catch (err) {
     if (request !== voiceInventoryRequest || backend !== settings.ttsBackend) return;
     console.warn(`[ui] failed to load ${backend} clone voices:`, err);
-    clearVoiceProfileOptions(backend, `${backend} voice inventory unavailable; saved selection retained`);
+    defaultVoice = DEFAULT_VOICE;
+    voiceProfiles = [];
+    profileLibraryWritable = false;
   }
+  renderVoiceOptions();
 }
 
 async function refreshFasterModelInventory() {
@@ -2327,6 +2368,7 @@ inputTtsBackend.addEventListener("change", async () => {
   const saved = await saveSettings(settings);
   if (!saved.ok) profileLibraryStatus.textContent = `Could not save selected backend: ${saved.error}`;
   await refreshTtsBackends();
+  await refreshLocalIdentity({ retry: true, resetRetry: true });
   await refreshFasterModelInventory();
   renderSelectedTtsBackendStatus();
   updateRealtimeAudioSummary();
@@ -2362,8 +2404,9 @@ profileDeleteBtn.addEventListener("click", async () => {
   if (!profile || !window.confirm(`Delete clone profile ${profile.name}?`)) return;
   try {
     const payload = await qwen3Json(`api/tts/backends/${encodeURIComponent(settings.ttsBackend)}/profiles/${encodeURIComponent(profile.id)}`, { method: "DELETE" });
-    applyVoiceProfilePayload(payload);
+    if (settings.voice === profile.voice) settings.voice = defaultVoice;
     saveSettings(settings);
+    applyVoiceProfilePayload(payload);
     profileLibraryStatus.textContent = "Clone profile deleted.";
   } catch (err) { profileLibraryStatus.textContent = err instanceof Error ? err.message : String(err); }
 });
@@ -2457,9 +2500,13 @@ function readSettingsFromForm() {
     voiceByBackend: { ...(settings.voiceByBackend || {}), [backend]: voice },
     instructions: inputInstructions.value.trim() || DEFAULT_INSTRUCTIONS,
     noiseGate: readGateThreshold(),
-    echoGuard: ["native", "adaptive", "strict"].includes(inputEchoGuard.value) ? inputEchoGuard.value : "adaptive",
+    echoGuard: ["native", "adaptive", "strict"].includes(inputEchoGuard.value) ? inputEchoGuard.value : "native",
     echoCalibrations: settings.echoCalibrations || {},
     fullBufferTts: inputFullBufferTts.checked,
+    playbackContinuity: settings.playbackContinuity === "fast-start" ? "fast-start" : "adaptive",
+    ttsDeliveryMode: settings.ttsDeliveryMode === "native_incremental_pcm"
+      ? "native_incremental_pcm"
+      : "buffered_phrase",
     liveTranscript: inputLiveTranscript.checked,
     maxResponseTokens: Math.min(1024, Math.max(64, Number(inputMaxResponseTokens.value) || 384)),
     ttsBackend: backend,
@@ -2701,8 +2748,7 @@ async function primeMicPermission() {
 /** Acquire the live capture stream once a slot is granted. Permission was primed
  *  in the tap gesture, so this is silent. Stored module-side for mute + teardown. */
 async function acquireMicStream() {
-  micStream = await navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS);
-  return micStream;
+  return navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS);
 }
 
 /** @param {number} position Update the queued caption ("You're #N in line"). */
@@ -2742,6 +2788,41 @@ function stopJoinCountdown() {
   }
 }
 
+function staleStartError() {
+  const error = /** @type {Error & { code?: string }} */ (new Error("A newer conversation start replaced this attempt"));
+  error.code = "aborted";
+  return error;
+}
+
+/**
+ * Abort an obsolete start without disturbing a replacement client. If the old
+ * attempt already owns a client, its own close path releases mic/context/socket.
+ * @param {number} attempt @param {AudioContext | null} audioContext
+ * @param {S2sWsRealtimeClient | null} [candidate]
+ */
+async function ensureCurrentStartAttempt(attempt, audioContext, candidate = null) {
+  if (startAttempts.isCurrent(attempt)) return;
+  if (candidate) {
+    try { await candidate.close(); } catch { /* best-effort stale cleanup */ }
+  } else if (audioContext) {
+    try { await audioContext.close(); } catch { /* best-effort stale cleanup */ }
+  }
+  throw staleStartError();
+}
+
+/** Await a start preflight and suppress any stale success or failure. */
+async function awaitStartPreflight(attempt, preflight, audioContext) {
+  let value;
+  try {
+    value = await preflight;
+  } catch (error) {
+    await ensureCurrentStartAttempt(attempt, audioContext);
+    throw error;
+  }
+  await ensureCurrentStartAttempt(attempt, audioContext);
+  return value;
+}
+
 /**
  * Start a conversation. Pass a pre-created AudioContext when the caller already
  * made one inside the tap/click gesture (required on iOS); otherwise one is
@@ -2749,11 +2830,30 @@ function stopJoinCountdown() {
  * @param {AudioContext | null} [audioContext]
  */
 async function doStart(audioContext = null) {
+  // Claim synchronously, before any readiness/network await. This makes a fast
+  // second tap invalidate the older preflight instead of allowing two mics or
+  // WebSockets to race into the same page state.
+  const startAttempt = startAttempts.claim();
+  setState("connecting");
+  setCaption("Asking for mic…", "muted");
   // Resolve the target before touching mic/audio so a misconfiguration (e.g.
   // direct mode with no URL) fails fast with a clear message.
   const target = connectionTarget();
-  await assertTtsBackendReady();
-  await assertModelEndpointReady();
+
+  // Create + resume the AudioContext SYNCHRONOUSLY, still inside the gesture.
+  // iOS Safari only starts an AudioContext from a user gesture; if we waited
+  // until after the preflight awaits below, it would stay suspended and the
+  // whole pipeline would be silent.
+  if (!audioContext) audioContext = createResumedAudioContext();
+
+  let initialTtsTuning = null;
+  try {
+    initialTtsTuning = await awaitStartPreflight(startAttempt, assertTtsBackendReady(), audioContext);
+    await awaitStartPreflight(startAttempt, assertModelEndpointReady(), audioContext);
+  } catch (err) {
+    if (audioContext) void audioContext.close().catch(() => {});
+    throw err;
+  }
 
   chat.clear();
   chat.reset();
@@ -2763,21 +2863,12 @@ async function doStart(audioContext = null) {
   clearTimeout(backendRuntimeTimer);
   setDiagnosticWarning("backend-version");
   setDiagnosticWarning("backend-metrics");
-  setState("connecting");
-  setCaption("Asking for mic…", "muted");
-
-  // Create + resume the AudioContext SYNCHRONOUSLY, still inside the gesture.
-  // iOS Safari only starts an AudioContext from a user gesture; if we waited
-  // until after the getUserMedia / session-creation awaits below, it would stay
-  // suspended and the whole pipeline would be silent.
-  if (!audioContext) audioContext = createResumedAudioContext();
-
   // Prime the mic permission now (get the prompt out of the way up front), then
   // release it. The real capture stream is acquired only once a slot is granted
   // (see acquireMicStream), so the mic 'in use' indicator never lights while we
   // sit in the queue. Permission persists, so the later acquire is silent.
   try {
-    await primeMicPermission();
+    await awaitStartPreflight(startAttempt, primeMicPermission(), audioContext);
   } catch (err) {
     if (audioContext) void audioContext.close().catch(() => {});
     throw err;
@@ -2790,7 +2881,18 @@ async function doStart(audioContext = null) {
     ...target,
     voice: settings.voice,
     instructions: effectiveInstructions(),
-    acquireMic: acquireMicStream,
+    acquireMic: async () => {
+      const stream = await acquireMicStream();
+      if (!startAttempts.isCurrent(startAttempt)) {
+        for (const track of stream.getTracks()) track.stop();
+        throw staleStartError();
+      }
+      // Do not publish an obsolete stream globally: a replacement start may
+      // already own the live capture while this delayed permission request
+      // resolves. The stale path above stops only its own stream.
+      micStream = stream;
+      return stream;
+    },
     tools: activeToolDefs(),
     noiseGate: gateParams(settings.noiseGate),
     echoGuard: settings.echoGuard,
@@ -2799,9 +2901,10 @@ async function doStart(audioContext = null) {
       full_buffer_tts: settings.fullBufferTts,
       live_transcription: settings.liveTranscript,
       max_response_tokens: settings.maxResponseTokens,
+      history_compaction: normalizeHistoryCompaction(settings.historyCompaction),
       tts_backend: settings.ttsBackend,
-      ...(activeTtsTuning(settings.ttsBackend)
-        ? { tts_tuning: activeTtsTuning(settings.ttsBackend) }
+      ...(normalizeTtsProvider(settings.ttsBackend) === AUDIO_CPP_PROVIDER
+        ? { tts_tuning: initialTtsTuning }
         : {}),
       model_endpoint: modelEndpointConfig(settings),
     },
@@ -2809,7 +2912,6 @@ async function doStart(audioContext = null) {
     ...(audioContext ? { audioContext } : {}),
   });
   client = c;
-  resetSearchTurnPolicy();
 
   c.addEventListener("queue", (e) => {
     if (client !== c) return;
@@ -2845,35 +2947,20 @@ async function doStart(audioContext = null) {
 
   c.addEventListener("response-finished", (e) => {
     if (client !== c) return;
-    const detail = /** @type {CustomEvent<{ responseId: string; status: string; audible?: boolean; transcript?: string }>} */ (e).detail;
+    const detail = /** @type {CustomEvent<{ responseId: string; status: string; audible?: boolean; transcript?: string; responseEpoch?: number | null; committed?: boolean }>} */ (e).detail;
     chat.onResponseFinished(detail);
   });
 
   c.addEventListener("toolcall", (e) => {
     if (client !== c) return;
-    const { name, arguments: args, callId, responseId, itemId } = /** @type {CustomEvent<{ name: string; arguments: unknown; callId: string; responseId?: string; itemId?: string }>} */ (e).detail;
-    const prepared = prepareToolArgumentsForBrowser(name, args, TOOL_DEFS[name]?.parameters);
-    const lifecycle = beginToolLifecycle(prepared.tool, callId, {
-      responseId,
-      itemId,
-      acceptedTurnId: searchTurnItemId,
-    });
-    // Durable UI surfaces receive only schema-validated arguments or fixed,
-    // content-free failure metadata. Raw protocol arguments stay transient.
-    chat.onToolCall(prepared.tool, prepared.displayArguments, callId, lifecycle);
+    const { name, arguments: args, callId } = /** @type {CustomEvent<{ name: string; arguments: string; callId: string }>} */ (e).detail;
+    chat.onToolCall(name, args, callId);
     // Execute the tool, then push it to the conversation once the result is in,
     // so the toggle shows both the call input and its output together.
-    void runTool(c, name, callId, lifecycle, prepared).then(({ output, image, lifecycle: completedLifecycle }) => {
+    void runTool(c, name, args, callId).then(({ output, image }) => {
       if (client !== c) return;
-      chat.onToolResult(prepared.tool, prepared.displayArguments, output, image, callId, completedLifecycle);
+      chat.onToolResult(name, args, output, image, callId);
     });
-  });
-  c.addEventListener("tool-protocol-error", (e) => {
-    if (client !== c) return;
-    const rawCode = /** @type {CustomEvent<{ code?: string }>} */ (e).detail?.code;
-    const code = rawCode === "missing_call_id" ? "missing_call_id" : "missing_tool_name";
-    chat.onToolProtocolFailure(code);
-    addPipelineMetric({ stage: "tool", status: "protocol_error", detail: { code } });
   });
   c.addEventListener("error", (e) => {
     if (client !== c) return;
@@ -2932,8 +3019,6 @@ async function doStart(audioContext = null) {
     clearTimeout(backendRuntimeTimer);
     if (backendRuntime.api_version !== EXPECTED_BACKEND_API_VERSION) {
       setDiagnosticWarning("backend-version", `Backend restart required (API ${backendRuntime.api_version ?? "missing"}, expected ${EXPECTED_BACKEND_API_VERSION}).`);
-    } else if (!runtimeIdentityMatches(frontendRuntime, backendRuntime)) {
-      setDiagnosticWarning("backend-version", "Frontend/backend source identity mismatch. Restart managed HF Realtime.");
     } else {
       setDiagnosticWarning("backend-version");
     }
@@ -2942,6 +3027,12 @@ async function doStart(audioContext = null) {
   c.addEventListener("local-pipeline-updated", (e) => {
     if (client !== c) return;
     const config = /** @type {CustomEvent<any>} */ (e).detail;
+    if (config?.history_compaction) {
+      acknowledgedHistoryCompaction = normalizeHistoryCompaction(config.history_compaction);
+      settings.historyCompaction = acknowledgedHistoryCompaction;
+      syncHistoryCompactionControls();
+      renderHistoryCompactionDiagnostics();
+    }
     if (config?.model_endpoint) {
       const endpoint = config.model_endpoint;
       localPipeline = localPipeline || {};
@@ -2957,10 +3048,8 @@ async function doStart(audioContext = null) {
   });
   c.addEventListener("turn-state", (e) => {
     if (client !== c) return;
-    const turnState = /** @type {CustomEvent<any>} */ (e).detail;
-    const status = turnState.status;
+    const status = /** @type {CustomEvent<any>} */ (e).detail.status;
     if (status !== "speech_stopped") return;
-    beginAcceptedSearchTurn(turnState.itemId);
     chat.onUserTurnPending();
     clearTimeout(backendMetricTimer);
     backendMetricTimer = window.setTimeout(() => {
@@ -2970,7 +3059,11 @@ async function doStart(audioContext = null) {
 
   try {
     await c.connect();
+    await ensureCurrentStartAttempt(startAttempt, audioContext, c);
   } catch (err) {
+    if (!startAttempts.isCurrent(startAttempt)) {
+      await ensureCurrentStartAttempt(startAttempt, audioContext, c);
+    }
     // The grant can be refused (402 → limit) or the dial can fail. In LB mode
     // the AudioContext hasn't been adopted by the client yet (the session POST
     // runs first), so close the one we created here to avoid leaking it.
@@ -3058,7 +3151,6 @@ function endQueueTicket() {
 
 /** @param {string} status */
 function onClientStatus(status) {
-  if (status === "closed" || status === "error") resetSearchTurnPolicy();
   switch (status) {
     case "creating-session":
     case "connecting":
@@ -3092,7 +3184,9 @@ function onClientStatus(status) {
 }
 
 async function teardown() {
-  resetSearchTurnPolicy();
+  // Invalidate a queued/connecting start before asynchronous resource cleanup;
+  // its next preflight checkpoint closes itself rather than reviving this UI.
+  startAttempts.invalidate();
   stopHeartbeat();
   stopJoinCountdown();
   endTrackedSession();
@@ -3140,11 +3234,30 @@ async function initializeApp() {
   // request. Starting both operations concurrently allowed a Faster request
   // to win while the UI later displayed audio.cpp, leaving a foreign or empty
   // clone list attached to the selected provider.
-  await restorePersistentSettings();
-  await fetchConfig();
-  await refreshCandidateTuningProfiles().catch((error) => console.warn("candidate tuning refresh failed", error));
-  await fetchVoiceProfiles();
-  if (settings.modelProvider === "local") void refreshLocalPipeline();
+  try {
+    await restorePersistentSettings();
+    syncHistoryCompactionControls();
+    renderHistoryCompactionDiagnostics();
+    await fetchConfig();
+    await refreshLocalIdentity({ retry: true, resetRetry: true });
+    await refreshCandidateTuningProfiles().catch((error) => console.warn("candidate tuning refresh failed", error));
+    await fetchVoiceProfiles();
+    // The initial render awaits the uncached selected-provider identity above.
+  } catch (error) {
+    console.warn("initial local identity refresh failed", error);
+    if (!localPipeline) {
+      localPipeline = {
+        mode: "unavailable", gemma: { reachable: false },
+        tts: { backend: settings.ttsBackend, reachable: false, displayName: settings.ttsBackend },
+        vad: {}, tools: {}, unavailableReason: "Initial local status unavailable",
+      };
+      renderLocalPipeline();
+    }
+  } finally {
+    // Do not finish the initial shell until the selected-provider identity
+    // probe settled into either a live result or a truthful unavailable state.
+    document.body.classList.remove("booting");
+  }
 }
 
 setState("idle");
@@ -3158,7 +3271,7 @@ void watchCameraPermission();
 
 // Reconcile a live session if the tab is closed/hidden mid-call (no teardown).
 window.addEventListener("pagehide", () => { endTrackedSession(); endQueueTicket(); });
-
-requestAnimationFrame(() => {
-  document.body.classList.remove("booting");
+window.addEventListener("focus", () => { void refreshLocalIdentity({ retry: true, resetRetry: true }); });
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) void refreshLocalIdentity({ retry: true, resetRetry: true });
 });

@@ -1,0 +1,15 @@
+# Candidate-only opt-in for the development native PCM engine. Combine this
+# with compose.candidate.yml; never use it for Faster or Groxaxo services.
+services:
+  audio-cpp-candidate:
+    environment:
+      AUDIO_CPP_NATIVE_INCREMENTAL_PCM: "true"
+      AUDIO_CPP_NATIVE_LOAD_WARMUP: "true"
+      AUDIO_CPP_NATIVE_LOAD_WARMUP_TIMEOUT_SECONDS: "180"
+      # Four entries cover the normal A/B set: each retains one exact clone/language/control/reference KV prefix,
+      # then replays the phrase-specific suffix. generated speech state remain fresh and request-local.
+      # This is active only in this explicit native-development override.
+      AUDIO_CPP_TALKER_PREFIX_CACHE_SLOTS: "4"
+      # The pinned audio.cpp/ggml source exposes no supported runtime CUDA-graph
+      # switch. It therefore runs the engine default. Do not add a cosmetic env
+      # toggle or claim a graphs-on/off A/B until the engine consumes one.

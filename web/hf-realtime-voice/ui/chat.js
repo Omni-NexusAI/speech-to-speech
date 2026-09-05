@@ -13,8 +13,8 @@
  *   - user transcripts by the server's `item_id` — a speculative continuation
  *     REUSES it, so both segments land in one row/bubble; deltas are CUMULATIVE
  *     (each carries the full sentence so far), so we replace text wholesale.
- *   - assistant transcripts by `response_id`, so a cancelled speculative reply
- *     can be marked interrupted without erasing what was already shown.
+ *   - assistant transcripts by `response_id`, so a speculative reply can be
+ *     rolled back before rendered playback or marked interrupted once heard.
  */
 
 import { $, escHtml, DEBUG } from "./dom.js";
@@ -22,32 +22,6 @@ import { $, escHtml, DEBUG } from "./dom.js";
 const WRENCH_PATH = `<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>`;
 const CHAT_BUBBLE_SVG = `<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>`;
 const EMPTY_STATE_HTML = `<div id="chat-empty" class="chat-empty">${CHAT_BUBBLE_SVG}<span class="chat-empty-title">No messages yet</span><span class="chat-empty-hint">Tap the orb and start talking</span></div>`;
-
-const MAX_CORRELATION_ID_LENGTH = 128;
-const CORRELATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-
-/**
- * Keep protocol correlation visible without turning a server-controlled field
- * into an unbounded or content-bearing diagnostics channel.
- * @param {unknown} value
- */
-export function boundedCorrelationId(value) {
-  if (typeof value !== "string" || value.length > MAX_CORRELATION_ID_LENGTH) return "";
-  return CORRELATION_ID_RE.test(value) ? value : "";
-}
-
-/**
- * @typedef {Object} CameraLifecycle
- * @property {number} captureGeneration
- * @property {number} requestedAtMs
- * @property {string} cardId
- * @property {string} callId
- * @property {string} responseId
- * @property {string} itemId
- * @property {string} acceptedTurnId
- * @property {string} captureStatus
- * @property {string} outputStatus
- */
 
 export class ChatView {
   constructor() {
@@ -77,6 +51,12 @@ export class ChatView {
     this._activeUserItemId = "";
     /** @type {HTMLElement | null} */
     this._pendingUserHist = null;
+    /** @type {{ hist: HTMLElement, itemId: string, bubble: HTMLElement | null, responseId: string, responseEpoch: number | null }[]} */
+    this._userTurns = [];
+    /** @type {Map<string, { hist: HTMLElement, itemId: string, bubble: HTMLElement | null, responseId: string, responseEpoch: number | null }>} */
+    this._userTurnByItem = new Map();
+    /** @type {Map<string, { hist: HTMLElement, itemId: string, bubble: HTMLElement | null, responseId: string, responseEpoch: number | null }>} */
+    this._userTurnByResponse = new Map();
     // Monotonic counter for synthesizing unique keys when the server omits an
     // item_id / response_id, so id-less messages never collapse onto each other.
     this._anonSeq = 0;
@@ -271,16 +251,85 @@ export class ChatView {
   }
 
   /**
-   * Append a durable tool-call row immediately; its output and optional camera
-   * frame are filled into the same card when execution finishes.
-   * @param {string} name @param {unknown} argsJson @param {string} output
-   * @param {CameraLifecycle | undefined} [lifecycle]
+   * Track a user row until its response is known to have reached the listener.
+   * The realtime protocol serializes model ownership, so the oldest unbound
+   * user row belongs to the next response even when a barge-in has already
+   * reserved the following row before the old response terminal arrives.
+   * @param {HTMLElement} hist @param {string} [itemId]
    */
-  _appendHistTool(name, argsJson, output, lifecycle) {
+  _trackUserTurn(hist, itemId = "") {
+    let turn = itemId ? this._userTurnByItem.get(itemId) : undefined;
+    if (!turn) turn = this._userTurns.find((candidate) => candidate.hist === hist);
+    if (!turn) {
+      turn = { hist, itemId, bubble: null, responseId: "", responseEpoch: null };
+      this._userTurns.push(turn);
+    } else if (itemId && !turn.itemId) {
+      turn.itemId = itemId;
+    }
+    if (itemId) this._userTurnByItem.set(itemId, turn);
+    return turn;
+  }
+
+  /** @param {string} responseId @param {number | null | undefined} responseEpoch */
+  _bindResponseUserTurn(responseId, responseEpoch) {
+    if (!responseId) return null;
+    let turn = this._userTurnByResponse.get(responseId) ?? null;
+    if (!turn) {
+      turn = this._userTurns.find((candidate) => !candidate.responseId) ?? null;
+      if (turn) {
+        turn.responseId = responseId;
+        this._userTurnByResponse.set(responseId, turn);
+      }
+    }
+    if (turn && Number.isSafeInteger(Number(responseEpoch))) turn.responseEpoch = Number(responseEpoch);
+    return turn;
+  }
+
+  /** @param {{ hist: HTMLElement, itemId: string, bubble: HTMLElement | null, responseId: string, responseEpoch: number | null } | null} turn */
+  _settleUserTurn(turn) {
+    if (!turn) return;
+    this._userTurns = this._userTurns.filter((candidate) => candidate !== turn);
+    if (turn.itemId && this._userTurnByItem.get(turn.itemId) === turn) this._userTurnByItem.delete(turn.itemId);
+    if (turn.responseId && this._userTurnByResponse.get(turn.responseId) === turn) this._userTurnByResponse.delete(turn.responseId);
+    if (this._pendingUserHist === turn.hist) this._pendingUserHist = null;
+  }
+
+  /** Remove a local, superseded turn before either side became audible. */
+  _discardUnheardUserTurn(turn) {
+    if (!turn) return;
+    if (turn.bubble) this._dismissBubble(turn.bubble);
+    if (this._activeUserBubble === turn.bubble) {
+      this._activeUserBubble = null;
+      this._activeUserItemId = "";
+    }
+    turn.hist.remove();
+    if (turn.itemId && this._userHistByItem.get(turn.itemId) === turn.hist) this._userHistByItem.delete(turn.itemId);
+    this._settleUserTurn(turn);
+  }
+
+  /** Remove the provisional assistant rendering for an unheard local response. */
+  _discardUnheardResponse(responseId, entry) {
+    if (entry) {
+      this._dismissBubble(entry.bubble);
+      entry.hist.remove();
+    }
+    this._asstByResp.delete(responseId);
+  }
+
+  _renderEmptyHistoryIfNeeded() {
+    if (!this._chatHistory.querySelector(".hist-msg")) this.renderEmptyState();
+  }
+
+  /**
+   * Append a tool-call row to the conversation. We only add it once the tool
+   * has run, so the expandable toggle carries BOTH the call input and its result.
+   * @param {string} name @param {string} argsJson @param {string} output
+   */
+  _appendHistTool(name, argsJson, output) {
     const empty = this._chatHistory.querySelector(".chat-empty");
     if (empty) empty.remove();
-    let pretty = typeof argsJson === "string" ? argsJson : "(invalid non-string arguments)";
-    try { pretty = JSON.stringify(JSON.parse(pretty), null, 2); } catch {}
+    let pretty = argsJson;
+    try { pretty = JSON.stringify(JSON.parse(argsJson), null, 2); } catch {}
     const el = document.createElement("div");
     el.className = "hist-msg tool";
     el.innerHTML = `
@@ -290,7 +339,6 @@ export class ChatView {
         <span class="hist-tool-name">${escHtml(name)}</span>
         <svg class="hist-tool-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
-      <div class="hist-tool-meta" hidden></div>
       <div class="hist-tool-body">
         <div class="hist-tool-label">Input</div>
         <div class="hist-tool-block">${escHtml(pretty)}</div>
@@ -300,7 +348,6 @@ export class ChatView {
     `;
     const header = /** @type {HTMLButtonElement} */ (el.querySelector(".hist-tool-header"));
     const body = /** @type {HTMLDivElement} */ (el.querySelector(".hist-tool-body"));
-    this._updateToolLifecycle(el, lifecycle);
     header.addEventListener("click", () => {
       const expanded = header.getAttribute("aria-expanded") === "true";
       header.setAttribute("aria-expanded", String(!expanded));
@@ -309,54 +356,6 @@ export class ChatView {
     this._chatHistory.appendChild(el);
     this._scrollToBottom();
     return el;
-  }
-
-  /**
-   * A camera generation is part of the history identity so every actual call
-   * receives its own durable card, even if the backend omits or repeats a call ID.
-   * @param {string} callId
-   * @param {Partial<CameraLifecycle> | undefined} lifecycle
-   */
-  _toolHistoryKey(callId, lifecycle) {
-    if (Number.isFinite(lifecycle?.captureGeneration)) {
-      const boundedCallId = boundedCorrelationId(lifecycle?.callId ?? callId);
-      return `camera:${lifecycle.captureGeneration}:${boundedCallId || "missing-call-id"}`;
-    }
-    return callId;
-  }
-
-  /**
-   * Render content-free camera lifecycle information. Never include argument,
-   * transcript, image, or tool-result content in this metadata line.
-   * @param {HTMLElement} el
-   * @param {CameraLifecycle | undefined} lifecycle
-   */
-  _updateToolLifecycle(el, lifecycle) {
-    if (!lifecycle) return;
-    const cardId = boundedCorrelationId(lifecycle.cardId);
-    const callId = boundedCorrelationId(lifecycle.callId);
-    const responseId = boundedCorrelationId(lifecycle.responseId);
-    const itemId = boundedCorrelationId(lifecycle.itemId);
-    const acceptedTurnId = boundedCorrelationId(lifecycle.acceptedTurnId);
-    el.dataset.captureGeneration = String(lifecycle.captureGeneration);
-    el.dataset.cameraCardId = cardId;
-    el.dataset.callId = callId;
-    el.dataset.responseId = responseId;
-    el.dataset.itemId = itemId;
-    el.dataset.acceptedTurnId = acceptedTurnId;
-    el.dataset.captureStatus = lifecycle.captureStatus;
-    el.dataset.outputStatus = lifecycle.outputStatus;
-    const meta = /** @type {HTMLElement | null} */ (el.querySelector(".hist-tool-meta"));
-    if (!meta) return;
-    const requested = Number.isFinite(lifecycle.requestedAtMs)
-      ? new Date(lifecycle.requestedAtMs).toLocaleTimeString()
-      : "time unavailable";
-    const call = callId || "missing call ID";
-    const response = responseId || "missing response ID";
-    const item = itemId || "missing item ID";
-    const turn = acceptedTurnId || "missing accepted turn ID";
-    meta.hidden = false;
-    meta.textContent = `Capture #${lifecycle.captureGeneration} | ${requested} | ${call} | response ${response} | item ${item} | turn ${turn} | ${lifecycle.captureStatus} | output ${lifecycle.outputStatus}`;
   }
 
   /** Tag an assistant history row as interrupted (user barged in mid-reply).
@@ -370,16 +369,17 @@ export class ChatView {
     hist.appendChild(note);
   }
 
-  /** Render a captured webcam frame inside its exact tool card.
-   *  @param {string} dataUrl @param {HTMLElement} toolCard */
-  _appendHistImage(dataUrl, toolCard) {
-    const body = toolCard.querySelector(".hist-tool-body") || toolCard;
-    const frame = document.createElement("div");
-    frame.className = "hist-tool-snapshot";
-    frame.innerHTML = `<div class="hist-tool-label">Captured frame</div><img class="hist-image" alt="Webcam snapshot sent to the model" />`;
-    const img = /** @type {HTMLImageElement} */ (frame.querySelector("img"));
+  /** Render a captured webcam frame in the transcript (the camera tool result).
+   *  @param {string} dataUrl */
+  _appendHistImage(dataUrl) {
+    const empty = this._chatHistory.querySelector(".chat-empty");
+    if (empty) empty.remove();
+    const el = document.createElement("div");
+    el.className = "hist-msg tool";
+    el.innerHTML = `<div class="hist-role">Snapshot</div><img class="hist-image" alt="Webcam snapshot sent to the model" />`;
+    const img = /** @type {HTMLImageElement} */ (el.querySelector("img"));
     img.src = dataUrl;
-    body.appendChild(frame);
+    this._chatHistory.appendChild(el);
     this._scrollToBottom();
   }
 
@@ -397,6 +397,9 @@ export class ChatView {
     this._activeUserBubble = null;
     this._activeUserItemId = "";
     this._pendingUserHist = null;
+    this._userTurns = [];
+    this._userTurnByItem.clear();
+    this._userTurnByResponse.clear();
     this._asstByResp.clear();
     this._toolHistByCall.clear();
   }
@@ -408,7 +411,7 @@ export class ChatView {
    * @param {{ role: "user" | "assistant"; text: string; partial: boolean; itemId?: string; responseId?: string }} d
    */
   onTranscript(d, options = {}) {
-    if (DEBUG) console.debug(`[ui] transcript role=${d.role} partial=${d.partial} item=${d.itemId} resp=${d.responseId} chars=${String(d.text || "").length}`);
+    if (DEBUG) console.debug(`[ui] transcript role=${d.role} partial=${d.partial} item=${d.itemId} resp=${d.responseId} text=${JSON.stringify(d.text)}`);
 
     if (d.role === "user") {
       // Group by item_id: a speculative continuation reuses the same id, so it
@@ -426,6 +429,7 @@ export class ChatView {
       } else {
         this._updateHistMsg(hist, text, d.partial);
       }
+      const userTurn = this._trackUserTurn(hist, id);
 
       // One ephemeral bubble per active item. Purely timer-based: the timer is
       // refreshed on every delta, so it stays while the user keeps talking and
@@ -439,6 +443,7 @@ export class ChatView {
           this._updateBubbleText(this._activeUserBubble, text);
         }
         this._bumpDismiss(this._activeUserBubble, 6000);
+        if (this._activeUserItemId === id) userTurn.bubble = this._activeUserBubble;
       }
       this._markUnread();
     } else if (d.role === "assistant") {
@@ -446,6 +451,7 @@ export class ChatView {
       // response_id so a cancelled speculative response can be removed later. A
       // missing id gets a unique key so two id-less replies never collide.
       const rid = d.responseId || `_a${++this._anonSeq}`;
+      this._bindResponseUserTurn(rid, null);
       const entry = this._asstByResp.get(rid);
       if (!entry) {
         const bubble = this._spawnBubble("assistant", d.text);
@@ -464,25 +470,49 @@ export class ChatView {
   onUserTurnPending() {
     if (this._pendingUserHist) return;
     this._pendingUserHist = this._appendHistMsg("user", "Transcribing audio…", true);
+    this._trackUserTurn(this._pendingUserHist);
     this._markUnread();
   }
 
   /**
    * A response closed (completed or cancelled).
-   * @param {{ responseId: string; status: string; audible?: boolean; transcript?: string }} detail
+   * @param {{ responseId: string; status: string; audible?: boolean; transcript?: string; responseEpoch?: number | null; committed?: boolean }} detail
    */
   onResponseFinished(detail) {
-    const { responseId, status, audible, transcript } = detail;
+    const { responseId, status, audible, transcript, responseEpoch, committed } = detail;
     if (DEBUG) console.debug(`[ui] response-finished resp=${responseId} status=${status} audible=${audible} known=${this._asstByResp.has(responseId)}`);
-    // Without an id we can't target a specific response; the bubble will
-    // auto-dismiss on its own timer regardless.
-    if (!responseId) return;
-    const entry = this._asstByResp.get(responseId);
+    // `audible` is meaningful only for the local epoch-owned path. Standard
+    // OpenAI-compatible text events omit an epoch and retain their historical
+    // completion behavior even though they have no browser playback signal.
+    const localEpoch = responseEpoch != null && Number.isSafeInteger(Number(responseEpoch));
+    // A terminal local lifecycle may legitimately have no OpenAI response ID
+    // (for example a cancelled generation before response.created). Its epoch
+    // still owns the oldest provisional user row and must settle it.
+    const terminalKey = responseId || (localEpoch ? `_response_epoch_${responseEpoch}` : "");
+    if (!terminalKey) return;
+    const entry = responseId ? this._asstByResp.get(responseId) : undefined;
+    const userTurn = this._bindResponseUserTurn(terminalKey, responseEpoch);
+    // A tool-only response has already committed the originating user/tool
+    // transaction even though it deliberately produced no PCM. Keep its user
+    // row as the visible origin for the later audible tool follow-up.
+    if (localEpoch && audible === false && committed !== true) {
+      if (responseId) this._discardUnheardResponse(responseId, entry);
+      this._discardUnheardUserTurn(userTurn);
+      this._renderEmptyHistoryIfNeeded();
+      return;
+    }
 
-    if (status === "cancelled") {
-      // Keep every transcript that was received — mark it interrupted rather
-      // than erasing it. If the `*.transcript.done` never fired, build the row
-      // from the text carried in response.done.
+    // Nothing was rendered for an ID-less terminal. Its committed user origin
+    // remains in history, but it must leave provisional bookkeeping so a later
+    // response cannot claim it again.
+    if (!responseId) {
+      this._settleUserTurn(userTurn);
+      return;
+    }
+
+    if (status === "cancelled" || status === "canceled") {
+      // Audible cancellation is durable: mark its one assistant row interrupted.
+      // If `*.transcript.done` never fired, build it from response.done instead.
       let hist = entry?.hist ?? null;
       if (!hist && transcript) {
         hist = this._appendHistMsg("assistant", transcript, false);
@@ -491,6 +521,7 @@ export class ChatView {
       }
       if (hist) this._markHistInterrupted(hist);
       this._asstByResp.delete(responseId);
+      this._settleUserTurn(userTurn);
       return;
     }
 
@@ -499,54 +530,31 @@ export class ChatView {
     // the history row persists as the conversation log. Crucially we do NOT
     // touch user state here — that lifecycle is fully independent.
     this._asstByResp.delete(responseId);
+    this._settleUserTurn(userTurn);
   }
 
   /** The model called a tool — reserve its durable history position immediately.
-   *  @param {string} name @param {unknown} argsJson @param {string} callId
-   *  @param {CameraLifecycle | undefined} [lifecycle] */
-  onToolCall(name, argsJson, callId, lifecycle) {
+   *  @param {string} name @param {string} argsJson @param {string} callId */
+  onToolCall(name, argsJson, callId) {
     this._bumpDismiss(this._spawnBubble("tool", name));
-    const historyKey = this._toolHistoryKey(callId, lifecycle);
-    if (lifecycle && historyKey && !this._toolHistByCall.has(historyKey)) {
-      this._toolHistByCall.set(historyKey, this._appendHistTool(name, argsJson, "Running...", lifecycle));
-    }
-    if (!lifecycle && callId && !this._toolHistByCall.has(callId)) {
+    if (callId && !this._toolHistByCall.has(callId)) {
       this._toolHistByCall.set(callId, this._appendHistTool(name, argsJson, "Running…"));
     }
     this._markUnread();
   }
 
-  /** Render a non-executable, content-free tool protocol failure. Missing call
-   * IDs cannot be paired with function output and must never reach the tool
-   * executor or trigger response.create.
-   * @param {string} code */
-  onToolProtocolFailure(code) {
-    const safeCode = code === "missing_call_id" ? "missing_call_id" : "missing_tool_name";
-    const output = JSON.stringify({
-      type: "invalid_tool_call",
-      code: safeCode,
-      message: "The tool call was rejected because its protocol identity was incomplete.",
-    });
-    this._bumpDismiss(this._spawnBubble("tool", "tool_protocol"));
-    this._appendHistTool("tool_protocol", "{}", output);
-    this._markUnread();
-  }
-
   /** The tool finished — update its durable card (and any captured image).
-   *  @param {string} name @param {unknown} argsJson @param {string} output @param {string} [image] @param {string} [callId]
-   *  @param {CameraLifecycle | undefined} [lifecycle] */
-  onToolResult(name, argsJson, output, image, callId = "", lifecycle) {
-    const historyKey = this._toolHistoryKey(callId, lifecycle);
-    let existing = historyKey ? this._toolHistByCall.get(historyKey) : null;
+   *  @param {string} name @param {string} argsJson @param {string} output @param {string} [image] @param {string} [callId] */
+  onToolResult(name, argsJson, output, image, callId = "") {
+    const existing = callId ? this._toolHistByCall.get(callId) : null;
     const outputEl = existing?.querySelector(".hist-tool-output");
     if (outputEl) {
       outputEl.textContent = output || "(no output)";
-      this._updateToolLifecycle(existing, lifecycle);
-      this._toolHistByCall.delete(historyKey);
+      this._toolHistByCall.delete(callId);
     } else {
-      existing = this._appendHistTool(name, argsJson, output, lifecycle);
+      this._appendHistTool(name, argsJson, output);
     }
-    if (image && existing) this._appendHistImage(image, existing);
+    if (image) this._appendHistImage(image); // show the captured frame below the call
     this._markUnread();
   }
 }

@@ -21,7 +21,7 @@ the live Space, never locally (even with the LB exported for testing).
 Endpoints:
   GET  /api/config           -> { search, lb, allowDirect, auth }
   GET  /api/me               -> login + tier + remaining budget (LB mode only)
-  POST /api/search           -> versioned structured Serper web/news results
+  POST /api/search           -> { results, answer }  Google via Serper.dev
   POST /api/session          -> proxies <LB>/session: a grant, or a queue ticket
   GET  /api/queue/{id}       -> proxies <LB>/queue/{id}: position, or a grant on claim
   DELETE /api/queue/{id}     -> leave the queue (explicit "Leave queue" button)
@@ -40,14 +40,13 @@ import asyncio
 import base64
 import json
 import logging
-import math
 import os
 import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from secrets import token_hex
-from typing import Any, Literal
+from typing import Any
 
 import auth
 import httpx
@@ -55,41 +54,9 @@ import limiter
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel
 
 logger = logging.getLogger("s2s.search")
-
-_RUNTIME_REVISION_RE = re.compile(r"^[0-9a-f]{7,64}$", re.IGNORECASE)
-_RUNTIME_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
-_RUNTIME_ASSET_TOKEN = r"[A-Za-z0-9._-]+"
-_RUNTIME_ASSET_RE = re.compile(
-    rf"^main={_RUNTIME_ASSET_TOKEN};ws={_RUNTIME_ASSET_TOKEN};"
-    rf"chat={_RUNTIME_ASSET_TOKEN};playback={_RUNTIME_ASSET_TOKEN}$"
-)
-_MAX_RUNTIME_ASSET_LENGTH = 256
-
-
-def _runtime_identity_from_environment() -> dict[str, Any]:
-    """Capture only bounded content-free launch identity once per process."""
-    revision = os.environ.get("S2S_RUNTIME_REVISION", "").strip()
-    fingerprint = os.environ.get("S2S_RUNTIME_SOURCE_FINGERPRINT", "").strip()
-    assets = os.environ.get("S2S_UI_ASSET_GENERATION", "").strip()
-    dirty = {"0": False, "1": True}.get(os.environ.get("S2S_RUNTIME_DIRTY", "").strip())
-    return {
-        "source_revision": revision.lower() if _RUNTIME_REVISION_RE.fullmatch(revision) else "unknown",
-        "source_dirty": dirty,
-        "source_fingerprint": (
-            fingerprint.lower() if _RUNTIME_FINGERPRINT_RE.fullmatch(fingerprint) else "unknown"
-        ),
-        "ui_asset_generation": (
-            assets
-            if len(assets) <= _MAX_RUNTIME_ASSET_LENGTH and _RUNTIME_ASSET_RE.fullmatch(assets)
-            else "unknown"
-        ),
-    }
-
-
-RUNTIME_IDENTITY = _runtime_identity_from_environment()
 
 SERPER_KEY = os.environ.get("SERPER_API_KEY", "").strip()
 # Speech-to-speech load balancer URL. When set, the browser POSTs /api/session
@@ -105,27 +72,10 @@ LOAD_BALANCER_URL = os.environ.get("LOAD_BALANCER_URL", "").strip()
 # but nothing is metered: no budget, no reservations, no sign-in gating.
 SPACE_ID = os.environ.get("SPACE_ID", "").strip()
 LIMITER_ENABLED = bool(LOAD_BALANCER_URL) and bool(SPACE_ID)
-SERPER_URLS = {
-    "web": "https://google.serper.dev/search",
-    "news": "https://google.serper.dev/news",
-}
-SEARCH_FRESHNESS_TO_QDR = {
-    "none": None,
-    "day": "qdr:d",
-    "week": "qdr:w",
-    "month": "qdr:m",
-    "year": "qdr:y",
-}
+SERPER_URL = "https://google.serper.dev/search"
 # Cap results so the tool output stays small enough to feed back to the model.
 MAX_RESULTS = 5
-MAX_QUERY_CHARS = 500
-MAX_RESULT_TITLE_CHARS = 300
-MAX_RESULT_SNIPPET_CHARS = 1200
-MAX_RESULT_URL_CHARS = 2048
-MAX_RESULT_DATE_CHARS = 100
-MAX_RESULT_SOURCE_CHARS = 200
-MAX_ANSWER_CHARS = 1600
-LOCAL_UI_API_VERSION = 22
+LOCAL_UI_API_VERSION = 21
 HERE = os.path.dirname(os.path.abspath(__file__))
 _repo_runtime_dir = Path(HERE).parents[1] / ".runtime"
 # In the repository the legacy shared runtime is two levels above the UI.
@@ -160,9 +110,12 @@ PUBLIC_UI_SETTING_KEYS = {
     "modelName",
     "voiceByBackend",
     "ttsProfileByBackend",
+    "playbackContinuity",
+    "ttsDeliveryMode",
+    "historyCompaction",
 }
-ECHO_ROUTE_KEY_RE = re.compile(r"route_[0-9a-f]{64}")
-MAX_ECHO_CALIBRATION_ROUTES = 16
+DEFAULT_QWEN3_VOICE_ID = "16d9bb336799"
+DEFAULT_QWEN3_VOICE = f"clone:{DEFAULT_QWEN3_VOICE_ID}"
 TTS_BACKENDS = {
     "faster": {
         "endpoint": "http://127.0.0.1:8881/v1", "requiredModel": "1.7B-Base",
@@ -204,81 +157,40 @@ def _normalize_tts_provider_settings(payload: dict[str, Any]) -> dict[str, Any]:
 DEFAULT_VOICE_LIBRARY_DIR = Path(
     os.environ.get(
         "VOICE_LIBRARY_DIR",
-        str(Path.home() / ".speech-to-speech" / "qwen3-tts-voices"),
+        r"C:\Users\yepyy\Documents\Codex\2026-05-24\files-mentioned-by-the-user-i\qwen3-tts-candidate\voice_library_from_original",
     )
 ).expanduser()
 
 app = FastAPI(title="s2s-demo")
 
 
-def _sanitize_echo_calibrations(value: Any) -> dict[str, dict[str, float]]:
-    """Retain only bounded calibration keyed by the browser's opaque route digest."""
-    if not isinstance(value, dict):
-        return {}
-    limits = {
-        "delayMs": (0.0, 500.0),
-        "suppressionStrength": (0.0, 1.0),
-        "leakageThreshold": (0.05, 1.0),
-        "doubleTalkSensitivity": (0.0, 1.0),
-        "echoTailMs": (350.0, 1000.0),
-    }
-    calibrations: dict[str, dict[str, float]] = {}
-    for route_key, calibration in value.items():
-        if (
-            not isinstance(route_key, str)
-            or ECHO_ROUTE_KEY_RE.fullmatch(route_key) is None
-            or not isinstance(calibration, dict)
-        ):
-            continue
-        cleaned: dict[str, float] = {}
-        for field, (minimum, maximum) in limits.items():
-            candidate = calibration.get(field)
-            if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
-                continue
-            try:
-                candidate = float(candidate)
-            except (OverflowError, ValueError):
-                continue
-            if not math.isfinite(candidate):
-                continue
-            cleaned[field] = max(minimum, min(maximum, candidate))
-        if cleaned:
-            calibrations[route_key] = cleaned
-            if len(calibrations) > MAX_ECHO_CALIBRATION_ROUTES:
-                del calibrations[next(iter(calibrations))]
-    return calibrations
-
-
-def _atomic_write_public_ui_settings(path: Path, saved: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
-    # Preserve nested insertion order: echo calibration eviction is newest-first,
-    # not lexicographic by opaque digest.
-    temporary.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
-
-
 def _read_public_ui_settings() -> dict[str, Any]:
     """Load local non-secret UI settings, if the managed frontend has saved any."""
     paths = (UI_SETTINGS_PATH, _LEGACY_UI_SETTINGS_PATH) if UI_SETTINGS_PATH == _ui_settings_default else (UI_SETTINGS_PATH,)
-    selected: dict[str, Any] | None = None
     for path in paths:
         try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
+            saved = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if not isinstance(loaded, dict):
-            continue
-        saved = _normalize_tts_provider_settings(loaded)
-        if "echoCalibrations" in saved:
-            saved["echoCalibrations"] = _sanitize_echo_calibrations(
-                saved.get("echoCalibrations")
-            )
-        if saved != loaded:
-            _atomic_write_public_ui_settings(path, saved)
-        if selected is None:
-            selected = saved
-    return selected or {}
+        if isinstance(saved, dict):
+            # A historical browser build could write API keys here.  Retain
+            # only the explicit public allowlist and atomically rewrite the
+            # file when legacy/private keys are present.  Never inspect,
+            # return, or log the discarded values.
+            public = {key: saved[key] for key in PUBLIC_UI_SETTING_KEYS if key in saved}
+            if set(saved) != set(public):
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = path.with_suffix(".tmp")
+                    temporary.write_text(json.dumps(public, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                    temporary.replace(path)
+                except OSError:
+                    # Filtering still prevents a legacy secret from reaching
+                    # the browser if an unrelated filesystem failure blocks
+                    # cleanup.
+                    pass
+            return _normalize_tts_provider_settings(public)
+    return {}
 
 
 def _write_public_ui_settings(payload: dict[str, Any]) -> dict[str, Any]:
@@ -302,10 +214,51 @@ def _write_public_ui_settings(payload: dict[str, Any]) -> dict[str, Any]:
                 and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", profile_id)
             }
         elif key == "echoCalibrations" and isinstance(value, dict):
-            existing[key] = _sanitize_echo_calibrations(value)
+            limits = {
+                "delayMs": (0.0, 500.0),
+                "suppressionStrength": (0.0, 1.0),
+                "leakageThreshold": (0.05, 1.0),
+                "doubleTalkSensitivity": (0.0, 1.0),
+                "echoTailMs": (0.0, 1000.0),
+            }
+            calibrations: dict[str, dict[str, float]] = {}
+            for pair, calibration in list(value.items())[:16]:
+                if not isinstance(pair, str) or not isinstance(calibration, dict):
+                    continue
+                cleaned: dict[str, float] = {}
+                for field, (minimum, maximum) in limits.items():
+                    candidate = calibration.get(field)
+                    if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
+                        continue
+                    cleaned[field] = max(minimum, min(maximum, float(candidate)))
+                if cleaned:
+                    calibrations[pair[:512]] = cleaned
+            existing[key] = calibrations
+        elif key == "historyCompaction" and isinstance(value, dict):
+            enabled = bool(value.get("enabled", True))
+            trigger = value.get("trigger_ratio", 0.70)
+            target = value.get("target_ratio", 0.50)
+            recent_turns = value.get("recent_turns", 6)
+            if isinstance(trigger, bool) or not isinstance(trigger, (int, float)):
+                trigger = 0.70
+            if isinstance(target, bool) or not isinstance(target, (int, float)):
+                target = 0.50
+            if isinstance(recent_turns, bool) or not isinstance(recent_turns, (int, float)):
+                recent_turns = 6
+            trigger = max(0.20, min(0.90, float(trigger)))
+            target = max(0.10, min(trigger - 0.05, float(target)))
+            existing[key] = {
+                "enabled": enabled,
+                "trigger_ratio": trigger,
+                "target_ratio": target,
+                "recent_turns": max(1, min(12, int(recent_turns))),
+            }
         elif isinstance(value, (str, int, float, bool)):
             existing[key] = value
-    _atomic_write_public_ui_settings(UI_SETTINGS_PATH, existing)
+    UI_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = UI_SETTINGS_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(UI_SETTINGS_PATH)
     return existing
 
 
@@ -461,11 +414,7 @@ async def _sweeper():
 
 
 class SearchRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
     query: str
-    mode: Literal["auto", "web", "news"] = "auto"
-    freshness: Literal["none", "day", "week", "month", "year"] = "none"
     # Optional user-supplied key (fallback when the deploy has no server key).
     # Used for this request only; never stored.
     key: str | None = None
@@ -584,7 +533,6 @@ def config():
         "lb": bool(LOAD_BALANCER_URL),
         "allowDirect": not LOAD_BALANCER_URL,
         "auth": AUTH_ENABLED,
-        "runtime": dict(RUNTIME_IDENTITY),
     }
 
 
@@ -618,7 +566,7 @@ def _load_base_clone_profiles(library_dir: Path) -> list[dict]:
             }
         )
 
-    voices.sort(key=lambda item: (item["name"].casefold(), item["id"].casefold()))
+    voices.sort(key=lambda item: (item["id"] != DEFAULT_QWEN3_VOICE_ID, item["name"].lower()))
     return voices
 
 
@@ -667,25 +615,19 @@ def _write_profile(directory: Path, profile: dict[str, Any]) -> None:
     (directory / "meta.json").write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
 
 
-def _selected_base_voice(library_dir: Path, voices: list[dict[str, Any]]) -> str | None:
-    available = {str(profile["id"]): str(profile["voice"]) for profile in voices}
-    selected_path = library_dir / "selected_profile.json"
-    try:
-        selected = json.loads(selected_path.read_text(encoding="utf-8"))
-        profile_id = str(selected.get("profile_id") or "").strip()
-    except (OSError, json.JSONDecodeError, AttributeError):
-        profile_id = ""
-    return available.get(profile_id) or (str(voices[0]["voice"]) if voices else None)
-
-
 def _profile_response(library_dir: Path) -> dict[str, Any]:
-    voices = _load_base_clone_profiles(library_dir)
+    selected_path = library_dir / "selected_profile.json"
+    selected = DEFAULT_QWEN3_VOICE_ID
+    try:
+        selected = str(json.loads(selected_path.read_text(encoding="utf-8")).get("profile_id") or selected)
+    except (OSError, json.JSONDecodeError):
+        pass
     return {
-        "defaultVoice": str(voices[0]["voice"]) if voices else None,
-        "selectedVoice": _selected_base_voice(library_dir, voices),
+        "defaultVoice": DEFAULT_QWEN3_VOICE,
+        "selectedVoice": f"clone:{selected}",
         "libraryDir": str(library_dir),
         "writable": os.access(library_dir, os.W_OK),
-        "voices": voices,
+        "voices": _load_base_clone_profiles(library_dir),
     }
 
 
@@ -731,7 +673,7 @@ async def _backend_voice_inventory(backend: str) -> dict[str, Any]:
         "reachable": False,
         "writable": config.get("profileMode") in {"local", "remote"},
         "management": config.get("profileMode"),
-        "defaultVoice": None,
+        "defaultVoice": DEFAULT_QWEN3_VOICE if backend == "faster" else None,
         "selectedVoice": None,
         "voices": [],
     }
@@ -760,10 +702,10 @@ async def _backend_voice_inventory(backend: str) -> dict[str, Any]:
                 }
                 reconciled = [item for item in local if str(item.get("name") or "").casefold() in live_names]
                 base["voices"] = reconciled
-                base["defaultVoice"] = reconciled[0]["voice"] if reconciled else None
-                base["selectedVoice"] = _selected_base_voice(DEFAULT_VOICE_LIBRARY_DIR, reconciled)
-                if not reconciled:
-                    base["error"] = "No live Base clone profiles are available from FasterQwen3TTS."
+                profile_state = _profile_response(DEFAULT_VOICE_LIBRARY_DIR)
+                base["selectedVoice"] = profile_state["selectedVoice"]
+                if not any(item["voice"] == DEFAULT_QWEN3_VOICE for item in reconciled) and reconciled:
+                    base["defaultVoice"] = reconciled[0]["voice"]
             else:
                 base["voices"] = remote_voices
                 base["writable"] = False
@@ -938,6 +880,8 @@ def edit_qwen3_profile(profile_id: str, req: ProfileEditRequest):
 
 @app.delete("/api/qwen3/profiles/{profile_id}")
 def delete_qwen3_profile(profile_id: str):
+    if profile_id == DEFAULT_QWEN3_VOICE_ID:
+        raise HTTPException(status_code=409, detail="The configured J.A.R.V.I.S default profile cannot be deleted.")
     library_dir = DEFAULT_VOICE_LIBRARY_DIR
     _ensure_profile_library_writable(library_dir)
     profile_dir = _profile_path(library_dir, profile_id)
@@ -960,21 +904,39 @@ def select_qwen3_profile(req: ProfileSelectRequest):
 @app.get("/api/local-pipeline")
 async def local_pipeline():
     """Best-effort live description of the local runtime backing the UI."""
-    gemma_base = os.environ.get("GEMMA_AUDIO_BASE_URL", "http://127.0.0.1:8818/v1").rstrip("/")
-    tts_base = os.environ.get("QWEN3_TTS_API_BASE_URL", "http://127.0.0.1:8881/v1").rstrip("/")
-    profile_state = _profile_response(DEFAULT_VOICE_LIBRARY_DIR)
+    saved = _read_public_ui_settings()
+    model_provider = str(saved.get("modelProvider") or "local").strip().lower()
+    if model_provider not in {"local", "remote"}:
+        model_provider = "local"
+    configured_gemma_base = os.environ.get("GEMMA_AUDIO_BASE_URL", "http://127.0.0.1:8818/v1")
+    if model_provider == "remote" and isinstance(saved.get("modelUrl"), str):
+        candidate_base = saved["modelUrl"].strip()
+        if candidate_base.startswith(("http://", "https://")):
+            configured_gemma_base = candidate_base
+    gemma_base = configured_gemma_base.rstrip("/")
+    configured_gemma_model = os.environ.get("GEMMA_AUDIO_MODEL", "gemma-4-12b-it-qat")
+    if model_provider == "remote" and isinstance(saved.get("modelName"), str) and saved["modelName"].strip():
+        configured_gemma_model = saved["modelName"].strip()
+    selected_provider = _canonical_tts_provider(saved.get("ttsBackend"))
+    if selected_provider not in TTS_BACKENDS:
+        selected_provider = "faster"
+    selected_spec = TTS_BACKENDS[selected_provider]
+    tts_base = str(selected_spec["endpoint"]).rstrip("/")
     status = {
         "mode": "local-direct-audio",
         "vad": {"name": "Silero VAD", "device": "CPU", "sampleRate": 16000},
-        "gemma": {"baseUrl": gemma_base, "model": os.environ.get("GEMMA_AUDIO_MODEL", "gemma-4-12b-it-qat")},
+        "gemma": {
+            "provider": model_provider,
+            "baseUrl": gemma_base,
+            "model": configured_gemma_model,
+            "contextWindow": None,
+        },
         "tts": {
             "baseUrl": tts_base,
-            "backend": "qwen3-tts-faster",
-            "apiModel": "qwen3-tts",
-            "model": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-            "voice": profile_state["selectedVoice"],
-            "voiceAvailable": bool(profile_state["selectedVoice"]),
-            "container": "qwen3-tts-faster",
+            "backend": selected_provider,
+            "displayName": selected_spec["displayName"],
+            "model": selected_spec.get("requiredModel") or "provider-managed model",
+            "voice": (saved.get("voiceByBackend") or {}).get(selected_provider) or DEFAULT_QWEN3_VOICE,
         },
         "tools": {"serper": bool(SERPER_KEY), "camera": True},
     }
@@ -985,8 +947,11 @@ async def local_pipeline():
             if gemma.status_code == 200:
                 data = gemma.json()
                 models = data.get("data") or []
-                if models and isinstance(models[0], dict):
-                    status["gemma"]["model"] = models[0].get("id") or status["gemma"]["model"]
+                status["gemma"]["availableModels"] = [
+                    str(item.get("id"))
+                    for item in models
+                    if isinstance(item, dict) and item.get("id")
+                ]
         except Exception:
             status["gemma"]["reachable"] = False
         try:
@@ -1108,7 +1073,6 @@ async def _probe_audio_cpp_candidate(
     """
     config = TTS_BACKENDS["qwen3tts-audiocpp"]
     endpoint = str(config["endpoint"]).rstrip("/")
-    control_endpoint = os.environ.get("AUDIO_CPP_CONTROL_URL", f"{endpoint.removesuffix('/v1')}/control").rstrip("/")
     candidate_models = _audio_cpp_model_ids()
     requested_model = model_id or None
     if requested_model and requested_model not in candidate_models:
@@ -1359,6 +1323,46 @@ def _audio_cpp_proxy_base() -> str:
     return str(TTS_BACKENDS["qwen3tts-audiocpp"]["endpoint"]).rstrip("/")
 
 
+def _no_store_json_response(upstream: httpx.Response) -> Response:
+    """Return a bounded candidate read without allowing browser cache reuse."""
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        media_type="application/json",
+        headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"},
+    )
+
+
+@app.get("/api/audio-cpp/control/status")
+async def proxy_audio_cpp_control_status() -> Response:
+    """Expose only the candidate's read-only lifecycle snapshot to Studio."""
+    candidate_api_base = _audio_cpp_proxy_base()
+    control_base = candidate_api_base.removesuffix("/v1")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as http:
+        upstream = await http.get(f"{control_base}/control/status")
+    return _no_store_json_response(upstream)
+
+
+@app.get("/api/audio-cpp/v1/voices/profiles/{profile_id}")
+async def proxy_audio_cpp_profile_snapshot(profile_id: str) -> Response:
+    """Expose one immutable clone snapshot; no generic candidate relay exists."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", profile_id):
+        raise HTTPException(status_code=404, detail="Unknown audio.cpp clone profile.")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as http:
+        upstream = await http.get(f"{_audio_cpp_proxy_base()}/voices/profiles/{profile_id}")
+    return _no_store_json_response(upstream)
+
+
+@app.get("/api/audio-cpp/audio/outcomes/{request_id}")
+async def proxy_audio_cpp_audio_outcome(request_id: str) -> Response:
+    """Expose one short-lived candidate outcome; mutations stay unavailable."""
+    if not re.fullmatch(r"[0-9a-f]{32}", request_id):
+        raise HTTPException(status_code=404, detail="Unknown audio.cpp request outcome.")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as http:
+        upstream = await http.get(f"{_audio_cpp_proxy_base()}/audio/outcomes/{request_id}")
+    return _no_store_json_response(upstream)
+
+
 @app.get("/api/audio-cpp/settings")
 async def proxy_audio_cpp_settings() -> Response:
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as http:
@@ -1385,7 +1389,7 @@ async def proxy_audio_cpp_tuning(path: str, request: Request) -> Response:
         kwargs["json"] = await request.json()
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0)) as http:
         upstream = await http.request(request.method, f"{_audio_cpp_proxy_base()}/tuning/{path}", **kwargs)
-    return Response(content=upstream.content, status_code=upstream.status_code, media_type="application/json")
+    return _no_store_json_response(upstream)
 
 
 @app.post("/api/audio-cpp/audio/speech")
@@ -1674,111 +1678,60 @@ async def me(request: Request):
 
 @app.post("/api/search")
 async def search(req: SearchRequest):
-    """Run one canonical Serper search with truthful mode and recency metadata."""
+    """Proxy a Google search via Serper.dev. The key stays on the server unless
+    the user brought their own (then theirs is used for this request only)."""
     query = (req.query or "").strip()
     if not query:
         raise HTTPException(status_code=400, detail="Empty query.")
-    if len(query) > MAX_QUERY_CHARS:
-        raise HTTPException(status_code=400, detail="Query is too long.")
 
     key = (req.key or "").strip() or SERPER_KEY
     if not key:
         # No server key and the user didn't supply one — search is unavailable.
         raise HTTPException(status_code=503, detail="Search is not configured.")
 
-    requested_mode = req.mode
-    effective_mode = "news" if requested_mode == "news" or (
-        requested_mode == "auto" and req.freshness != "none"
-    ) else "web"
-    qdr = SEARCH_FRESHNESS_TO_QDR[req.freshness]
     headers = {"X-API-KEY": key, "Content-Type": "application/json"}
     payload = {"q": query, "num": MAX_RESULTS}
-    if qdr is not None:
-        payload["tbs"] = qdr
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as http:
+            resp = await http.post(SERPER_URL, headers=headers, json=payload)
+    except httpx.RequestError as exc:
+        logger.warning("Serper unreachable: %r", exc)
+        raise HTTPException(status_code=502, detail="Search provider unreachable.")
 
-    async def request_serper(http: httpx.AsyncClient, mode: Literal["web", "news"]) -> dict[str, Any]:
+    if resp.status_code != 200:
+        # Serper's error body carries the real reason (e.g. "Not enough
+        # credits") and contains no key, so it's safe to log and relay.
+        body = resp.text[:300]
+        logger.warning("Serper error %s: %s", resp.status_code, body)
+        msg = None
         try:
-            response = await http.post(SERPER_URLS[mode], headers=headers, json=payload)
-        except httpx.RequestError as exc:
-            logger.warning("Serper request failed error_class=%s", type(exc).__name__)
-            raise HTTPException(status_code=502, detail="Search provider unreachable.") from exc
-        if response.status_code != 200:
-            logger.warning("Serper request failed status=%s", response.status_code)
-            raise HTTPException(status_code=502, detail=f"Search provider error ({response.status_code})")
-        try:
-            data = response.json()
-        except ValueError as exc:
-            logger.warning("Serper response decode failed error_class=%s", type(exc).__name__)
-            raise HTTPException(status_code=502, detail="Search provider returned an invalid response.") from exc
-        if not isinstance(data, dict):
-            raise HTTPException(status_code=502, detail="Search provider returned an invalid response.")
-        return data
+            msg = resp.json().get("message")
+        except Exception:
+            pass
+        detail = f"Search provider error ({resp.status_code})"
+        if msg:
+            detail += f": {msg}"
+        raise HTTPException(status_code=502, detail=detail)
 
-    async with httpx.AsyncClient(timeout=12.0) as http:
-        data = await request_serper(http, effective_mode)
-        raw_results = data.get("news" if effective_mode == "news" else "organic") or []
-        if not isinstance(raw_results, list):
-            raw_results = []
-        fallback_applied = requested_mode == "auto" and effective_mode == "news" and not raw_results
-        if fallback_applied:
-            effective_mode = "web"
-            data = await request_serper(http, "web")
-            raw_results = data.get("organic") or []
-            if not isinstance(raw_results, list):
-                raw_results = []
-
-    def bounded(value: Any, maximum: int) -> str | None:
-        if value is None:
-            return None
-        return str(value)[:maximum]
-
-    results: list[dict[str, Any]] = []
-    for index, item in enumerate(raw_results[:MAX_RESULTS], start=1):
-        if not isinstance(item, dict):
-            continue
+    data = resp.json()
+    results = []
+    for item in (data.get("organic") or [])[:MAX_RESULTS]:
         results.append(
             {
-                "title": bounded(item.get("title"), MAX_RESULT_TITLE_CHARS) or "",
-                "snippet": bounded(item.get("snippet"), MAX_RESULT_SNIPPET_CHARS) or "",
-                "url": bounded(item.get("link"), MAX_RESULT_URL_CHARS) or "",
-                "date": bounded(item.get("date"), MAX_RESULT_DATE_CHARS),
-                "source": bounded(item.get("source"), MAX_RESULT_SOURCE_CHARS),
-                "position": item.get("position")
-                if isinstance(item.get("position"), int) and 1 <= item["position"] <= 1000
-                else index,
+                "title": item.get("title", ""),
+                "snippet": item.get("snippet", ""),
+                "url": item.get("link", ""),
             }
         )
 
     # A direct answer when Google has one — saves the model a hop.
-    answer = None
-    if requested_mode != "news" and req.freshness == "none":
-        box = data.get("answerBox") or {}
-        if isinstance(box, dict):
-            answer = box.get("answer") or box.get("snippet") or None
-        if not answer:
-            kg = data.get("knowledgeGraph") or {}
-            if isinstance(kg, dict):
-                answer = kg.get("description") or None
-        answer = bounded(answer, MAX_ANSWER_CHARS)
+    box = data.get("answerBox") or {}
+    answer = box.get("answer") or box.get("snippet") or None
+    if not answer:
+        kg = data.get("knowledgeGraph") or {}
+        answer = kg.get("description") or None
 
-    retrieved_at_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    return JSONResponse(
-        {
-            "type": "web_search_result",
-            "schema_version": 1,
-            "provider": "serper",
-            "query": query,
-            "requested_mode": requested_mode,
-            "effective_mode": effective_mode,
-            "freshness": req.freshness,
-            "retrieved_at_utc": retrieved_at_utc,
-            "recency_filter_applied": qdr is not None,
-            "fallback_applied": fallback_applied,
-            "answer": answer,
-            "results": results,
-        },
-        headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"},
-    )
+    return JSONResponse({"query": query, "answer": answer, "results": results})
 
 
 @app.post("/api/session")
@@ -2016,14 +1969,23 @@ async def session_end(request: Request):
 try:
     import gradio as gr
     from gradio_voice_studio import build_app as build_gradio_voice_studio
-    app = gr.mount_gradio_app(
-        app,
-        build_gradio_voice_studio(
-            os.environ.get("AUDIO_CPP_TTS_BASE_URL", "http://127.0.0.1:8080/v1").removesuffix("/v1"),
-            DEFAULT_VOICE_LIBRARY_DIR,
-        ),
-        path="/voice-studio",
-    )
+
+    mount_gradio_app = getattr(gr, "mount_gradio_app", None)
+    if callable(mount_gradio_app):
+        app = mount_gradio_app(
+            app,
+            build_gradio_voice_studio(
+                os.environ.get("AUDIO_CPP_TTS_BASE_URL", "http://127.0.0.1:8080/v1").removesuffix("/v1"),
+                DEFAULT_VOICE_LIBRARY_DIR,
+            ),
+            path="/voice-studio",
+        )
+    else:
+        # Repository test/development environments may carry a pre-mount
+        # Gradio release.  Keep the HF Realtime server usable there; the
+        # self-contained candidate image pins a release with this API and must
+        # still pass its separate Voice Studio route smoke test.
+        logger.info("Voice Studio route unavailable: Gradio mount API is not installed")
 except ImportError:
     # The regular Realtime server stays runnable outside the candidate image.
     pass

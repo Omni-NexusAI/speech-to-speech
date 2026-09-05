@@ -98,6 +98,29 @@ class ModelOperationCoordinator:
         with self._condition:
             return self._active is not None and self._active.token.operation_id == token.operation_id
 
+    def cancellation_requested(self, token: ModelOperationToken) -> bool:
+        """Return whether cancellation was captured for this exact operation.
+
+        A request can be cancelled after it acquires the coordinator but before
+        its HTTP transport exists.  Late transport registration uses this bit
+        to close the real resource synchronously instead of consuming the
+        cancellation against an empty handler resource set.
+        """
+
+        with self._condition:
+            active = self._active
+            return bool(
+                active is not None
+                and active.token.operation_id == token.operation_id
+                and active.cancel_requested
+            )
+
+    def active_token(self) -> ModelOperationToken | None:
+        """Return the current immutable token without changing its state."""
+
+        with self._condition:
+            return self._active.token if self._active is not None else None
+
     def release(self, token: ModelOperationToken) -> None:
         with self._condition:
             active = self._active
@@ -106,13 +129,25 @@ class ModelOperationCoordinator:
                 self._condition.notify_all()
 
     def cancel_and_wait(self, reason: str, timeout_s: float = 2.0) -> ModelCancellationResult:
-        started = time.monotonic()
+        token = self.request_cancel(reason)
+        return self.wait_for_cancellation(token, reason, timeout_s)
+
+    def request_cancel(self, reason: str) -> ModelOperationToken | None:
+        """Synchronously capture and cancel the current operation.
+
+        Callers that must do other ownership work before awaiting transport
+        teardown use the returned token with :meth:`wait_for_cancellation`.
+        Capturing here prevents a later worker thread from accidentally
+        cancelling a successor that acquires after the original operation
+        releases.
+        """
+
         callback: Callable[[], None] | None = None
         token: ModelOperationToken | None = None
         with self._condition:
             active = self._active
             if active is None:
-                return ModelCancellationResult(None, True, False, 0.0, reason)
+                return None
             token = active.token
             active.cancel_requested = True
             if active.cancel is not None and not active.cancel_started:
@@ -121,6 +156,50 @@ class ModelOperationCoordinator:
 
         if callback is not None:
             self._invoke_cancel(token, callback)
+        logger.debug(
+            "Captured model operation for cancellation "
+            "(operation=%s kind=%s reason=%s)",
+            token.operation_id,
+            token.kind,
+            reason,
+        )
+        return token
+
+    def request_cancel_token(self, token: ModelOperationToken, reason: str) -> bool:
+        """Request cancellation only if ``token`` is still the active owner."""
+
+        callback: Callable[[], None] | None = None
+        with self._condition:
+            active = self._active
+            if active is None or active.token.operation_id != token.operation_id:
+                return False
+            active.cancel_requested = True
+            if active.cancel is not None and not active.cancel_started:
+                active.cancel_started = True
+                callback = active.cancel
+
+        if callback is not None:
+            self._invoke_cancel(token, callback)
+        logger.debug(
+            "Requested exact model-operation cancellation "
+            "(operation=%s kind=%s reason=%s)",
+            token.operation_id,
+            token.kind,
+            reason,
+        )
+        return True
+
+    def wait_for_cancellation(
+        self,
+        token: ModelOperationToken | None,
+        reason: str,
+        timeout_s: float = 2.0,
+    ) -> ModelCancellationResult:
+        """Wait for one previously captured operation and never its successor."""
+
+        started = time.monotonic()
+        if token is None:
+            return ModelCancellationResult(None, True, False, 0.0, reason)
 
         deadline = started + max(0.0, timeout_s)
         detached = False

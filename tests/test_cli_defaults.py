@@ -54,14 +54,14 @@ def test_release_defaults_match_responses_api_parakeet_qwen3_realtime_profile():
     assert qwen3_args.qwen3_tts_ref_audio is None
     assert qwen3_args.qwen3_tts_mlx_quantization == "6bit"
     assert qwen3_args.qwen3_tts_api_base_url == "http://127.0.0.1:8881/v1"
-    assert qwen3_args.qwen3_tts_api_voice is None
+    assert qwen3_args.qwen3_tts_api_voice == "clone:16d9bb336799"
     assert qwen3_args.qwen3_tts_api_backend_model == "1.7B-Base"
 
 
 def test_runtime_echo_guard_descriptor_matches_client_owned_aec3_contract():
     descriptor = ECHO_GUARD_RUNTIME_DESCRIPTOR
 
-    assert descriptor["default"] == "adaptive"
+    assert descriptor["default"] == "native"
     assert descriptor["modes"] == ["native", "adaptive", "strict"]
     assert descriptor["reference"] == "post_gain_resampled_scheduled_playback_pcm"
     assert descriptor["ownership"] == "client"
@@ -69,7 +69,7 @@ def test_runtime_echo_guard_descriptor_matches_client_owned_aec3_contract():
         "implementation": "sonora_aec3_wasm",
         "activation": "validated_module_only",
         "availability": "client_reported",
-        "calibration": "per_opaque_microphone_output_route_fingerprint",
+        "calibration": "per_microphone_output_device_pair",
         "failure_mode": "native",
     }
     assert descriptor["strict"] == {"failure_mode": "fail_closed"}

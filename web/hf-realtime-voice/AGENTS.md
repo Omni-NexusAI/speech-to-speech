@@ -15,23 +15,18 @@
 - Default local testing should connect to `ws://127.0.0.1:8765/v1/realtime` through the UI settings.
 - Do not enable external search or cloud services by default.
 - Settings, About, and Diagnostics should show the real local runtime state, not hosted-demo model labels.
-- Keep the upstream `Built by` credit intact. The top identity row must source local Gemma and FasterQwen3TTS provider status from `/api/local-pipeline`, and place the Omni-NexusAI fork credit in a separate `Modified by` row.
+- Keep the upstream `Built by` credit intact. The top identity row must source the persisted selected Gemma provider, endpoint, and model plus the currently selected TTS provider from `/api/local-pipeline`; it must not fall back to the launcher's local Gemma identity when Remote is selected. Place the Omni-NexusAI fork credit in a separate `Modified by` row.
 - When the backend emits `pipeline.metric`, keep the UI rendering lightweight and diagnostic-only; do not infer pipeline state by duplicating backend logic in the browser.
 - Local runtime toggles and TTS backend selection use `pipeline.config.update`, leaving OpenAI-compatible `session.update` for standard voice/instructions/tool fields.
 - Initial capture remains gated until `pipeline.config.updated` acknowledges the
   complete conversation-scoped configuration. A missing acknowledgement times
   out after 15 seconds; any server error before it is fatal, visible, and closes
   the socket so the backend releases the pipeline slot.
-- Send tool output, optional camera image, and one follow-up `response.create` immediately in hosted order. The backend owns the call-ID barrier; never replay a rejected create on a later user turn.
-- Speech stop reserves persistent visual user chronology. Replace it with validated transcript metadata when available or persistent `[User audio]` when absent; both are UI-only representations. The backend separately owns one semantic user anchor, upgrading audio to validated text when available, and transcript availability never controls assistant or tool UI.
+- Send tool output, optional camera image, and one follow-up `response.create` immediately in hosted order. The backend owns the response-create call-ID barrier; the browser keeps bounded per-connection accepted call-ID tombstones so a replayed function-call terminal cannot execute an external tool twice, while its one output acknowledgement remains idempotent. Never replay a rejected create on a later user turn.
+- Speech stop reserves persistent user chronology. Replace it with validated transcript metadata when available or persistent `[User audio]` when absent; the placeholder is display-only and transcript availability never controls assistant or tool UI.
 - The live-transcription setting controls only the temporary floating user bubble. Final user text always updates the persistent conversation panel.
 - Diagnostics label the always-on final stage `Transcription` and show retained history tokens against the context window detected from llama.cpp.
 - Camera preview and Diagnostics should not occupy the same desktop corner; keep the camera self-view clear when diagnostics are open.
-- Reject missing, non-string, wrong-type, and extra tool arguments before execution without displaying raw values. Preserve output/image/single-`response.create` ordering.
-- `web_search` accepts required `query` plus optional `mode=auto|web|news` and `freshness=none|day|week|month|year`. Auto uses news when freshness is requested and web otherwise; Serper receives the matching endpoint and qdr filter. Only zero-result news selected by `mode=auto` may make one same-filter web fallback; explicit news stays news with zero results.
-- Search tool output is versioned structured JSON with retrieval time, requested/effective mode, filter/fallback state, and bounded results carrying title, snippet, URL, date, source, and position. Retrieval time is not publication time; never label undated results as today, and suppress unscoped answer panels for news or freshness-filtered requests.
-- The shared direct/post-tool search policy permits one initial search and at most one distinct narrower refinement per accepted turn. Bind that budget to the server item ID so cumulative VAD revisions cannot reset it. Normalized duplicates or broader retries are terminal. The first successful search follow-up exposes only `web_search` with response-scoped automatic choice; all terminal search and non-search follow-ups use response-scoped `tool_choice: none`. Never mutate session policy. Search diagnostics contain only fixed modes/states, booleans, counts, timings, and bounded error classes—never queries, result content, or provider bodies.
-- Render every real camera invocation as a distinct generation-keyed card, including unavailable captures. Carry bounded content-free accepted-turn, response, item, call, card, capture-generation, capture-status, and output-acknowledgement identities through requested, completed, unavailable, and rejected states; missing or malformed correlation stays visibly missing and never suppresses the card. Requests about the current view or what changed require a fresh snapshot; never imply that a stale frame is live.
 - Settings list every configured TTS provider even while unavailable. Provider
   changes apply to the next conversation, and an unavailable selected provider
   blocks start without silent fallback.
@@ -39,13 +34,6 @@
   Reconcile Faster's live voices with its configured writable library, use the
   candidate-private audio.cpp profile API, and keep Groxaxo inventory-only
   unless its existing API explicitly advertises safe mutation support.
-- Resolve the shared Faster clone library from `VOICE_LIBRARY_DIR`; when it is
-  unset, use `~/.speech-to-speech/qwen3-tts-voices`, matching the pipeline
-  handler. A missing portable library is an empty inventory, never permission
-  to borrow profiles from another provider or a developer checkout.
-- No clone is privileged or undeletable. Preserve an explicit backend-scoped
-  selection; otherwise use a valid `selected_profile.json`, then the first live
-  Base profile, and clear/disable voice state when the inventory is empty.
 - Treat each selected backend's current no-store inventory as authoritative;
   do not hide a live audio.cpp profile merely because another provider uses the
   same ID. Clear and disable the voice selector before awaiting a backend
@@ -74,8 +62,8 @@
   Faster/Groxaxo automatically.
 - Persist local UI preferences (including the selected TTS backend) atomically
   through `/api/ui-settings` so an environment/browser reset can restore them.
-  Never retain model or service API keys there; those remain in browser-local
-  device storage and are excluded from every UI-server persistence payload.
+  Never retain model or service API keys there; those remain browser-session
+  settings.
 - General provider validation checks health, resident model, capabilities,
   selected clone presence, and a short synthesis without changing model
   residency. Persist and retrieve results by backend/model/clone so switching
@@ -83,42 +71,87 @@
   experimental audio.cpp still requires explicit validation.
 - Persist non-secret backend endpoints, prompts, selected backend, and
   per-backend clone selections atomically through server-managed runtime state.
-  Await saves in the Settings UI and keep all API keys in browser-local device
-  storage only, excluded from every UI-server persistence payload and response.
+  Await saves in the Settings UI and keep all API keys browser-session-only.
+- History compaction is a conversation-scoped `pipeline.config.update` setting
+  with only `enabled`, `trigger_ratio`, `target_ratio`, and `recent_turns`.
+  Persist the bounded local preference and render only backend-reported history
+  token telemetry; render acknowledged backend policy/status and bounded budget
+  fields only, never estimate a compaction budget, success, or failure.
+  On startup, remove the legacy local model-key slot without reading it; the
+  managed settings reader likewise filters and rewrites legacy private fields
+  without returning or logging their values.
 - Keep model inference controls separate from TTS controls, and place Voice directly beneath TTS Backend in the vertically scrolling settings layout.
-- The loopback `/api/config` response carries only the managed launch revision, dirty flag, runtime-source SHA-256 fingerprint, and four browser asset generations. Snapshot this bounded identity once per frontend process and compare it exactly with `pipeline.runtime`; never expose paths, branches, environment values, config content, prompts, media, or credentials.
 - Stop invalidates the active client before asynchronous teardown; closed-client mic, playback, tool, and WebSocket events must never change the idle UI or enter a replacement conversation.
-- Feed the exact generated playback PCM into the capture worklet as a non-audible reference; never substitute the static clone recording. Adaptive is the default and uses only the SHA-verified, import-free bundled AEC3 module; any manifest, ABI, hash, compile, or worklet failure resolves truthfully to Native. Strict suspends uncertain upload through the echo tail without inserting zero PCM.
-- Native-fallback and AEC3 capture share one stateful, phase-indexed
-  windowed-sinc conversion to 16 kHz. Average all available channels to finite
-  mono before capture/reference processing, retain filter state across browser
-  render blocks, support a bounded idempotent clean-endpoint tail flush for
-  explicit callers, and saturate PCM16 at `-32768..32767`. Normal session
-  teardown aborts and discards the tail. Anti-alias filtering must not change
-  VAD, gate, AEC, echo-mode, or reference-tail decisions. A route reset resolves
-  the old route once, then clears FIR, partial-chunk, and reference-level state
-  before accepting samples from the replacement route.
-- Keep one generation-tagged playback worklet FIFO across phrase chunks and same-turn tool continuations. Validated native audio.cpp playback freezes one acknowledged model/clone/profile/effective-settings signature for the complete accepted user turn, including tool continuations; Faster, Groxaxo, and buffered fallback remain immediate. The cold ceiling is the acknowledged first plus steady decoder-block duration, with conservative 800/1280/1760 ms built-in fallbacks and a 2000 ms custom fallback when metadata is invalid. Learn warm starts only from logical decoder-block sample boundaries after two clean full-prime responses, using the last-eight p95 gap plus 64 ms jitter and never less than first-block duration plus 160 ms. A real underrun immediately restores the full ceiling and requires three clean full-prime recoveries. Preserve every input sample, flush a short ended stream, re-arm cancellation only after accepted current-generation PCM, and reject stale-generation tails. Retire completed response snapshots into a bounded tombstone set so long sessions do not leak memory or reopen late PCM.
-- Adaptive safe-start diagnostics are content-free and response-scoped: expose cold ceiling, effective target/mode, latest logical block gap, p95, fixed 64 ms jitter, queued duration, underrun/re-prime counters, learning state, and a bounded fallback reason. Never expose the raw signature, model, clone, prompt, transcript, or audio content through playback metrics or persisted learning state.
-- Treat worklet `started` and `drained` as the exclusive audible/UI speaking lifecycle. Network PCM, transcript, content-part, and `response.done` events may advance protocol state or release response/tool locks, but must not claim or end audible playback.
+- Local response ownership uses monotonic `input_epoch` and `response_epoch`.
+  Accept an epoch-only pending `pipeline.response` for diagnostics, then bind
+  playback only once its OpenAI response ID exists. Reject stale epoch text,
+  PCM, metrics, and terminal events. Browser clients declare rendered-playback
+  acknowledgement capability at startup; the worklet's first rendered sample
+  sends exactly one local `pipeline.playback.started` acknowledgement per
+  response/epoch, while nonbrowser peers settle only after the first non-empty
+  PCM frame is successfully sent.
+- An epoch-only terminal `pipeline.response` without an OpenAI response ID is
+  a one-shot browser terminal: clear the pending response/create state and roll
+  back its paired provisional user row. A tool-call response ID commits its
+  originating user/tool chronology even when it emits no PCM, so its later
+  audible follow-up retains visible origin. Treat response terminal IDs as
+  idempotent too, so duplicate completion cannot settle a later user row.
+- Retired response IDs are terminal even when a compatible peer later omits
+  epoch metadata on transcript frames. Drop only that stale-ID transcript;
+  preserve unrelated legacy epoch-less transcript IDs.
+- A local epoch-owned response stays provisional until rendered playback is
+  acknowledged. Roll back an unheard terminal response and its paired user
+  transaction; retain an audible cancelled response once, marked interrupted.
+  Epoch-less standard OpenAI-compatible text completions retain their normal
+  transcript history.
+- A completed response that never reaches audible playback is retired at the
+  same rollback boundary. Its bounded response-ID tombstone rejects delayed
+  epoch-less compatible transcript frames, while unrelated legacy IDs remain
+  accepted.
+- The local `pipeline.input_audio.speech_started` decision is available only
+  after the browser advertises rendered-playback acknowledgement support. It
+  precedes the stock speech-start event and tells the browser whether to clear
+  playback; nonbrowser and OpenAI SDK clients receive only the stock event.
+- audio.cpp playback continuity defaults to Adaptive. It may alter only the
+  bounded (two-second maximum) browser startup reservoir for both native PCM
+  and the buffered-phrase fallback while preserving the existing PCM sample
+  clock, pitch, duration, and quality. Fast start retains the fixed profile
+  target. When the cap or backend RTF proves realtime cannot be sustained,
+  expose that condition and retain the explicit full-buffer fallback.
+- A playback configuration acknowledgement changes only source-clock and
+  continuity-reservoir defaults for later responses. Every response freezes its
+  16/24 kHz source rate, native/Adaptive-or-Fast-start mode, effective prime
+  target, and two-second ceiling at pending ownership; queued PCM/end messages
+  cannot be retimed or re-primed by a later acknowledgement.
+- The local `pipeline.response` lifecycle event captures the complete
+  response-owned playback policy by epoch before an OpenAI response ID exists,
+  then binds it to the first response snapshot before PCM; a later config
+  acknowledgement may only set the next response's policy.
+- `pipeline.config.update` carries the bounded local `playback_policy`
+  extension (`prime_target_ms`, `continuity_mode`, `native_streaming`,
+  `max_prime_ms`) for server-side admission freezing. Source rate remains the
+  separate server-owned `audio_output_sample_rate`; never duplicate it in the
+  strict playback-policy request. The matching enriched `pipeline.response`
+  copy is authoritative across delayed acknowledgement/lifecycle ordering;
+  retain the legacy rate-only fallback for an older local server.
+- `response.done` is protocol completion, not browser audibility. When PCM is
+  primed but the worklet has not rendered its first sample, retain the
+  provisional ChatView transaction and defer its one terminal event. Settle it
+  audible only on the matching worklet `started`; settle it unheard only on a
+  definitive `drained` or `cleared` boundary, then retire the response so a
+  late worklet message cannot revive it.
+- Starting a conversation claims a monotonic attempt token and renders
+  `connecting` before any await. Every asynchronous preflight, mic acquire,
+  and connect completion must abandon and close stale resources rather than
+  allowing a fast repeat click to create a second mic, socket, or client.
+- Initial local identity is an uncached, latest-request-wins parallel probe of
+  the selected provider and local pipeline. Retry boundedly on a transient
+  failure and render explicit unavailability; never use it to manage services.
+  Render a settled local-pipeline result before a slower backend/clone
+  inventory has returned, so static `Checking...` text cannot persist.
+- Feed the exact generated playback PCM into the capture worklet as a non-audible reference; never substitute the static clone recording. Native browser AEC is the default. Adaptive uses only the SHA-verified, import-free bundled AEC3 module; any manifest, ABI, hash, compile, or worklet failure resolves truthfully to Native. Strict suspends uncertain upload through the echo tail without inserting zero PCM.
 - Keep native `echoCancellation`, `noiseSuppression`, and `autoGainControl` enabled and expose requested/effective mode, module availability, calibration, reference wiring, and double-talk status in diagnostics. The response-length setting remains independent.
-- Reduce resolved microphone/output routes immediately to a domain-separated
-  SHA-256 fingerprint; raw device IDs, group IDs, and labels are transient
-  digest input only and must never be retained, logged, persisted, rendered, or
-  emitted in diagnostics. Fail closed without a persistence key when either
-  physical route cannot be resolved. A changed route advances an async-guarded
-  epoch, resets AEC state and the measurement cohort, and reloads only that
-  route's calibration; an unchanged fingerprint refreshes latency without a
-  reset. Remove route listeners during teardown.
-- Persist at most 16 finite, normalized opaque-route calibrations. Legacy raw
-  keys are discarded in browser-local load/save, public settings, and server
-  GET/PUT paths. Delay remains available to Adaptive and Strict; suppression,
-  leakage, and double-talk controls are Strict-only, while `echoTailMs` is
-  bounded to 350–1000 ms. "Use measured" requires at least 20 quiet,
-  playback-active, no-double-talk samples spanning at least two seconds and an
-  accepted median/p95/jitter result after current output-latency adjustment.
-  Keep Sonora's derived `aec3-output-evidence` label distinct from WebRTC's
-  private internal double-talk state.
+- Persist delay, strict suppression, leakage, and double-talk calibration by microphone/output-device pair. Feed the worklet the active AudioContext output latency and keep Sonora's derived `aec3-output-evidence` label distinct from WebRTC's private internal double-talk state.
 
 ## Child DOX Index
 
@@ -131,21 +164,34 @@
   temporary overrides page-scoped, and can save the effective values as a new
   immutable-built-in-safe custom profile without changing Voice Studio's
   selection. Show named, override, and effective values separately; require an
-  explicit unsafe unlock before editing the 72-frame decoder context. Never
+  explicit unsafe unlock before editing the 25-frame decoder context. Never
   send audio.cpp tuning to another TTS provider. Expanded metrics include LLM first stable phrase, TTS first PCM,
   first playback, synthesis RTF, end-to-end time, model/profile, GPU headroom,
-  requested/effective response language and declared provider Auto capability,
   paired reference source/requested/used duration, limit-applied state,
   pairing mode, truthful delivery mode,
   requested/effective echo mode, verified AEC3 identity, device calibration,
   and truthful Native fallback reasons.
-- After resolving a candidate profile, carry only its bounded
-  `text_lookahead`/`phrase_flush_ms` snapshot in session `tts_tuning` so HF
-  Realtime can apply the same phrase queue without hardcoding profile defaults.
-  Drop stale resolved values when the selected profile changes.
-- Candidate supervisor REST payloads retain `scope=realtime`; WebSocket
-  `tts_tuning` is strictly limited to `provider`, `profile_id`, `overrides`, and
-  optional `resolved`. Candidate preflight must complete one live profile
-  resolution, and provider switches clear foreign voice/tuning state.
+- After resolving a candidate profile, carry its complete frozen effective
+  Base/full-ICL tuning snapshot plus profile revision in session `tts_tuning`;
+  use effective lookahead/flush locally and treat legacy `resolved` values as a
+  bounded compatibility fallback only. Candidate supervisor REST payloads retain
+  `scope=realtime`; strict WebSocket tuning accepts only the candidate provider,
+  profile/revision, complete safe effective fields, and bounded overrides.
+  Candidate preflight must complete one live profile resolution and freeze that
+  exact result for the initial socket update; it fails visibly rather than
+  silently opening a candidate session without `tts_tuning`. Provider switches
+  clear foreign voice/tuning state.
 
 - No child AGENTS.md files currently.
+
+## Candidate snapshot and failure boundaries
+
+- Studio snapshot proxies expose only validated GET model/clone snapshots and
+  the bounded outcome lookup, never lifecycle mutations. Tuning resolve and
+  snapshot responses, including failures/conflicts, are no-store.
+- A candidate phrase is complete only after its opaque request outcome confirms
+  successful engine termination. Missing/failed outcomes clear the exact owned
+  playback queue and stop remaining phrases without replay or provider fallback.
+- The Studio diagnostic WAV picker is explicit, local, and separate from live
+  microphone capture. A selected clip goes through the normal LLM/TTS path but
+  bypasses microphone/VAD admission; do not label it a physical microphone test.

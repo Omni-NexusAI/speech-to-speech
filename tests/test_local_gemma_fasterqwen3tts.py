@@ -12,13 +12,15 @@ from speech_to_speech.pipeline.messages import TTSInput
 from speech_to_speech.TTS.qwen3_tts_handler import Qwen3TTSHandler
 
 
-def _write_base_profile(library: Path, profile_id: str, name: str, task_type: str = "Base") -> None:
-    profile_dir = library / "profiles" / profile_id
-    profile_dir.mkdir(parents=True)
-    (profile_dir / "meta.json").write_text(
-        json.dumps({"profile_id": profile_id, "name": name, "task_type": task_type}),
-        encoding="utf-8",
-    )
+def _completed_candidate_outcome(request_id: str):
+    class OutcomeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"requestId": request_id, "state": "completed", "eos": True}
+
+    return OutcomeResponse()
 
 
 def test_local_realtime_config_disables_compaction_for_chat_completions_backend():
@@ -30,10 +32,9 @@ def test_local_realtime_config_disables_compaction_for_chat_completions_backend(
     assert config["responses_api_compact_history"] is False
     assert config["responses_api_stream"] is True
     assert config["stream_batch_sentences"] == 1
-    assert config["qwen3_tts_api_voice"] is None
 
 
-def test_setup_openai_api_backend_skips_in_process_model_loading(monkeypatch, tmp_path):
+def test_setup_openai_api_backend_skips_in_process_model_loading(monkeypatch):
     def _setup_mlx(self, *args, **kwargs):
         raise AssertionError("openai-api should not use mlx")
 
@@ -44,15 +45,14 @@ def test_setup_openai_api_backend_skips_in_process_model_loading(monkeypatch, tm
     monkeypatch.setattr(Qwen3TTSHandler, "_setup_mlx", _setup_mlx)
     monkeypatch.setattr(Qwen3TTSHandler, "_setup_faster", _setup_faster)
     monkeypatch.setattr(Qwen3TTSHandler, "_ensure_openai_api_backend_model", lambda self: None)
-    monkeypatch.setenv("VOICE_LIBRARY_DIR", str(tmp_path))
 
     handler = object.__new__(Qwen3TTSHandler)
-    handler.setup(Event(), backend="openai-api", api_voice="clone:explicit-voice")
+    handler.setup(Event(), backend="openai-api")
 
     assert handler.backend == "openai_api"
     assert handler.device == "remote"
     assert handler.api_base_url == "http://127.0.0.1:8881/v1"
-    assert handler.api_voice == "clone:explicit-voice"
+    assert handler.api_voice == "clone:16d9bb336799"
     assert handler.api_fallback_voice is None
     assert handler.api_backend_model == "1.7B-Base"
     assert handler._audio_cpp_native_warm_streams == set()
@@ -60,63 +60,53 @@ def test_setup_openai_api_backend_skips_in_process_model_loading(monkeypatch, tm
     assert not hasattr(handler, "model")
 
 
+def test_audio_cpp_lifecycle_cache_fails_closed_after_legacy_status():
+    handler = object.__new__(Qwen3TTSHandler)
+    handler._audio_cpp_native_lifecycle_epochs = {}
+    handler._audio_cpp_native_lifecycle_instances = {}
+    handler._audio_cpp_native_warm_streams = set()
+    endpoint = "http://127.0.0.1:8890/v1"
+    model = "qwen3-tts-1.7b-base-bf16"
+    base_key = (endpoint, model)
+
+    handler._observe_audio_cpp_native_lifecycle_epoch(
+        endpoint,
+        model,
+        {"engineEpoch": 7, "supervisorInstanceId": "a" * 32},
+    )
+    warm_key = handler._audio_cpp_native_stream_key(endpoint, model)
+    handler._audio_cpp_native_warm_streams.add(warm_key)
+    assert handler._audio_cpp_native_lifecycle_epochs[base_key] == "7"
+    assert handler._audio_cpp_native_lifecycle_instances[base_key] == "a" * 32
+
+    # The same long-lived handler later observes a downgraded/restarting
+    # supervisor that has only legacy event metadata. It must not retain and
+    # forward the previously cached canonical identity.
+    handler._observe_audio_cpp_native_lifecycle_epoch(
+        endpoint,
+        model,
+        {"events": [{"action": "supervisor-started", "at": "legacy"}]},
+    )
+
+    assert base_key not in handler._audio_cpp_native_lifecycle_epochs
+    assert base_key not in handler._audio_cpp_native_lifecycle_instances
+    assert not any(key[:2] == base_key for key in handler._audio_cpp_native_warm_streams)
+
+
 def test_openai_api_payload_uses_streaming_pcm_and_clone_voice():
     handler = object.__new__(Qwen3TTSHandler)
     handler.api_model = "qwen3-tts"
 
-    payload = handler._openai_api_payload("hello", "clone:alpha-base-0001")
+    payload = handler._openai_api_payload("hello", "clone:16d9bb336799")
 
     assert payload == {
         "model": "qwen3-tts",
         "input": "hello",
-        "voice": "clone:alpha-base-0001",
+        "voice": "clone:16d9bb336799",
         "response_format": "pcm",
         "stream": True,
         "language": "Auto",
     }
-
-
-def test_openai_api_voice_library_uses_portable_default_and_env_override(monkeypatch, tmp_path):
-    handler = object.__new__(Qwen3TTSHandler)
-    monkeypatch.delenv("VOICE_LIBRARY_DIR", raising=False)
-
-    expected = Path.home() / ".speech-to-speech" / "qwen3-tts-voices"
-    assert qwen3_tts_module.DEFAULT_OPENAI_API_VOICE_LIBRARY_DIR == expected
-    assert handler._resolve_api_voice_library_dir(None) == expected
-    assert expected.relative_to(Path.home()) == Path(".speech-to-speech/qwen3-tts-voices")
-
-    override = tmp_path / "shared-voices"
-    monkeypatch.setenv("VOICE_LIBRARY_DIR", str(override))
-    assert handler._resolve_api_voice_library_dir(None) == override
-
-    configured = tmp_path / "configured-voices"
-    assert handler._resolve_api_voice_library_dir(str(configured)) == configured
-
-
-def test_openai_api_voice_uses_valid_selection_then_first_live_base_or_none(tmp_path):
-    _write_base_profile(tmp_path, "beta-base-0002", "Beta Voice")
-    _write_base_profile(tmp_path, "alpha-base-0001", "Alpha Voice")
-    _write_base_profile(tmp_path, "custom-voice-01", "Custom Voice", "CustomVoice")
-    handler = object.__new__(Qwen3TTSHandler)
-    handler.api_voice_library_dir = tmp_path
-    handler.api_voice = None
-
-    (tmp_path / "selected_profile.json").write_text(
-        json.dumps({"profile_id": "beta-base-0002"}), encoding="utf-8"
-    )
-    assert handler._resolve_api_voice(None, None) == "clone:beta-base-0002"
-
-    (tmp_path / "selected_profile.json").write_text(
-        json.dumps({"profile_id": "stale-base-0099"}), encoding="utf-8"
-    )
-    assert handler._resolve_api_voice(None, None) == "clone:alpha-base-0001"
-
-    empty = object.__new__(Qwen3TTSHandler)
-    empty.api_voice_library_dir = tmp_path / "empty"
-    empty.api_voice = None
-    assert empty._resolve_api_voice(None, None) is None
-    with pytest.raises(RuntimeError, match="No live Base clone profile"):
-        empty._require_api_voice(None)
 
 
 def test_process_openai_api_uses_session_voice_and_yields_audio(monkeypatch):
@@ -125,7 +115,7 @@ def test_process_openai_api_uses_session_voice_and_yields_audio(monkeypatch):
     handler.cancel_scope = None
     handler.speculative_turns = None
     handler.backend = "openai_api"
-    handler.api_voice = "clone:alpha-base-0001"
+    handler.api_voice = "clone:16d9bb336799"
     handler.api_fallback_voice = None
     handler.blocksize = 512
     handler.queue_in = Queue()
@@ -165,9 +155,6 @@ def test_process_openai_api_uses_session_voice_and_yields_audio(monkeypatch):
     }
     done = next(kwargs for stage, status, kwargs in metrics if stage == "tts" and status == "done")
     assert "reference_pairing" not in done["detail"]
-    assert done["detail"]["requested_language"] == "Auto"
-    assert done["detail"]["effective_language"] is None
-    assert done["detail"]["language_auto_supported"] is False
     assert handler._last_tts_response_headers == {}
 
 
@@ -206,6 +193,16 @@ def test_process_audio_cpp_native_propagates_profile_and_latency_metrics(monkeyp
         "qwen3-tts-1.7b-base-bf16",
     )
     handler._resolve_api_voice = lambda _runtime, _response: "clone:candidate"
+    handler._audio_cpp_native_lifecycle_epochs = {
+        ("http://127.0.0.1:8890/v1", "qwen3-tts-1.7b-base-bf16"): "9",
+    }
+    handler._audio_cpp_native_lifecycle_instances = {
+        ("http://127.0.0.1:8890/v1", "qwen3-tts-1.7b-base-bf16"): "a" * 32,
+    }
+    # This metric-only handler test has no candidate profile service. Clone
+    # immutability is covered independently, so keep this transport assertion
+    # isolated from live profile I/O.
+    monkeypatch.setattr(handler, "_freeze_candidate_clone", lambda *_args: None)
     handler._emit_metric = lambda stage, status, *_args, **kwargs: metrics.append(
         (stage, status, kwargs)
     )
@@ -216,8 +213,24 @@ def test_process_audio_cpp_native_propagates_profile_and_latency_metrics(monkeyp
         tts_tuning={
             "provider": "qwen3tts-audiocpp",
             "profile_id": "low-latency",
+            "profile_revision": 1,
+            "delivery_mode": "native_incremental_pcm",
             "overrides": {"top_k": 32},
-            "resolved": {"text_lookahead": 32, "phrase_flush_ms": 250},
+            "effective": {
+                "model": "qwen3-tts-1.7b-base-bf16",
+                "clone_mode": "full_icl",
+                "max_reference_seconds": 20,
+                "first_block_frames": 4,
+                "steady_block_frames": 12,
+                "left_context_frames": 25,
+                "text_lookahead": 32,
+                "phrase_flush_ms": 250,
+                "temperature": 0.7,
+                "top_k": 32,
+                "top_p": 0.9,
+                "repetition_penalty": 1.05,
+                "seed": None,
+            },
         },
     )
 
@@ -239,10 +252,12 @@ def test_process_audio_cpp_native_propagates_profile_and_latency_metrics(monkeyp
     assert captured["native_candidate"] is True
     assert captured["progressive_buffered"] is False
     assert captured["tts_tuning"]["profile_id"] == "low-latency"
-    assert captured["tts_tuning"]["resolved"] == {
-        "text_lookahead": 32,
-        "phrase_flush_ms": 250,
-    }
+    assert captured["tts_tuning"]["provider"] == "qwen3tts-audiocpp"
+    assert captured["tts_tuning"]["overrides"]["top_k"] == 32
+    assert 0 <= captured["tts_tuning"]["overrides"]["seed"] <= 0xFFFFFFFF
+    assert captured["tts_tuning"]["effective"]["model"] == "qwen3-tts-1.7b-base-bf16"
+    assert captured["tts_tuning"]["effective"]["top_k"] == 32
+    assert "resolved" not in captured["tts_tuning"]
     first_phrase = next(
         kwargs for stage, status, kwargs in metrics
         if stage == "gemma" and status == "first_stable_phrase"
@@ -253,19 +268,12 @@ def test_process_audio_cpp_native_propagates_profile_and_latency_metrics(monkeyp
     )
     assert first_phrase["elapsed_ms"] >= 200
     assert request_start["elapsed_ms"] >= first_phrase["elapsed_ms"]
-    assert request_start["detail"]["requested_language"] == "Auto"
-    assert request_start["detail"]["effective_language"] == "Auto"
-    assert request_start["detail"]["language_auto_supported"] is True
     first_pcm = next(kwargs for stage, status, kwargs in metrics if stage == "tts" and status == "first_audio")
     assert first_pcm["detail"]["mode"] == "native_incremental_pcm"
     assert first_pcm["detail"]["first_pcm_ms"] >= 0
     assert first_pcm["detail"]["end_to_end_ms"] >= request_start["elapsed_ms"]
-    assert first_pcm["detail"]["language_auto_supported"] is True
     done = next(kwargs for stage, status, kwargs in metrics if stage == "tts" and status == "done")
     assert done["detail"]["rtf"] is not None
-    assert done["detail"]["requested_language"] == "Auto"
-    assert done["detail"]["effective_language"] == "Auto"
-    assert done["detail"]["language_auto_supported"] is True
     expected_reference = {
         "reference_source_seconds": 18.125,
         "reference_requested_limit_seconds": 12.0,
@@ -306,78 +314,10 @@ def test_openai_api_payload_preserves_explicit_multilingual_language():
     handler = object.__new__(Qwen3TTSHandler)
     handler.api_model = "qwen3-tts"
 
-    payload = handler._openai_api_payload("Guten Tag", "clone:alpha-base-0001", "German")
+    payload = handler._openai_api_payload("Guten Tag", "clone:16d9bb336799", "German")
 
     assert payload["input"] == "Guten Tag"
     assert payload["language"] == "German"
-
-
-def test_explicit_auto_language_is_not_replaced_by_script_detection():
-    text = "はい, I can help con eso."
-
-    assert Qwen3TTSHandler._api_language_name("Auto", text) == "Auto"
-
-
-@pytest.mark.parametrize(
-    ("provider", "supported"),
-    [
-        ("qwen3tts-audiocpp", True),
-        ("faster", False),
-        ("groxaxo", False),
-    ],
-)
-def test_provider_auto_language_support_is_reported_truthfully(provider, supported):
-    assert Qwen3TTSHandler._provider_auto_language_supported(provider) is supported
-
-
-def test_faster_adapter_patch_preserves_auto_instead_of_clone_reference_language():
-    patch = (
-        Path(__file__).resolve().parents[1]
-        / "integrations"
-        / "qwen3-tts-faster-language.patch"
-    ).read_text(encoding="utf-8")
-
-    assert patch.count('clone_language = req.language or "Auto"') == 2
-    assert 'else profile["language"]' not in patch
-
-
-def test_same_turn_tool_continuation_uses_saved_auto_language_and_clone_voice(monkeypatch):
-    handler = object.__new__(Qwen3TTSHandler)
-    handler.should_listen = Event()
-    handler.cancel_scope = None
-    handler.speculative_turns = None
-    handler.backend = "openai_api"
-    handler.api_voice = "clone:alpha-base-0001"
-    handler.api_fallback_voice = None
-    handler.blocksize = 512
-    handler.queue_in = Queue()
-    handler._last_tts_response_headers = {}
-    captured = {}
-
-    def _process_openai_api(text, voice, **kwargs):
-        captured.update(text=text, voice=voice, **kwargs)
-        yield np.zeros(512, dtype=np.int16)
-
-    handler._process_openai_api = _process_openai_api
-    handler._resolve_api_provider = lambda _runtime: (
-        "qwen3tts-audiocpp",
-        "http://127.0.0.1:8890/v1",
-        "qwen3-tts-1.7b-base-bf16",
-    )
-    handler._emit_metric = lambda *_args, **_kwargs: None
-    monkeypatch.setattr(qwen3_tts_module.console, "print", lambda *args, **kwargs: None)
-    runtime_config = RuntimeConfig()
-    runtime_config.session.audio.output.voice = "clone:code-switch"
-    runtime_config.local_pipeline.update(
-        tts_backend="qwen3tts-audiocpp",
-        assistant_language="Auto",
-    )
-
-    outputs = list(handler.process(TTSInput(text="Sí, it is ready.", runtime_config=runtime_config)))
-
-    assert len(outputs) == 1
-    assert captured["voice"] == "clone:code-switch"
-    assert captured["language"] == "Auto"
 
 
 def test_audio_cpp_buffered_payload_preserves_clone_and_disables_http_streaming():
@@ -411,7 +351,7 @@ def test_audio_cpp_buffered_payload_uses_resident_provider_model():
 
 def test_audio_cpp_does_not_retry_faster_fallback(monkeypatch):
     handler = object.__new__(Qwen3TTSHandler)
-    handler.api_fallback_voice = "clone:alpha-base-0001"
+    handler.api_fallback_voice = "clone:16d9bb336799"
     handler._api_voice_for_backend = lambda value: value
     calls = []
 
@@ -442,6 +382,8 @@ def test_audio_cpp_buffered_phrase_uses_cancellable_offline_timeout(monkeypatch)
     seen = {}
 
     class Response:
+        response_headers = {"x-tts-request-id": "a" * 32}
+
         def wait_for_headers(self):
             return None
 
@@ -457,6 +399,7 @@ def test_audio_cpp_buffered_phrase_uses_cancellable_offline_timeout(monkeypatch)
         return Response()
 
     monkeypatch.setattr(qwen3_tts_module, "CancellableAsyncByteStream", create_response)
+    monkeypatch.setattr(qwen3_tts_module.httpx, "get", lambda *_args, **_kwargs: _completed_candidate_outcome("a" * 32))
     chunks = list(handler._stream_openai_api_voice("short", "clone:22fb07ef3a80", progressive_buffered=True))
 
     assert chunks
@@ -477,6 +420,8 @@ def test_audio_cpp_native_capability_selects_incremental_pcm(monkeypatch):
 
         def json(self):
             return {
+                "engineEpoch": 9,
+                "supervisorInstanceId": "a" * 32,
                 "state": "loaded",
                 "current": "qwen3-tts-1.7b-base-bf16",
                 "loaded_models": ["qwen3-tts-1.7b-base-bf16"],
@@ -499,6 +444,72 @@ def test_audio_cpp_native_capability_selects_incremental_pcm(monkeypatch):
     assert handler.api_streaming_supported is True
     assert handler.api_candidate_streaming_mode == "native_incremental_pcm"
     assert handler.api_response_format == "pcm"
+    assert handler._audio_cpp_native_stream_key(
+        "http://127.0.0.1:8890/v1", "qwen3-tts-1.7b-base-bf16"
+    )[2] == f"{'a' * 32}:9"
+
+
+def test_audio_cpp_candidate_without_supervisor_instance_id_fails_closed(monkeypatch):
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.audio_cpp_api_base_url = "http://127.0.0.1:8890/v1"
+    handler._openai_api_headers = lambda: {}
+    runtime_config = RuntimeConfig()
+    runtime_config.local_pipeline["tts_backend"] = "qwen3tts-audiocpp"
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "engineEpoch": 1,
+                "state": "loaded",
+                "current": "qwen3-tts-1.7b-base-bf16",
+                "loaded_models": ["qwen3-tts-1.7b-base-bf16"],
+                "runtime": {"native_incremental_pcm": True, "progressive_phrase_pcm": True},
+            }
+
+    monkeypatch.setattr(qwen3_tts_module.httpx, "get", lambda *_args, **_kwargs: Response())
+    with pytest.raises(RuntimeError, match="supervisor lifecycle identity"):
+        handler._resolve_api_provider(runtime_config)
+
+
+def test_audio_cpp_candidate_legacy_event_lifecycle_fails_closed(monkeypatch):
+    """Event history cannot replace the canonical integer per-request guard."""
+
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.audio_cpp_api_base_url = "http://127.0.0.1:8890/v1"
+    handler._openai_api_headers = lambda: {}
+    runtime_config = RuntimeConfig()
+    runtime_config.local_pipeline["tts_backend"] = "qwen3tts-audiocpp"
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "supervisorInstanceId": "b" * 32,
+                "state": "loaded",
+                "current": "qwen3-tts-1.7b-base-bf16",
+                "loaded_models": ["qwen3-tts-1.7b-base-bf16"],
+                "events": [
+                    {"action": "supervisor-started", "at": "legacy"},
+                    {
+                        "action": "model-ready",
+                        "model": "qwen3-tts-1.7b-base-bf16",
+                    },
+                ],
+                "runtime": {
+                    "native_incremental_pcm": True,
+                    "progressive_phrase_pcm": True,
+                },
+            }
+
+    monkeypatch.setattr(qwen3_tts_module.httpx, "get", lambda *_args, **_kwargs: Response())
+
+    with pytest.raises(RuntimeError, match="supervisor lifecycle identity"):
+        handler._resolve_api_provider(runtime_config)
 
 
 def test_audio_cpp_native_cold_budget_becomes_normal_after_pcm_per_model(monkeypatch):
@@ -511,15 +522,21 @@ def test_audio_cpp_native_cold_budget_becomes_normal_after_pcm_per_model(monkeyp
     handler._active_response_lock = qwen3_tts_module.Lock()
     handler._active_response = None
     handler._audio_cpp_native_warm_streams = set()
+    handler._openai_api_headers = lambda: {}
     observed_budgets = []
 
     class Response:
-        response_headers = {"x-tts-streaming-mode": "native-incremental-pcm"}
+        response_headers = {
+            "x-tts-streaming-mode": "native-incremental-pcm",
+            "x-tts-native-engine-chunk-proof": "two-distinct-sse-delta-events",
+            "x-tts-request-id": "b" * 32,
+        }
 
         def wait_for_headers(self):
             return None
 
         def iter_bytes(self):
+            yield b"\x00\x00" * 512
             yield b"\x00\x00" * 512
 
         def close(self):
@@ -530,6 +547,7 @@ def test_audio_cpp_native_cold_budget_becomes_normal_after_pcm_per_model(monkeyp
         return Response()
 
     monkeypatch.setattr(qwen3_tts_module, "CancellableAsyncByteStream", create_response)
+    monkeypatch.setattr(qwen3_tts_module.httpx, "get", lambda *_args, **_kwargs: _completed_candidate_outcome("b" * 32))
     candidate_url = "http://127.0.0.1:8890/v1"
 
     first = list(
@@ -578,10 +596,15 @@ def test_audio_cpp_native_pcm_is_yielded_before_provider_stream_finishes(monkeyp
     handler._active_response_lock = qwen3_tts_module.Lock()
     handler._active_response = None
     handler._audio_cpp_native_warm_streams = set()
+    handler._openai_api_headers = lambda: {}
     provider_progress = []
 
     class Response:
-        response_headers = {"x-tts-streaming-mode": "native-incremental-pcm"}
+        response_headers = {
+            "x-tts-streaming-mode": "native-incremental-pcm",
+            "x-tts-native-engine-chunk-proof": "two-distinct-sse-delta-events",
+            "x-tts-request-id": "c" * 32,
+        }
 
         def wait_for_headers(self):
             return None
@@ -601,6 +624,7 @@ def test_audio_cpp_native_pcm_is_yielded_before_provider_stream_finishes(monkeyp
         "CancellableAsyncByteStream",
         lambda *_args, **_kwargs: Response(),
     )
+    monkeypatch.setattr(qwen3_tts_module.httpx, "get", lambda *_args, **_kwargs: _completed_candidate_outcome("c" * 32))
 
     stream = handler._stream_openai_api_voice(
         "The provider is still generating this phrase.",
@@ -611,11 +635,68 @@ def test_audio_cpp_native_pcm_is_yielded_before_provider_stream_finishes(monkeyp
     )
 
     first = next(stream)
+    # Engine incrementality was proven by the supervisor before headers. The
+    # first downstream HTTP read is delivered immediately; its byte boundary
+    # is not confused with an engine speech.audio.delta boundary.
     assert first.size == 512
     assert provider_progress == ["first"]
     remaining = list(stream)
     assert remaining
     assert provider_progress == ["first", "second", "complete", "closed"]
+    assert np.concatenate([first, *remaining]).size == 1536
+
+
+@pytest.mark.parametrize(
+    ("headers", "chunks", "message"),
+    [
+        ({}, [b"\x00\x00" * 16, b"\x00\x00" * 16], "did not prove"),
+        (
+            {"x-tts-streaming-mode": "native-incremental-pcm"},
+            [b"\x00\x00" * 16],
+            "did not prove two engine-owned",
+        ),
+    ],
+)
+def test_audio_cpp_native_pcm_requires_supervisor_engine_chunk_proof(monkeypatch, headers, chunks, message):
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.api_base_url = "http://127.0.0.1:8881/v1"
+    handler.api_response_format = "pcm"
+    handler.api_sample_rate = 24000
+    handler.blocksize = 512
+    handler.cancel_scope = None
+    handler._active_response_lock = qwen3_tts_module.Lock()
+    handler._active_response = None
+    handler._audio_cpp_native_warm_streams = set()
+
+    class Response:
+        response_headers = headers
+
+        def wait_for_headers(self):
+            return None
+
+        def iter_bytes(self):
+            yield from chunks
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        qwen3_tts_module,
+        "CancellableAsyncByteStream",
+        lambda *_args, **_kwargs: Response(),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        list(
+            handler._stream_openai_api_voice(
+                "proof gate",
+                "clone:candidate",
+                base_url="http://127.0.0.1:8890/v1",
+                model="qwen3-tts-0.6b-base-bf16",
+                native_candidate=True,
+            )
+        )
+    assert handler._audio_cpp_native_warm_streams == set()
 
 
 def test_audio_cpp_same_model_reload_lifecycle_becomes_cold_again(monkeypatch):
@@ -630,11 +711,14 @@ def test_audio_cpp_same_model_reload_lifecycle_becomes_cold_again(monkeypatch):
     handler._active_response = None
     handler._audio_cpp_native_warm_streams = set()
     handler._audio_cpp_native_lifecycle_epochs = {}
+    handler._audio_cpp_native_lifecycle_instances = {}
     handler._openai_api_headers = lambda: {}
     runtime_config = RuntimeConfig()
     runtime_config.local_pipeline["tts_backend"] = "qwen3tts-audiocpp"
     model = "qwen3-tts-0.6b-base-bf16"
     lifecycle_at = {"value": "2026-08-04T16:00:00Z"}
+    lifecycle_epoch = {"value": 1}
+    lifecycle_instance = {"value": "a" * 32}
     observed_budgets = []
 
     class StatusResponse:
@@ -644,6 +728,8 @@ def test_audio_cpp_same_model_reload_lifecycle_becomes_cold_again(monkeypatch):
         def json(self):
             at = lifecycle_at["value"]
             return {
+                "engineEpoch": lifecycle_epoch["value"],
+                "supervisorInstanceId": lifecycle_instance["value"],
                 "state": "loaded",
                 "current": model,
                 "loaded_models": [model],
@@ -660,12 +746,17 @@ def test_audio_cpp_same_model_reload_lifecycle_becomes_cold_again(monkeypatch):
             }
 
     class StreamResponse:
-        response_headers = {"x-tts-streaming-mode": "native-incremental-pcm"}
+        response_headers = {
+            "x-tts-streaming-mode": "native-incremental-pcm",
+            "x-tts-native-engine-chunk-proof": "two-distinct-sse-delta-events",
+            "x-tts-request-id": "d" * 32,
+        }
 
         def wait_for_headers(self):
             return None
 
         def iter_bytes(self):
+            yield b"\x00\x00" * 512
             yield b"\x00\x00" * 512
 
         def close(self):
@@ -675,7 +766,12 @@ def test_audio_cpp_same_model_reload_lifecycle_becomes_cold_again(monkeypatch):
         observed_budgets.append(kwargs["timeout"].read)
         return StreamResponse()
 
-    monkeypatch.setattr(qwen3_tts_module.httpx, "get", lambda *_args, **_kwargs: StatusResponse())
+    def get_response(url, *_args, **_kwargs):
+        if "/audio/outcomes/" in url:
+            return _completed_candidate_outcome("d" * 32)
+        return StatusResponse()
+
+    monkeypatch.setattr(qwen3_tts_module.httpx, "get", get_response)
     monkeypatch.setattr(qwen3_tts_module, "CancellableAsyncByteStream", create_stream)
 
     assert handler._resolve_api_provider(runtime_config)[2] == model
@@ -699,6 +795,7 @@ def test_audio_cpp_same_model_reload_lifecycle_becomes_cold_again(monkeypatch):
     )
 
     lifecycle_at["value"] = "2026-08-04T16:01:00Z"
+    lifecycle_epoch["value"] = 2
     assert handler._resolve_api_provider(runtime_config)[2] == model
     assert list(
         handler._stream_openai_api_voice(
@@ -805,7 +902,7 @@ def test_audio_cpp_native_cancellation_does_not_warm_or_replay_buffered(monkeypa
     assert handler._audio_cpp_native_warm_streams == set()
 
 
-def test_audio_cpp_native_request_falls_back_only_before_first_pcm_chunk():
+def test_audio_cpp_native_failure_requires_explicit_buffered_mode_selection():
     handler = object.__new__(Qwen3TTSHandler)
     handler.api_fallback_voice = "clone:faster-must-not-run"
     calls = []
@@ -819,28 +916,26 @@ def test_audio_cpp_native_request_falls_back_only_before_first_pcm_chunk():
                 kwargs.get("native_candidate", False),
             )
         )
-        if not kwargs["progressive_buffered"]:
-            raise RuntimeError("native experiment unavailable")
-        yield np.zeros(512, dtype=np.int16)
+        raise RuntimeError("native experiment unavailable")
+        yield  # pragma: no cover - keep this helper a generator
 
     handler._stream_openai_api_voice = stream
     tuning = {"provider": "qwen3tts-audiocpp", "profile_id": "balanced", "overrides": {}}
 
-    chunks = list(
-        handler._process_openai_api(
-            "hello",
-            "clone:candidate-only",
-            native_candidate=True,
-            tts_tuning=tuning,
+    with pytest.raises(RuntimeError, match="native experiment unavailable"):
+        list(
+            handler._process_openai_api(
+                "hello",
+                "clone:candidate-only",
+                native_candidate=True,
+                tts_tuning=tuning,
+            )
         )
-    )
 
-    assert len(chunks) == 1
     assert calls == [
         ("clone:candidate-only", False, tuning, True),
-        ("clone:candidate-only", True, tuning, False),
     ]
-    assert handler._last_streaming_mode == "buffered_fallback"
+    assert handler._last_streaming_mode == "native_failed"
 
 
 def test_audio_cpp_native_request_never_replays_buffered_after_emitting_pcm():
@@ -859,6 +954,59 @@ def test_audio_cpp_native_request_never_replays_buffered_after_emitting_pcm():
         list(handler._process_openai_api("hello", "clone:candidate", native_candidate=True))
 
     assert calls == [False]
+
+
+def test_phrase_failure_suppresses_later_phrases_from_the_same_response(monkeypatch):
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.should_listen = Event()
+    handler.cancel_scope = None
+    handler.speculative_turns = None
+    handler.backend = "openai_api"
+    handler.api_voice = "clone:test"
+    handler.api_fallback_voice = None
+    handler.blocksize = 512
+    handler.queue_in = Queue()
+    calls = []
+    metrics = []
+
+    def fail_phrase(text, _voice, **_kwargs):
+        calls.append(text)
+        raise RuntimeError("provider stream failed")
+        yield  # pragma: no cover - keep this helper a generator
+
+    handler._process_openai_api = fail_phrase
+    handler._resolve_api_provider = lambda _runtime: (
+        "faster",
+        "http://127.0.0.1:8881/v1",
+        "1.7B-Base",
+    )
+    handler._resolve_api_voice = lambda _runtime, _response: "clone:test"
+    handler._emit_metric = lambda stage, status, *_args, **kwargs: metrics.append(
+        (stage, status, kwargs)
+    )
+    monkeypatch.setattr(handler, "_model_type", lambda: "base")
+    runtime_config = RuntimeConfig()
+
+    first = TTSInput(
+        text="First phrase.",
+        runtime_config=runtime_config,
+        turn_id="turn-failed-tts",
+        turn_revision=1,
+    )
+    second = TTSInput(
+        text="Second phrase must not play.",
+        runtime_config=runtime_config,
+        turn_id="turn-failed-tts",
+        turn_revision=1,
+    )
+
+    assert list(handler.process(first)) == []
+    assert list(handler.process(second)) == []
+    assert calls == ["First phrase."]
+    assert any(
+        stage == "tts" and status == "suppressed_after_failure"
+        for stage, status, _kwargs in metrics
+    )
 
 
 def test_audio_cpp_cancelled_before_first_phrase_is_not_reported_done(monkeypatch):
@@ -1017,7 +1165,7 @@ def test_streaming_tts_runaway_is_aborted_and_closed(monkeypatch):
     monkeypatch.setattr(qwen3_tts_module, "CancellableAsyncByteStream", lambda *_args, **_kwargs: response)
 
     with pytest.raises(qwen3_tts_module.TTSRunawayError):
-        list(handler._stream_openai_api_voice("short reply", "clone:alpha-base-0001"))
+        list(handler._stream_openai_api_voice("short reply", "clone:16d9bb336799"))
 
     assert response.closed is True
 
@@ -1188,14 +1336,14 @@ def test_ensure_openai_api_backend_model_uses_fixed_faster_pcm_streaming_when_ad
 
 
 def test_api_voice_for_backend_maps_clone_id_to_profile_name(tmp_path):
-    profile_dir = tmp_path / "profiles" / "alpha-base-0001"
+    profile_dir = tmp_path / "profiles" / "16d9bb336799"
     profile_dir.mkdir(parents=True)
     (profile_dir / "meta.json").write_text(
-        json.dumps({"profile_id": "alpha-base-0001", "name": "Alpha Voice", "task_type": "Base"}),
+        json.dumps({"profile_id": "16d9bb336799", "name": "J.A.R.V.I.S", "task_type": "Base"}),
         encoding="utf-8",
     )
     handler = object.__new__(Qwen3TTSHandler)
     handler.api_voice_library_dir = tmp_path
 
-    assert handler._api_voice_for_backend("clone:alpha-base-0001") == "clone:Alpha Voice"
+    assert handler._api_voice_for_backend("clone:16d9bb336799") == "clone:J.A.R.V.I.S"
     assert handler._api_voice_for_backend("clone:missing") == "clone:missing"

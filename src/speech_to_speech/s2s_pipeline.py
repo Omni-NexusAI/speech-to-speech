@@ -52,6 +52,7 @@ from speech_to_speech.arguments_classes.websocket_streamer_arguments import WebS
 from speech_to_speech.arguments_classes.whisper_stt_arguments import WhisperSTTHandlerArguments
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.LLM.chat import Chat
+from speech_to_speech.LLM.direct_history_compaction import normalize_history_compaction
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.handler_types import LLMIn, LLMOut, STTIn, STTOut, TTSIn, TTSOut
 from speech_to_speech.pipeline.model_operations import ModelOperationCoordinator
@@ -91,7 +92,7 @@ logging.getLogger("numba").setLevel(logging.WARNING)  # quiet down numba logs
 
 
 ECHO_GUARD_RUNTIME_DESCRIPTOR = {
-    "default": "adaptive",
+    "default": "native",
     "modes": ["native", "adaptive", "strict"],
     "reference": "post_gain_resampled_scheduled_playback_pcm",
     "ownership": "client",
@@ -99,13 +100,43 @@ ECHO_GUARD_RUNTIME_DESCRIPTOR = {
         "implementation": "sonora_aec3_wasm",
         "activation": "validated_module_only",
         "availability": "client_reported",
-        "calibration": "per_opaque_microphone_output_route_fingerprint",
+        "calibration": "per_microphone_output_device_pair",
         "failure_mode": "native",
     },
     "strict": {
         "failure_mode": "fail_closed",
     },
 }
+
+
+def _idle_pool_context_descriptor(
+    *,
+    stt: str,
+    chat_size: int,
+    context_window: int | None,
+    compact_history: bool,
+) -> dict[str, Any]:
+    """Describe configured context policy before a pooled conversation has usage."""
+    if stt != "gemma-audio":
+        # Preserve the existing non-direct descriptor and its upstream turn cap.
+        return {
+            "limit": chat_size,
+            "turn_limit": chat_size,
+            "history_tokens": 0,
+            "max_tokens": context_window,
+            "compact_history": compact_history,
+            "policy": "compact" if compact_history else "visible_trim",
+        }
+    default_policy = RuntimeConfig().local_pipeline.get("history_compaction")
+    policy = normalize_history_compaction(default_policy)
+    return {
+        "history_tokens": None,
+        "max_tokens": context_window,
+        "history_compaction": {
+            "policy": policy,
+            "status": {"status": "idle", "last_failure": None},
+        },
+    }
 
 
 @dataclass
@@ -574,6 +605,8 @@ def _build_realtime_pipeline_unit(
         ),
         default_model_name=gemma_audio_kw.model_name,
         default_model_api_key=gemma_audio_kw.api_key,
+        model_operations=model_operations,
+        direct_audio_session=module_kwargs.stt == "gemma-audio",
     )
 
     if module_kwargs.enable_live_transcription or module_kwargs.stt == "gemma-audio":
@@ -739,14 +772,12 @@ def build_pipeline(
                     "horizon_policy": "fixed_first_soft_endpoint",
                 },
                 "echo_guard": deepcopy(ECHO_GUARD_RUNTIME_DESCRIPTOR),
-                "context": {
-                    "limit": runtime_lm_kwargs.chat_size,
-                    "turn_limit": runtime_lm_kwargs.chat_size,
-                    "history_tokens": 0,
-                    "max_tokens": pool[0].service.default_model_endpoint.context_window,
-                    "compact_history": runtime_lm_kwargs.compact_history,
-                    "policy": "visible_trim" if not runtime_lm_kwargs.compact_history else "compact",
-                },
+                "context": _idle_pool_context_descriptor(
+                    stt=module_kwargs.stt,
+                    chat_size=runtime_lm_kwargs.chat_size,
+                    context_window=pool[0].service.default_model_endpoint.context_window,
+                    compact_history=runtime_lm_kwargs.compact_history,
+                ),
             },
         )
 

@@ -43,11 +43,12 @@ class SessionHandler(RealtimeBaseHandler):
             logger.info(f"Session model set to: {model}")
 
         cfg = self._state(conn_id).runtime_config
-        current = cfg.session
-        if current is None:
-            cfg.session = s
-        else:
-            cfg.apply_session_update(s)
+        with cfg.history_maintenance_lock:
+            current = cfg.session
+            if current is None:
+                cfg.session = s
+            else:
+                cfg.apply_session_update(s)
         logger.info("Session configuration updated")
         return SessionUpdatedEvent(
             type="session.updated",

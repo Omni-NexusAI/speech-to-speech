@@ -1,9 +1,9 @@
 // @ts-check
 
-import { AEC3_ABI_VERSION } from "./aec3-abi.js?v=3-opaque-echo-route";
+import { AEC3_ABI_VERSION } from "./aec3-abi.js";
 
 const DEFAULT_MANIFEST_URL = new URL("./aec3.manifest.json", import.meta.url);
-const PROCESSOR_URL = new URL("./aec3-capture.js?v=8-stateful-polyphase", import.meta.url);
+const PROCESSOR_URL = new URL("./aec3-capture.js", import.meta.url);
 
 function hex(bytes) {
   return [...new Uint8Array(bytes)].map((value) => value.toString(16).padStart(2, "0")).join("");

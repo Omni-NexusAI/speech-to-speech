@@ -6,102 +6,94 @@
 
 ## Local Contracts
 
-- Published scripts must accept workstation-specific executable and model paths
-  through parameters or environment variables; do not commit local path defaults.
+- Scripts may encode machine-local paths when they are explicitly for this Windows test setup.
 - Do not commit API keys; read local secrets from environment variables or optional script parameters.
-- `launch_gemma_4_12b_16k.ps1` reserves a 2560 MiB llama.cpp fit margin so an
-  already-resident isolated audio.cpp TTS candidate retains synthesis headroom.
-  It requires llama.cpp, main-model, draft-model, and mmproj paths through its
-  four path parameters or the corresponding environment variables.
-- Use `start_hf_realtime_frontend.ps1` for the local HF Realtime Voice UI on `http://127.0.0.1:7862`. In a worktree without `.venv`, it and `local_realtime.ps1` use `SPEECH_TO_SPEECH_PYTHON` or the established local shared virtual environment while still serving worktree source.
-- Use `start_local_gemma_realtime_backend.ps1` for a foreground local realtime backend on `ws://127.0.0.1:8765/v1/realtime`. It launches this worktree's source only and must never inspect, start, stop, or restart Gemma or TTS services; those dependencies are validated at conversation time.
-- Use `local_realtime.ps1 -Action start|stop|restart|status` for tracked background operation. It records launcher and listening child identities, adopts exact matching legacy repo processes, falls back to `netstat` when non-elevated PowerShell cannot query `Get-NetTCPConnection`, and never stops Gemma or FasterQwen3TTS.
-- Use `probe_historical_audio_context.py` only as a content-free live capability
-  gate. It runs two paired current/historical ABBA cycles with equal-RMS tone
-  and seeded-noise WAVs in memory, keeps the current arm audio-only like the
-  production direct request, calibrates the endpoint's label mapping from
-  the current-audio trials, and passes only when historical results flip and
-  remain consistent by stimulus against that mapping. It must never persist or
-  print audio, prompts, transcript/response text, endpoints, models, or bearer
-  keys.
-- Use `probe_user_memory_fallback.py` only as a content-free live capability
-  gate for the same-primary semantic-memory fallback. Each of its two equal-RMS
-  tone/noise ABBA cycles makes one current-audio primary request and, only after
-  allowlisted memory plus the fixed acknowledgement is returned without a
-  transcript, one text-only contextual follow-up. It calibrates inverted
-  primary label mappings and passes only when every follow-up preserves that
-  mapping. It must never persist or print memory, audio, prompts, response text,
-  endpoints, models, or bearer keys, and it must never become runtime retry
-  behavior.
-- Use `probe_realtime_context_tools.py` only as a content-free managed
-  WebSocket release gate. It synthesizes fixed spoken scenarios in memory with
-  Windows System.Speech, requires `pipeline.config.updated` before the first
-  PCM append, and validates contextual counting, one exact tool call/output/
-  follow-up transaction, and cancellation recovery in a single session. The
-  search turn temporarily requires a tool, its post-result create disables
-  recursive tools, and automatic tool choice is acknowledged again before the
-  next spoken turn. It reads the remote bearer only from
-  `S2S_REMOTE_MODEL_API_KEY`. Fixed non-sensitive fixture phrases remain
-  source-only; no runtime-generated or live prompt, audio, transcript,
-  response, tool value, endpoint/model/voice identity, or credential may be
-  persisted or emitted.
-- Use `probe_clarification_rate.py` only as the privacy-safe model-level
-  clarification-rate gate. It runs exactly 100 normal accepted direct-audio
-  turns across clear speech, hesitation, best-available installed voices,
-  deterministic moderate noise, and supported-language code-switching, plus a
-  separately reported meaningless cohort. Every normal turn uses a unique
-  deterministic numeric challenge and expected value so retained history
-  cannot answer a later cohort without attending to its current audio. It generates WAVs through Windows
-  System.Speech entirely in memory using explicit UTF-8 bytes on stdin plus a
-  UTF-8 PowerShell console input encoding, sends exactly one primary request per turn,
-  and reuses the production direct-audio payload, control parser, semantic
-  anchor, serializer, and 30-turn history contract. It reads the remote bearer
-  only from `S2S_REMOTE_MODEL_API_KEY` and may emit only aggregate counts,
-  rates, booleans, timings, exact attempted/completed request counts, and error
-  classes. Voice discovery uses a separate bounded PowerShell process because
-  failed enumeration may corrupt System.Speech process-wide; a clean synthesis
-  process then uses a fresh synthesizer per scenario, falls back to its default
-  voice, and reports culture/alternate coverage as false. Missing culture or
-  alternate voices fail full coverage truthfully; prompts, audio, transcripts, responses,
-  endpoints, models, voice identities, and credentials never reach public
-  stdout/stderr or temporary files. This controlled gate is not a WER, room/AEC, VAD, WebSocket,
-  tool-order, or open-ended conversation benchmark. Resolve model routing only
-  from the exact managed loopback `/api/ui-settings` response, reject redirects,
-  and validate that handoff before reading or using the remote credential.
-- Use `probe_native_tool_protocol.py` only as the content-free model-level
-  native-tool release gate. Resolve the exact provider/model through the
-  redirect-rejecting managed loopback settings handoff; when provider is local,
-  require the `/api/local-pipeline` descriptor to advertise the canonical
-  `127.0.0.1:8818/v1` route and do not read a remote credential. Remote routing
-  may read only `S2S_REMOTE_MODEL_API_KEY` after the managed handoff validates.
-  Send one request each for required native selection, automatic native
-  selection, ordinary automatic/no-call output, and a fixed tool-result
-  continuation with tools disabled. Run prose-shaped and malformed-call
-  classification only against fixed in-process fixtures. Never retry, recover
-  printed syntax, execute a tool, use TTS/WebSockets, or emit/persist prompts,
-  responses, tool names/arguments/results, endpoint/model identity, or keys;
-  public evidence is limited to counts, bounded categories, timings, and
-  pass/fail.
-- Use `probe_direct_audio_isolation.py` only for the fixed RAM-only model-level
-  isolation matrix. It synthesizes each English, Spanish, German, and Japanese
-  fixture once in memory, then compares fresh versus deliberately wrong
-  semantic history under short and production payload envelopes. It resolves
-  the managed target before any remote credential read, sends one non-streaming
-  primary request per cell, wipes audio/payload/response buffers, and emits
-  aggregate shape, exact-label, correction, and timing counts only. It does not
-  replay the managed WebSocket/VAD path, invoke TTS, retry, or mutate a session.
+- Future laptop Gemma tests use only the user's existing normal configuration launcher. Do not prescribe or substitute an ad-hoc launcher, forced 16k context, or other settings; the selected normal launcher is user-owned and must not be inferred.
+- The local llama.cpp build uses canonical `--spec-type mtp:n_max=...,p_min=...`
+  syntax, `--gpu-layers-draft`, and flag-only `--fit`; do not restore removed
+  legacy draft, projector-offload, fit-context, or slots flags.
+- Use `start_hf_realtime_frontend.ps1` for the local HF Realtime Voice UI on `http://127.0.0.1:7862`. In a worktree without a complete runtime, `local_realtime.ps1` resolves Python per component: the backend probes its actual worktree package import graph, while the frontend probes FastAPI/httpx/Uvicorn. It then uses `SPEECH_TO_SPEECH_PYTHON` or the established local shared virtual environment while still serving worktree source.
+- Use `start_local_gemma_realtime_backend.ps1` for the local realtime backend on `ws://127.0.0.1:8765/v1/realtime`.
+- Use `local_realtime.ps1 -Action start|stop|restart|status` for tracked background operation. It records the exact launcher or its direct Windows-venv listener child, includes the worktree app directory in the managed frontend command identity, adopts exact matching legacy repo processes, falls back to `netstat` when non-elevated PowerShell cannot query `Get-NetTCPConnection`, and never stops Gemma or FasterQwen3TTS.
+- Compare recorded and live process start times as round-trip UTC instants;
+  JSON reload must not reinterpret a matching listener through the local
+  timezone and break safe status, stop, or restart ownership checks.
+- Stop only the exact ownership-validated listener/launcher PID. If Windows
+  `Stop-Process` fails internally across job boundaries, re-resolve that PID,
+  treat an already-exited process as success, and use the fresh process
+  object's PowerShell 5.1-compatible `Kill()` fallback; never widen the target
+  to a process name or unrelated listener.
 - Managed startup validates only Python and repository configuration. Missing
   Gemma or TTS services are status warnings; the launcher never inspects,
   starts, stops, or restarts model containers.
+- On Windows PowerShell 5.1, Python runtime readiness is determined by the
+  native process exit code. Harmless import-time stderr diagnostics must not be
+  promoted into a failed preflight, and the caller's error preference must be
+  restored afterward.
 - Clear inherited `PYTHONPATH` only for managed child launches and restore the
   caller environment afterward so worktree imports remain deterministic.
 - Before `Start-Process`, collapse duplicate case-insensitive `Path`/`PATH`
   entries inherited by Windows PowerShell into one `Path` value; duplicate
   keys must not prevent the model-independent managed backend from restarting.
 - Managed runtime state and split logs live under the gitignored `.runtime/` directory.
-- The clarification probe shares the production direct-audio sampling constants, keeps all utterances and responses process-local, and fails the 100-turn normal-conversation gate above one clarification, any recognition/input-process commentary, any repeated clarification wording, or incomplete safe multilingual voice coverage. Recognition commentary takes precedence over an expected numeric answer. Pure English/Spanish/German/Japanese turns and mixed-language turns remain distinct cohorts; meaningless input is reported separately.
-- The installed command reads only `rts.target`. Before repointing it, preserve the previous launcher in the passive local `rts.target.rollback` record; installers and lifecycle commands must never execute or overwrite that record implicitly. Restore it only through an explicit user-authorized target installation after confirming the pool is idle.
-- Before a managed start, hash only the checkout's runtime source files and capture the Git revision, dirty state, and browser asset generations. Inject that immutable content-free identity into both child processes, reject healthy listeners whose identity does not match the intended checkout, and make `status` warn prominently when running code is stale relative to current source.
+- The managed launcher resolves Gemma identity from the repository JSON by
+  default, but a persisted Remote provider endpoint/model takes precedence for
+  frontend startup, dependency warnings, and `status`; it never starts or
+  manages that remote model service.
+- The foreground frontend launcher uses the repository JSON identity for its
+  child process and restores the caller environment when the raw console exits.
+- `install-rts.ps1` and `uninstall-rts.ps1` must preserve existing PowerShell
+  profile text and encoding outside their managed marker block. A User PATH
+  update changes the persisted User target while adding/removing only the shim
+  entry in the current process PATH; it must not replace the effective process
+  PATH or discard machine-level entries. The `rts.target` sidecar is UTF-8 so
+  non-ASCII Windows user and folder names remain launchable.
+- After a verified frontend health check, `local_realtime.ps1` prints
+  `HF Realtime Voice UI: http://127.0.0.1:7862` for start/restart/status. Only
+  the explicit `-Open` switch may launch that URL, and it must recheck frontend
+  readiness before doing so even when only the backend component was selected.
+- Launcher status must not hard-code a turn cap or compaction-disabled claim.
+  The active context policy is conversation-scoped and reported by Realtime
+  Diagnostics; model reachability is not authenticated generation proof.
+- `probe_audio_cpp_native_pcm.py` is a candidate-only acceptance harness. It
+  first reads `/health`, `/control/status`, and `/v1/models`, then can issue a
+  short already-resident native Base-clone request. It never uses control
+  endpoints or changes candidate model/container state, never writes PCM, and
+  binds every synthesis request to that engine/instance identity, and reports
+  raw byte/sample alignment plus timing; exact-once checks are limited to SSE
+  event identities when an SSE server provides them. It also reports
+  cancellation-follow-up recovery as compact JSON.
+
+- `measure_candidate_tts_paths.py` defaults to read-only, non-secret identity.
+  Only `--execute` starts resident-model diagnostic synthesis; it warms each
+  configuration and interleaves three repetitions without saving settings or
+  loading models. Refuse contended/hot GPU runs, freeze clone/profile/engine
+  identity, distinguish transport cadence from engine boundaries, and verify
+  request outcomes before optional explicit audio export. Store diagnostic
+  files only in the ignored scratch directory; never record ordinary turns.
+  Allow at most five seconds for the previous diagnostic's utilization sample
+  to age out only after this diagnostic's own completed request; the first
+  dispatch always uses one strict current snapshot. Never relax GPU limits,
+  and stop immediately on low memory,
+  excessive temperature, or missing telemetry.
+  An optional finite 0--60-second inter-request cooldown begins only after a
+  completed diagnostic request and before the next strict GPU/identity checks;
+  it is excluded from every measured request interval.
+- `validate_direct_audio_followups.py --execute` sends only explicitly selected
+  local diagnostic WAV clips through the running VAD/Gemma/TTS WebSocket path.
+  It never starts models, records microphones, or persists settings/secrets.
+  Read credentials only from the named environment variable. Audio export is
+  opt-in; synthetic clip delivery is not a microphone or manual listening gate.
+- `validate_hfrt_tts_handler_path.py --execute` sends one explicitly selected,
+  fixed candidate TTS phrase through the production `TTSInput`/snapshot/process
+  handler path after read-only resident health and profile/revision admission.
+  It excludes WebSocket, LLM, microphone, and listening validation; it never
+  loads/switches models or saves settings, and raw PCM export is opt-in.
+  Use only the explicit candidate endpoint without inherited TTS credentials.
+  Require frozen lifecycle admission and correlated engine-EOS completion;
+  emit allowlisted failure codes instead of raw provider errors. Refuse an
+  existing export before dispatch and atomically publish owned temporary PCM
+  only after completion proof, cleaning that temporary file on failure.
 
 ## Child DOX Index
 

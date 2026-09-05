@@ -1,34 +1,15 @@
 # Gemma 4 12B IT QAT + MTP draft head for local speech-to-speech testing.
-# All executable and model locations are explicit parameters or environment
-# variables so the launcher remains portable across Windows workstations.
+# Mirrors C:\llama.cpp\launch_gemma-4-12B-it-qat-MTP.ps1, except ctx is 16k.
+# Set GEMMA_API_KEY to the llama-server API key before running.
 
 param(
-    [string]$LlamaCppDir = $env:LLAMA_CPP_DIR,
-    [string]$ModelPath = $env:GEMMA_MODEL_PATH,
-    [string]$DraftModelPath = $env:GEMMA_DRAFT_MODEL_PATH,
-    [string]$MmprojPath = $env:GEMMA_MMPROJ_PATH,
+    [string]$LlamaCppDir = "C:\llama.cpp",
     [int]$CtxSize = 16384,
     [int]$Port = 8818,
     [string]$ApiKey = $env:GEMMA_API_KEY
 )
 
 $ErrorActionPreference = 'Stop'
-if (-not $LlamaCppDir) {
-    Write-Error "Set LLAMA_CPP_DIR or pass -LlamaCppDir."
-    exit 1
-}
-if (-not $ModelPath) {
-    Write-Error "Set GEMMA_MODEL_PATH or pass -ModelPath."
-    exit 1
-}
-if (-not $DraftModelPath) {
-    Write-Error "Set GEMMA_DRAFT_MODEL_PATH or pass -DraftModelPath."
-    exit 1
-}
-if (-not $MmprojPath) {
-    Write-Error "Set GEMMA_MMPROJ_PATH or pass -MmprojPath."
-    exit 1
-}
 if (-not $ApiKey) {
     Write-Error "Set GEMMA_API_KEY or pass -ApiKey before launching Gemma."
     exit 1
@@ -39,12 +20,6 @@ if (-not (Test-Path -LiteralPath $exe)) {
     Write-Error "llama-server.exe not found at: $exe"
     exit 1
 }
-foreach ($asset in @($ModelPath, $DraftModelPath, $MmprojPath)) {
-    if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
-        Write-Error "Required Gemma asset not found at: $asset"
-        exit 1
-    }
-}
 
 Write-Host "Launching Gemma 4 12B QAT + MTP for speech-to-speech testing..." -ForegroundColor Cyan
 Write-Host "  CTX:    $CtxSize | Batch: 512 | Cache: f16" -ForegroundColor DarkGray
@@ -52,14 +27,11 @@ Write-Host "  Fit margin: 2560 MiB reserved for the isolated audio.cpp candidate
 Write-Host "  Port:   127.0.0.1:$Port" -ForegroundColor DarkGray
 
 $arguments = @(
-    '-m', $ModelPath
-    '-md', $DraftModelPath
-    '--mmproj', $MmprojPath
-    '--mmproj-offload'
-    '--spec-type', 'draft-mtp'
-    '--spec-draft-n-max', '3'
-    '--spec-draft-p-min', '0.75'
-    '--spec-draft-ngl', '99'
+    '-m', 'D:\LMStudio\Models\unsloth\gemma-4-12B-it-qat-GGUF\gemma-4-12B-it-qat-UD-Q4_K_XL.gguf'
+    '-md', 'D:\LMStudio\Models\Janvitos\gemma-4-12B-it-qat-assistant-MTP-Q8_0-GGUF\gemma-4-12B-it-qat-assistant-MTP-Q8_0.gguf'
+    '--mmproj', 'D:\LMStudio\Models\unsloth\gemma-4-12B-it-qat-GGUF\mmproj-F32.gguf'
+    '--spec-type', 'mtp:n_max=3,p_min=0.75'
+    '--gpu-layers-draft', '99'
     '--temp', '0.3'
     '--top-k', '20'
     '--top-p', '0.8'
@@ -69,21 +41,17 @@ $arguments = @(
     '--port', [string]$Port
     '--api-key', $ApiKey
     '--ctx-size', [string]$CtxSize
-    '--fit', 'on'
-    '--fit-ctx', '8192'
+    '--fit'
     '--fit-margin', '2560'
     '--batch-size', '512'
     '--ubatch-size', '512'
-    '-ngl', '48'
     '--threads', '8'
     '--threads-batch', '24'
     '--cache-type-k', 'f16'
     '--cache-type-v', 'f16'
     '--flash-attn', 'on'
     '--parallel', '1'
-    '-np', '1'
     '--metrics'
-    '--slots'
 )
 
 & $exe @arguments

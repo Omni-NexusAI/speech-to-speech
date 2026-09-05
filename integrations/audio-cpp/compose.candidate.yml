@@ -1,0 +1,36 @@
+# Start only explicitly: docker compose -f integrations/audio-cpp/compose.candidate.yml --profile audio-cpp-candidate up --build
+# One self-contained candidate container.  Existing Faster and Groxaxo services
+# are not members of this compose project and are never managed by it.
+services:
+  audio-cpp-candidate:
+    profiles: ["audio-cpp-candidate"]
+    container_name: audio-cpp-qwen3-tts-voice-studio
+    image: ${AUDIO_CPP_IMAGE:-local/audio-cpp-qwen3-tts-voice-studio:native-development}
+    build:
+      context: ../..
+      dockerfile: integrations/audio-cpp/Dockerfile
+    environment:
+      AUDIOCPP_BACKEND: cuda
+      AUDIO_CPP_TTS_BASE_URL: http://127.0.0.1:8080/v1
+      AUDIO_CPP_CONTROL_URL: http://127.0.0.1:8080/control
+      AUDIO_CPP_ACTIVE_MODEL: qwen3-tts-1.7b-base-bf16
+      AUDIO_CPP_TTS_MODELS: qwen3-tts-0.6b-base-bf16,qwen3-tts-1.7b-base-bf16
+      AUDIO_CPP_NATIVE_INCREMENTAL_PCM: "false"
+      VOICE_LIBRARY_DIR: /voices
+    ports:
+      - "127.0.0.1:${AUDIO_CPP_API_PORT:-8890}:8080"
+      - "127.0.0.1:${AUDIO_CPP_STUDIO_PORT:-8891}:7860"
+    volumes:
+      - audio-cpp-voice-library:/voices
+    restart: "no"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  audio-cpp-voice-library:
+    name: speech-to-speech-audio-cpp-voice-library

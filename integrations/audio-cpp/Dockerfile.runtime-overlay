@@ -1,0 +1,37 @@
+ARG AUDIO_CPP_BASE_IMAGE
+
+FROM ${AUDIO_CPP_BASE_IMAGE}
+
+# This narrow recovery overlay is intentionally source-only.  It may be built
+# only over the already validated native-engine image whose immutable binary
+# hash is checked below.  Dockerfile.overlay remains the clean pinned-engine
+# rebuild path.
+ARG AUDIO_CPP_ENGINE_SHA256=28fb9d4a2940b8f0d6f426cfc7da21361438f878804cf6ac59888d5e807bb1a8
+ARG AUDIO_CPP_RUNTIME_OVERLAY_REV=stream-reliability-sm86-20260904
+ARG AUDIO_CPP_BASE_IMAGE_ID
+RUN test -n "$AUDIO_CPP_RUNTIME_OVERLAY_REV" \
+    && test -n "$AUDIO_CPP_BASE_IMAGE_ID" \
+    && echo "$AUDIO_CPP_ENGINE_SHA256  /usr/local/bin/audiocpp_server" | sha256sum -c - \
+    && test -d /opt/models/Qwen3-TTS-12Hz-0.6B-Base \
+    && test -d /opt/models/Qwen3-TTS-12Hz-1.7B-Base \
+    && test -f /config/qwen3-tts-base-f16.json \
+    && test -x /usr/local/bin/audio-cpp-candidate
+
+LABEL io.omninexus.rollback.base="${AUDIO_CPP_BASE_IMAGE_ID}" \
+      org.opencontainers.image.version="${AUDIO_CPP_RUNTIME_OVERLAY_REV}"
+
+WORKDIR /opt/voice-studio
+COPY web/hf-realtime-voice/ /opt/voice-studio/
+COPY integrations/audio-cpp/gradio_voice_studio.py /opt/voice-studio/gradio_voice_studio.py
+COPY integrations/audio-cpp/supervisor.py /opt/audio-cpp-supervisor.py
+COPY integrations/audio-cpp/profile_library.py /opt/profile_library.py
+COPY integrations/audio-cpp/profile_library.py /opt/voice-studio/profile_library.py
+
+RUN python3 -m py_compile \
+        /opt/audio-cpp-supervisor.py \
+        /opt/profile_library.py \
+        /opt/voice-studio/profile_library.py \
+        /opt/voice-studio/gradio_voice_studio.py \
+        /opt/voice-studio/server.py
+
+ENTRYPOINT ["/usr/local/bin/audio-cpp-candidate"]

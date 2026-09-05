@@ -11,6 +11,8 @@ import base64
 import time
 from queue import Empty, Queue
 from threading import Event as ThreadingEvent
+from threading import Thread
+from types import SimpleNamespace
 
 import pytest
 from starlette.testclient import TestClient
@@ -18,17 +20,34 @@ from starlette.websockets import WebSocketState
 
 import speech_to_speech.api.openai_realtime.websocket_router as router_module
 from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit
-from speech_to_speech.api.openai_realtime.service import CHUNK_SIZE_BYTES, RealtimeService
-from speech_to_speech.api.openai_realtime.websocket_router import _clean_unit, create_app
+from speech_to_speech.api.openai_realtime.service import (
+    CHUNK_SIZE_BYTES,
+    RealtimeService,
+)
+from speech_to_speech.api.openai_realtime.websocket_router import (
+    _audio_identity,
+    _audio_identity_is_admissible,
+    _clean_unit,
+    _should_discard_audio,
+    create_app,
+)
 from speech_to_speech.pipeline.cancel_scope import CancelScope
-from speech_to_speech.pipeline.control import SESSION_END, PipelineControlMessage, is_control_message
+from speech_to_speech.pipeline.control import (
+    SESSION_END,
+    PipelineControlMessage,
+    is_control_message,
+)
 from speech_to_speech.pipeline.events import (
     AssistantTextEvent,
     ResponseOutputCompleteEvent,
     SpeechStartedEvent,
     TokenUsageEvent,
 )
-from speech_to_speech.pipeline.messages import AUDIO_RESPONSE_DONE, PIPELINE_END, AudioOutput
+from speech_to_speech.pipeline.messages import (
+    AUDIO_RESPONSE_DONE,
+    PIPELINE_END,
+    AudioOutput,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -116,6 +135,48 @@ def _simulate_session_end_drain(input_queue: Queue, output_queue: Queue, timeout
 
 def _pcm_bytes(n_samples: int) -> bytes:
     return b"\x00" * (n_samples * 2)
+
+
+def _candidate_tuning_payload(
+    *,
+    profile_id: str = "balanced",
+    delivery_mode: str | None = None,
+    overrides: dict | None = None,
+    resolved: dict | None = None,
+) -> dict:
+    """Return the complete immutable candidate snapshot accepted by HFRT."""
+
+    payload = {
+        "provider": "qwen3tts-audiocpp",
+        "profile_id": profile_id,
+        "profile_revision": 3,
+        "effective": {
+            "model": "qwen3-tts-1.7b-base-bf16",
+            "clone_mode": "full_icl",
+            "max_reference_seconds": 20,
+            "first_block_frames": 4,
+            "steady_block_frames": 12,
+            "left_context_frames": 25,
+            "text_lookahead": 64,
+            "phrase_flush_ms": 500,
+            "temperature": 0.7,
+            "top_k": 40,
+            "top_p": 0.9,
+            "repetition_penalty": 1.05,
+            "seed": None,
+        },
+        "overrides": dict(overrides or {}),
+        "resolved": dict(
+            resolved
+            or {
+                "text_lookahead": 64,
+                "phrase_flush_ms": 500,
+            }
+        ),
+    }
+    if delivery_mode is not None:
+        payload["delivery_mode"] = delivery_mode
+    return payload
 
 
 def test_clean_unit_flushes_intermediate_handler_queues(setup):
@@ -217,10 +278,6 @@ class TestConnection:
                 assert runtime["runtime"]["api_version"] == router_module.BACKEND_RUNTIME_API_VERSION
                 assert runtime["runtime"]["mode"] == "local-direct-audio"
                 assert runtime["runtime"]["live_transcription"] is True
-                assert runtime["runtime"]["source_revision"] == "unknown"
-                assert runtime["runtime"]["source_dirty"] is None
-                assert runtime["runtime"]["source_fingerprint"] == "unknown"
-                assert runtime["runtime"]["ui_asset_generation"] == "unknown"
 
     def test_second_connection_rejected(self, setup):
         app, *_ = setup
@@ -241,6 +298,121 @@ class TestConnection:
 
 
 class TestClientEventDispatch:
+    def test_stale_response_epoch_pcm_is_rejected_even_without_cancel_generation(self, setup):
+        _, service, *_ = setup
+        conn_id = service.register()
+        try:
+            old = service.claim_pending_response(conn_id, turn_id="turn_a", turn_revision=0)
+            service.observe_speech_started(conn_id, reason="same_turn_revision")
+            current = service.claim_pending_response(conn_id, turn_id="turn_a", turn_revision=1)
+            service.bind_response_id(conn_id, "resp_new")
+            unit = SimpleNamespace(cancel_scope=CancelScope())
+
+            assert _should_discard_audio(
+                unit,
+                AudioOutput(
+                    audio=b"old",
+                    input_epoch=old.input_epoch,
+                    response_epoch=old.response_epoch,
+                    response_id="resp_old",
+                ),
+                service=service,
+                conn_id=conn_id,
+            )
+            assert not _should_discard_audio(
+                unit,
+                AudioOutput(
+                    audio=b"new",
+                    input_epoch=current.input_epoch,
+                    response_epoch=current.response_epoch,
+                    response_id="resp_new",
+                ),
+                service=service,
+                conn_id=conn_id,
+            )
+            old_identity = _audio_identity(
+                AudioOutput(
+                    audio=b"a",
+                    input_epoch=old.input_epoch,
+                    response_epoch=old.response_epoch,
+                    response_id="resp_old",
+                )
+            )
+            current_identity = _audio_identity(
+                AudioOutput(
+                    audio=b"b",
+                    input_epoch=current.input_epoch,
+                    response_epoch=current.response_epoch,
+                    response_id="resp_new",
+                )
+            )
+            assert old_identity != current_identity
+            # This is the same recheck used after batch assembly, before
+            # encoding, and immediately before each socket send.
+            assert not _audio_identity_is_admissible(service, conn_id, old_identity)
+            assert _audio_identity_is_admissible(service, conn_id, current_identity)
+        finally:
+            service.unregister(conn_id)
+
+    def test_completed_response_epoch_rejects_late_pcm_but_remains_acknowledgeable(self, setup):
+        _, service, *_ = setup
+        conn_id = service.register()
+        try:
+            owner = service.claim_pending_response(conn_id, turn_id="turn_a", turn_revision=0)
+            service.bind_response_id(conn_id, "resp_done")
+            service.mark_response_completed(conn_id)
+            unit = SimpleNamespace(cancel_scope=CancelScope())
+
+            assert _should_discard_audio(
+                unit,
+                AudioOutput(audio=b"late", response_epoch=owner.response_epoch, response_id="resp_done"),
+                service=service,
+                conn_id=conn_id,
+            )
+            assert service.handle_playback_started(
+                conn_id, response_id="resp_done", response_epoch=owner.response_epoch
+            ) is not None
+        finally:
+            service.unregister(conn_id)
+
+    def test_manual_response_creation_announces_epoch_and_accepts_playback_ack(self, setup):
+        app, service, *_ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()  # session.created
+                ws.send_json(
+                    {
+                        "type": "pipeline.playback.capability",
+                        "rendered_playback_ack": True,
+                    }
+                )
+                ws.send_json({"type": "response.create"})
+                created = ws.receive_json()
+                producing = ws.receive_json()
+                owner = ws.receive_json()
+
+                assert created["type"] == "response.created"
+                assert producing["type"] == "pipeline.response"
+                assert producing["state"] == "producing"
+                assert owner["type"] == "pipeline.response"
+                assert owner["state"] == "priming"
+                assert producing["response_epoch"] == owner["response_epoch"]
+                assert owner["response_id"] == created["response"]["id"]
+                assert owner["response_epoch"] >= 1
+
+                ws.send_json(
+                    {
+                        "type": "pipeline.playback.started",
+                        "response_id": owner["response_id"],
+                        "response_epoch": owner["response_epoch"],
+                    }
+                )
+                acknowledged = ws.receive_json()
+                assert acknowledged["type"] == "pipeline.response"
+                assert acknowledged["state"] == "audible"
+                active = service._state(service.connection_ids[0]).response_ownership.active()
+                assert active is not None and active.playback_started is True
+
     def test_audio_append_forwarded_to_input_queue(self, setup):
         app, _, input_queue, *_ = setup
         audio_b64 = base64.b64encode(_pcm_bytes(512)).decode("ascii")
@@ -313,6 +485,80 @@ class TestClientEventDispatch:
                 cid = service.connection_ids[0]
                 assert service._state(cid).runtime_config.local_pipeline["tts_backend"] == "qwen3tts-audiocpp"
 
+    def test_pipeline_config_update_validates_and_persists_candidate_playback_policy(self, setup):
+        app, service, *_ = setup
+        policy = {
+            "prime_target_ms": 480,
+            "continuity_mode": "adaptive",
+            "native_streaming": True,
+            "max_prime_ms": 2000,
+        }
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "pipeline.config.update",
+                        "config": {
+                            "tts_backend": "qwen3tts-audiocpp",
+                            "playback_policy": policy,
+                        },
+                    }
+                )
+
+                ack = ws.receive_json()
+                assert ack["type"] == "pipeline.config.updated"
+                assert ack["config"]["playback_policy"] == policy
+                runtime = service._state(service.connection_ids[0]).runtime_config.local_pipeline
+                assert runtime["playback_policy"] == policy
+
+    @pytest.mark.parametrize(
+        "policy",
+        [
+            {"prime_target_ms": 480, "continuity_mode": "adaptive"},
+            {
+                "prime_target_ms": 480,
+                "continuity_mode": "slow",
+                "native_streaming": True,
+                "max_prime_ms": 2000,
+            },
+            {
+                "prime_target_ms": 2080,
+                "continuity_mode": "adaptive",
+                "native_streaming": True,
+                "max_prime_ms": 2000,
+            },
+            {
+                "source_sample_rate": 24000,
+                "prime_target_ms": 480,
+                "continuity_mode": "adaptive",
+                "native_streaming": True,
+                "max_prime_ms": 2000,
+            },
+        ],
+    )
+    def test_pipeline_config_update_rejects_invalid_playback_policy_atomically(self, setup, policy):
+        app, service, *_ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "pipeline.config.update",
+                        "config": {
+                            "tts_backend": "qwen3tts-audiocpp",
+                            "playback_policy": policy,
+                        },
+                    }
+                )
+
+                error = ws.receive_json()
+                assert error["type"] == "error"
+                assert error["error"]["type"] == "invalid_playback_policy"
+                runtime = service._state(service.connection_ids[0]).runtime_config.local_pipeline
+                assert runtime.get("tts_backend", "faster") == "faster"
+                assert "playback_policy" not in runtime
+
     def test_pipeline_config_update_keeps_bounded_resolved_audio_cpp_phrase_queue(self, setup):
         app, service, *_ = setup
         with TestClient(app) as client:
@@ -323,21 +569,19 @@ class TestClientEventDispatch:
                         "type": "pipeline.config.update",
                         "config": {
                             "tts_backend": "qwen3tts-audiocpp",
-                            "tts_tuning": {
-                                "provider": "qwen3tts-audiocpp",
-                                "profile_id": "balanced",
-                                "overrides": {
+                            "tts_tuning": _candidate_tuning_payload(
+                                overrides={
                                     "max_reference_seconds": 20,
                                     "first_block_frames": 4,
                                     "steady_block_frames": 12,
                                     "left_context_frames": 25,
                                     "top_k": 40,
                                 },
-                                "resolved": {
+                                resolved={
                                     "text_lookahead": 64,
                                     "phrase_flush_ms": 500,
                                 },
-                            },
+                            ),
                         },
                     }
                 )
@@ -347,8 +591,39 @@ class TestClientEventDispatch:
                 tuning = ack["config"]["tts_tuning"]
                 assert tuning["resolved"] == {"text_lookahead": 64, "phrase_flush_ms": 500}
                 assert tuning["overrides"]["first_block_frames"] == 4
+                # Omitted transport is deliberately stable buffered phrase,
+                # even if the isolated candidate later advertises native PCM.
+                assert tuning["delivery_mode"] == "buffered_phrase"
                 cid = service.connection_ids[0]
                 assert service._state(cid).runtime_config.local_pipeline["tts_tuning"] == tuning
+
+    def test_browser_rendered_playback_capability_is_local_and_strict(self, setup):
+        app, service, *_ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                cid = service.connection_ids[0]
+                assert service._state(cid).rendered_playback_ack_supported is False
+
+                ws.send_json(
+                    {
+                        "type": "pipeline.playback.capability",
+                        "rendered_playback_ack": True,
+                    }
+                )
+                # This local declaration is deliberately acknowledgement-free,
+                # so give the receive loop an ordered follow-up to process
+                # before observing its state.
+                ws.send_json(
+                    {
+                        "type": "pipeline.playback.capability",
+                        "rendered_playback_ack": "true",
+                    }
+                )
+                error = ws.receive_json()
+                assert error["type"] == "error"
+                assert error["error"]["type"] == "invalid_playback_capability"
+                assert service._state(cid).rendered_playback_ack_supported is True
 
     def test_pipeline_config_update_rejects_unbounded_resolved_audio_cpp_phrase_queue(self, setup):
         app, service, *_ = setup
@@ -360,15 +635,13 @@ class TestClientEventDispatch:
                         "type": "pipeline.config.update",
                         "config": {
                             "tts_backend": "qwen3tts-audiocpp",
-                            "tts_tuning": {
-                                "provider": "qwen3tts-audiocpp",
-                                "profile_id": "low-latency",
-                                "overrides": {},
-                                "resolved": {
+                            "tts_tuning": _candidate_tuning_payload(
+                                profile_id="low-latency",
+                                resolved={
                                     "text_lookahead": 1,
                                     "phrase_flush_ms": 20,
                                 },
-                            },
+                            ),
                         },
                     }
                 )
@@ -378,6 +651,28 @@ class TestClientEventDispatch:
                 assert error["error"]["type"] == "invalid_tts_tuning"
                 cid = service.connection_ids[0]
                 assert "tts_tuning" not in service._state(cid).runtime_config.local_pipeline
+
+    def test_pipeline_config_update_preserves_explicit_native_pcm_opt_in(self, setup):
+        app, service, *_ = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()
+                ws.send_json(
+                    {
+                        "type": "pipeline.config.update",
+                        "config": {
+                            "tts_backend": "qwen3tts-audiocpp",
+                            "tts_tuning": _candidate_tuning_payload(
+                                delivery_mode="native_incremental_pcm"
+                            ),
+                        },
+                    }
+                )
+                ack = ws.receive_json()
+                assert ack["type"] == "pipeline.config.updated"
+                assert ack["config"]["tts_tuning"]["delivery_mode"] == "native_incremental_pcm"
+                runtime = service._state(service.connection_ids[0]).runtime_config.local_pipeline
+                assert runtime["tts_tuning"]["delivery_mode"] == "native_incremental_pcm"
 
     def test_pipeline_config_update_rejects_rest_scope_without_partial_mutation(self, setup):
         app, service, *_ = setup
@@ -425,12 +720,10 @@ class TestClientEventDispatch:
                         "type": "pipeline.config.update",
                         "config": {
                             "tts_backend": "audio-cpp",
-                            "tts_tuning": {
-                                "provider": "qwen3tts-audiocpp",
-                                "profile_id": "low-latency",
-                                "overrides": {},
-                                "resolved": {"text_lookahead": 48, "phrase_flush_ms": 320},
-                            },
+                            "tts_tuning": _candidate_tuning_payload(
+                                profile_id="low-latency",
+                                resolved={"text_lookahead": 48, "phrase_flush_ms": 320},
+                            ),
                         },
                     }
                 )
@@ -496,6 +789,66 @@ class TestClientEventDispatch:
                         break
                 assert "response.output_audio.done" in types
                 assert "response.done" in types
+
+    def test_response_cancel_serializes_transport_teardown_before_successor_claim(
+        self,
+        setup,
+        monkeypatch,
+    ):
+        """Identity-free teardown cannot cross the ownership boundary into B."""
+
+        app, service, *_ = setup
+        teardown_entered = ThreadingEvent()
+        release_teardown = ThreadingEvent()
+
+        def _blocking_transport_teardown(_unit, _reason):
+            teardown_entered.set()
+            assert release_teardown.wait(1.0)
+
+        monkeypatch.setattr(router_module, "_cancel_handler_transports", _blocking_transport_teardown)
+        claimed = []
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()  # session.created
+                conn_id = list(service._conns.keys())[0]
+                owner_a = service.claim_pending_response(conn_id, turn_id="turn_a", turn_revision=0)
+                service.response._ensure_response(conn_id)
+
+                ws.send_json({"type": "response.cancel"})
+                assert teardown_entered.wait(1.0)
+
+                def _claim_successor():
+                    supersession = service.observe_speech_started(conn_id, reason="turn_b")
+                    claimed.append(
+                        service.claim_pending_response(
+                            conn_id,
+                            turn_id="turn_b",
+                            turn_revision=0,
+                            input_epoch=supersession.input_epoch,
+                        )
+                    )
+
+                claimant = Thread(target=_claim_successor, daemon=True)
+                claimant.start()
+                time.sleep(0.05)
+                assert claimed == [], "successor admission escaped the response.cancel transaction"
+
+                release_teardown.set()
+                types = set()
+                for _ in range(8):
+                    types.add(ws.receive_json()["type"])
+                    if {"response.output_audio.done", "response.done"} <= types:
+                        break
+                assert {"response.output_audio.done", "response.done"} <= types
+                claimant.join(timeout=1.0)
+
+                assert len(claimed) == 1
+                owner_b = claimed[0]
+                state = service._state(conn_id)
+                assert owner_b.response_epoch > owner_a.response_epoch
+                assert state.response_ownership.is_current(owner_b.response_epoch)
+                assert state.response_pending is True
 
     def test_response_cancel_flushes_queues(self, setup):
         app, service, _, output_queue, text_output_queue, _, _, response_playing, cancel_scope = setup
@@ -648,10 +1001,12 @@ class TestSendLoop:
             with client.websocket_connect("/v1/realtime") as ws:
                 ws.receive_json()  # session.created
                 conn_id = list(service._conns.keys())[0]
+                service.claim_pending_response(conn_id, turn_id="turn_a", turn_revision=0)
                 service.response._ensure_response(conn_id)
                 response_playing.set()
                 # Trigger barge-in
-                text_output_queue.put(SpeechStartedEvent())
+                supersession = service.observe_speech_started(conn_id, reason="barge_in")
+                text_output_queue.put(SpeechStartedEvent(input_epoch=supersession.input_epoch))
                 ws.receive_json()  # input_audio_buffer.speech_started
                 ws.receive_json()  # response.output_audio.done
                 ws.receive_json()  # response.done
@@ -668,7 +1023,8 @@ class TestSendLoop:
                 ws.receive_json()  # session.created
                 conn_id = list(service._conns.keys())[0]
                 stale_generation = cancel_scope.generation
-                service._state(conn_id).response_pending = True
+                service.observe_speech_started(conn_id, reason="accepted_speech")
+                service.claim_pending_response(conn_id, turn_id="turn_pending", turn_revision=0)
 
                 text_output_queue.put(SpeechStartedEvent())
                 msg = ws.receive_json()
@@ -771,6 +1127,53 @@ class TestSendLoop:
                 state = service._state(conn_id)
                 assert state.in_response
                 assert state.current_response_id == current_response_id
+
+    def test_audio_terminal_preserves_promoted_successor_pending_state(self, setup):
+        """A's terminal must not clear B's response_pending after queue promotion."""
+
+        app, service, _, output_queue, _, _, _, _, cancel_scope = setup
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime") as ws:
+                ws.receive_json()  # session.created
+                conn_id = list(service._conns.keys())[0]
+                owner_a = service.claim_pending_response(conn_id, turn_id="turn_a", turn_revision=0)
+                response_id, _ = service.response._ensure_response(conn_id)
+                state = service._state(conn_id)
+                state.response_audio_emitted = True
+                assert service.handle_playback_started(
+                    conn_id,
+                    response_id=response_id,
+                    response_epoch=owner_a.response_epoch,
+                ) is not None
+
+                supersession = service.observe_speech_started(
+                    conn_id,
+                    reason="turn_b",
+                    interrupt_response=False,
+                )
+                owner_b = service.claim_pending_response(
+                    conn_id,
+                    turn_id="turn_b",
+                    turn_revision=0,
+                    input_epoch=supersession.input_epoch,
+                )
+                assert state.response_ownership.is_queued(owner_b.response_epoch)
+
+                output_queue.put(
+                    AudioOutput(
+                        audio=AUDIO_RESPONSE_DONE,
+                        cancel_generation=cancel_scope.generation,
+                        input_epoch=owner_a.input_epoch,
+                        response_epoch=owner_a.response_epoch,
+                        response_id=response_id,
+                    )
+                )
+                types = {ws.receive_json()["type"], ws.receive_json()["type"]}
+                assert types == {"response.output_audio.done", "response.done"}
+                time.sleep(0.05)
+
+                assert state.response_ownership.is_current(owner_b.response_epoch)
+                assert state.response_pending is True
 
     def test_response_done_drains_pending_token_usage_before_finish(self, setup):
         app, service, _, output_queue, text_output_queue, *_ = setup
@@ -1035,10 +1438,6 @@ class TestPool:
             assert data["in_use"] == 0
             assert [u["session_id"] for u in data["units"]] == [None, None]
             assert data["runtime"]["api_version"] == router_module.BACKEND_RUNTIME_API_VERSION
-            assert data["runtime"]["source_revision"] == "unknown"
-            assert data["runtime"]["source_dirty"] is None
-            assert data["runtime"]["source_fingerprint"] == "unknown"
-            assert data["runtime"]["ui_asset_generation"] == "unknown"
             assert data["runtime"]["diagnostic_stages"] == [
                 "mic",
                 "echo_guard",

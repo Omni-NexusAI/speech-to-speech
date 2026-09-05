@@ -112,9 +112,9 @@ class Qwen3TTSHandlerArguments:
         metadata={"help": "Model field for /audio/speech when qwen3_tts_backend=openai-api."},
     )
     qwen3_tts_api_voice: Optional[str] = field(
-        default=None,
+        default="clone:16d9bb336799",
         metadata={
-            "help": "Optional explicit Voice field for /audio/speech when qwen3_tts_backend=openai-api. When unset, use selected_profile.json if valid, otherwise the first live Base clone profile."
+            "help": "Default Voice field for /audio/speech when qwen3_tts_backend=openai-api. Set null to use selected_profile.json if valid, otherwise the first live Base clone profile."
         },
     )
     qwen3_tts_api_fallback_voice: Optional[str] = field(

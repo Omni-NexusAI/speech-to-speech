@@ -6,6 +6,12 @@ cache
 .pytest_cache
 .pytest-*
 .pytest_*
+.audio-cpp-prefix-cache-build-check
+.audio-cpp-final-audit
+.audio-cpp-patch-parity-audit
+.audio-cpp-totalcap-audit
+.claude
+.runtime
 .ruff_cache
 __pycache__
 **/__pycache__
